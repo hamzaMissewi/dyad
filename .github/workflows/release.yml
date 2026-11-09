@@ -3,7 +3,7 @@
 # Need to write to repo contents to upload the app to GitHub Release
 # See: https://www.electronforge.io/config/publishers/github#authentication
 permissions:
-  contents: write
+  contents: read
 
 name: Release app
 on:
@@ -17,6 +17,8 @@ jobs:
   prepare-release:
     name: Prepare Release Tag
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     outputs:
       tag: ${{ steps.prepare.outputs.tag }}
       version: ${{ steps.prepare.outputs.version }}
@@ -38,6 +40,10 @@ jobs:
   build:
     needs: prepare-release
     environment: release
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
     strategy:
       # Continue building other platforms even if one fails
       fail-fast: false
@@ -46,7 +52,7 @@ jobs:
           - { name: "windows", image: "windows-2022" }
           # See https://github.com/dyad-sh/dyad/issues/96
           - { name: "linux", image: "ubuntu-22.04" }
-          - { name: "macos-intel", image: "macos-15-intel" }
+          - { name: "macos-intel", image: "macos-26-intel" }
           - { name: "macos", image: "macos-latest" }
     runs-on: ${{ matrix.os.image }}
     steps:
@@ -63,6 +69,22 @@ jobs:
         env:
           # Required for @vscode/ripgrep to download binaries without hitting GitHub API rate limits
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Use clang 18 for Linux native rebuilds
+        if: matrix.os.name == 'linux'
+        run: |
+          sudo install -d -m 0755 /etc/apt/keyrings
+          wget -qO /tmp/llvm-snapshot.gpg.key https://apt.llvm.org/llvm-snapshot.gpg.key
+          gpg --dearmor /tmp/llvm-snapshot.gpg.key
+          sudo install -m 0644 /tmp/llvm-snapshot.gpg.key.gpg /etc/apt/keyrings/apt.llvm.org.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/apt.llvm.org.gpg] https://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main" | sudo tee /etc/apt/sources.list.d/llvm-toolchain-jammy-18.list
+          # Preserve the runner's package indexes and avoid refreshing unrelated Ubuntu mirrors.
+          sudo apt-get update \
+            -o Dir::Etc::sourcelist="sources.list.d/llvm-toolchain-jammy-18.list" \
+            -o Dir::Etc::sourceparts="-" \
+            -o APT::Get::List-Cleanup="0"
+          sudo apt-get install -y clang-18
+          echo "CC=clang-18" >> "$GITHUB_ENV"
+          echo "CXX=clang++-18" >> "$GITHUB_ENV"
       - name: add macos cert
         if: contains(matrix.os.name, 'macos')
         env:
@@ -141,6 +163,17 @@ jobs:
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
           WINDOWS_SIGN: ${{ contains(matrix.os.name, 'windows') && 'true' || '' }}
 
+      - name: Generate release provenance manifest
+        env:
+          RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.prepare-release.outputs.version }}
+        run: node scripts/generate-release-provenance.js "out/release-provenance-${{ matrix.os.name }}.json" "${{ matrix.os.name }}" out/make
+
+      - name: Attest release provenance manifest
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: out/release-provenance-${{ matrix.os.name }}.json
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
@@ -150,8 +183,10 @@ jobs:
 
   publish:
     name: Publish Release
-    needs: build
+    needs: [prepare-release, build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Github checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -182,18 +217,11 @@ jobs:
           DEBUG: "@electron/*,electron-forge:*"
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  verify-assets:
-    name: Verify Release Assets
-    needs: publish
-    runs-on: ubuntu-latest
-    steps:
-      - name: Github checkout
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Use Node.js
-        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
-        with:
-          node-version: v24.13.1
-          package-manager-cache: false # Do NOT use GitHub Actions cache in release builds: https://adnanthekhan.com/2024/12/21/cacheract-the-monster-in-your-build-cache/
+      - name: Upload provenance manifests to draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
+        run: gh release upload "$RELEASE_TAG" out/release-provenance-*.json --clobber
       - name: Verify release tag still points to this workflow commit
         run: node scripts/prepare-release-tag.js verify
       - name: Verify all release assets are uploaded

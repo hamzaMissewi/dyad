@@ -16,6 +16,7 @@ import {
   resolveTargetAppPath,
 } from "./resolve_app_context";
 import { DyadError, DyadErrorKind } from "@/errors/dyad_error";
+import { isDotenvFilePath } from "@/utils/dotenv_redaction";
 import log from "electron-log";
 
 const logger = log.scope("grep");
@@ -132,6 +133,10 @@ function truncateLineText(text: string): string {
   return text.slice(0, MAX_LINE_LENGTH) + "...";
 }
 
+export function normalizeRipgrepMatchPath(matchPath: string): string {
+  return matchPath.replace(/\\/g, "/").replace(/^\.\//, "");
+}
+
 async function runRipgrep({
   appPath,
   query,
@@ -231,8 +236,10 @@ async function runRipgrep({
             continue;
           }
 
-          // Normalize path (remove leading ./)
-          const normalizedPath = matchPath.replace(/^\.\//, "");
+          const normalizedPath = normalizeRipgrepMatchPath(matchPath);
+          if (isDotenvFilePath(normalizedPath)) {
+            continue;
+          }
 
           if (maxMatches !== undefined && results.length >= maxMatches) {
             stoppedEarly = true;

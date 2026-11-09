@@ -12,26 +12,32 @@ import {
   DyadBadge,
   DyadExpandIcon,
   DyadCardContent,
+  DyadStateIndicator,
 } from "./DyadCardPrimitives";
+import { getNpmPackagePageUrl } from "./npmPackageUrl";
 
 interface DyadAddDependencyProps {
   children?: ReactNode;
   node?: any;
   packages?: string;
+  execution?: boolean;
 }
 
 export const DyadAddDependency: React.FC<DyadAddDependencyProps> = ({
   children,
   node,
+  execution = false,
 }) => {
   const packages = node?.properties?.packages
     ? node.properties.packages.split(" ").filter(Boolean)
     : [];
   const [isContentVisible, setIsContentVisible] = useState(false);
-  const hasChildren = !!children;
+  const hasChildren =
+    typeof children === "string" && children.trim().length > 0;
 
   return (
     <DyadCard
+      state={execution ? node?.properties?.state : undefined}
       accentColor="blue"
       isExpanded={isContentVisible}
       onClick={
@@ -40,6 +46,13 @@ export const DyadAddDependency: React.FC<DyadAddDependencyProps> = ({
     >
       <DyadCardHeader icon={<Package size={15} />} accentColor="blue">
         <DyadBadge color="blue">Add Packages</DyadBadge>
+        {execution && (
+          <DyadStateIndicator
+            state={node?.properties?.state}
+            pendingLabel="Installing..."
+            finishedLabel="Installed"
+          />
+        )}
         {hasChildren && (
           <div className="ml-auto">
             <DyadExpandIcon isExpanded={isContentVisible} />
@@ -48,9 +61,11 @@ export const DyadAddDependency: React.FC<DyadAddDependencyProps> = ({
       </DyadCardHeader>
       {packages.length > 0 && (
         <div className="px-3 pb-2">
-          <div className="text-sm text-foreground mb-1">
-            Do you want to install these packages?
-          </div>
+          {!execution && (
+            <div className="text-sm text-foreground mb-1">
+              Do you want to install these packages?
+            </div>
+          )}
           <div className="flex flex-wrap gap-1.5 mt-1.5">
             {packages.map((p: string) => (
               <span
@@ -58,18 +73,18 @@ export const DyadAddDependency: React.FC<DyadAddDependencyProps> = ({
                 key={p}
                 onClick={(e) => {
                   e.stopPropagation();
-                  ipc.system.openExternalUrl(
-                    `https://www.npmjs.com/package/${p}`,
-                  );
+                  ipc.system.openExternalUrl(getNpmPackagePageUrl(p));
                 }}
               >
                 {p}
               </span>
             ))}
           </div>
-          <div className="text-xs text-muted-foreground mt-2">
-            Make sure these packages are what you want.
-          </div>
+          {!execution && (
+            <div className="text-xs text-muted-foreground mt-2">
+              Make sure these packages are what you want.
+            </div>
+          )}
         </div>
       )}
       <DyadCardContent isExpanded={isContentVisible}>

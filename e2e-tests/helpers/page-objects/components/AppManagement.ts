@@ -8,6 +8,7 @@ import * as eph from "electron-playwright-helpers";
 import { ElectronApplication } from "playwright";
 import path from "path";
 import { execSync, execFileSync } from "child_process";
+import { existsSync, readFileSync } from "node:fs";
 import { Timeout } from "../../constants";
 
 export class AppManagement {
@@ -196,15 +197,31 @@ export class AppManagement {
   // Imported apps default to needs_app_blueprint=0; flip it so tests can
   // exercise the blueprint approval flow against an imported fixture.
   async enableAppBlueprintForCurrentApp() {
+    await this.setNeedsAppBlueprintForCurrentApp(true);
+  }
+
+  async setNeedsAppBlueprintForCurrentApp(value: boolean) {
     const appName = await this.getCurrentAppName();
-    if (!appName) {
-      throw new Error("No current app to enable blueprint for");
-    }
-    await this.page.evaluate(async (appName) => {
-      await (window as any).electron.ipcRenderer.invoke(
-        "test:set-needs-app-blueprint",
-        { appName, value: true },
-      );
+    if (!appName) throw new Error("No current app to update blueprint state");
+    await this.page.evaluate(
+      async ({ appName, value }) => {
+        await (window as any).electron.ipcRenderer.invoke(
+          "test:set-needs-app-blueprint",
+          { appName, value },
+        );
+      },
+      { appName, value },
+    );
+  }
+
+  async getCurrentAppProcessId(): Promise<number | null> {
+    const appName = await this.getCurrentAppName();
+    if (!appName) throw new Error("No current app to inspect");
+    return this.page.evaluate(async (appName) => {
+      return (await (window as any).electron.ipcRenderer.invoke(
+        "test:get-app-process-id",
+        { appName },
+      )) as number | null;
     }, appName);
   }
 
@@ -225,6 +242,13 @@ export class AppManagement {
     });
     await this.page.getByRole("button", { name: "Select Folder" }).click();
     await this.page.getByRole("button", { name: "Import" }).click();
+    // Import opens the new app's chat once the main process answers. Return
+    // only when that navigation has landed: a caller that navigates in the
+    // meantime (goToChatTab's Apps click) races the pending route change and
+    // can end up on home with the app pane closed.
+    await expect(this.page.getByTestId("chat-input-container")).toBeVisible({
+      timeout: Timeout.MEDIUM,
+    });
   }
 
   async configureGitUser({
@@ -258,18 +282,26 @@ export class AppManagement {
     const retryIntervalMs = 15_000;
     const startTime = Date.now();
     let lastOutput = "";
-
-    const checkCommand = `node -e 'const pkg=require("./package.json");const{execSync}=require("child_process");try{const prodResult=JSON.parse(execSync("pnpm list --json --depth=0",{encoding:"utf8"}));const devResult=JSON.parse(execSync("pnpm list --json --depth=0 --dev",{encoding:"utf8"}));const installed={...(prodResult[0]||{}).dependencies||{},...(devResult[0]||{}).devDependencies||{}};const expected=Object.keys({...pkg.dependencies||{},...pkg.devDependencies||{}});const missing=expected.filter(dep=>!installed[dep]);console.log(missing.length?"MISSING: "+missing.join(", "):"All dependencies installed")}catch(e){console.log("Error:",e.message)}'`;
+    const packageJson = JSON.parse(
+      readFileSync(path.join(appPath, "package.json"), "utf8"),
+    );
+    const expectedDependencies = Object.keys({
+      ...packageJson.dependencies,
+      ...packageJson.devDependencies,
+    });
 
     while (Date.now() - startTime < maxDurationMs) {
       try {
         console.log(`Checking installed dependencies in ${appPath}...`);
-        const stdout = execSync(checkCommand, {
-          cwd: appPath,
-          stdio: "pipe",
-          encoding: "utf8",
-        });
-        lastOutput = (stdout || "").toString().trim();
+        const missingDependencies = expectedDependencies.filter(
+          (dependency) =>
+            !existsSync(
+              path.join(appPath, "node_modules", dependency, "package.json"),
+            ),
+        );
+        lastOutput = missingDependencies.length
+          ? `MISSING: ${missingDependencies.join(", ")}`
+          : "All dependencies installed";
         console.log(`Dependency check output: ${lastOutput}`);
         if (lastOutput.includes("All dependencies installed")) {
           return;

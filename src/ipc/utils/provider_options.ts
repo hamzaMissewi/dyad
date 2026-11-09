@@ -1,11 +1,12 @@
-import type { SmartContextMode, UserSettings } from "../../lib/schemas";
+import type { ModelSelection, SmartContextMode } from "../../lib/schemas";
 import type { CodebaseFile } from "../../utils/codebase";
 import type { VersionedFiles } from "./versioned_codebase_context";
 import { GoogleGenerativeAIProviderOptions } from "@ai-sdk/google";
 import { OpenAIResponsesProviderOptions } from "@ai-sdk/openai";
 import {
   getAnthropicProviderOptions,
-  getThinkingBudgetEffort,
+  getGeminiThinkingBudgetTokens,
+  getModelEffort,
 } from "./thinking_utils";
 
 export interface MentionedAppCodebase {
@@ -22,7 +23,8 @@ export interface GetProviderOptionsParams {
   versionedFiles?: VersionedFiles;
   mentionedAppsCodebases: MentionedAppCodebase[];
   builtinProviderId: string | undefined;
-  settings: UserSettings;
+  reasoningEffortProviderId?: string;
+  modelSelection: ModelSelection;
 }
 
 /**
@@ -38,7 +40,8 @@ export function getProviderOptions({
   versionedFiles,
   mentionedAppsCodebases,
   builtinProviderId,
-  settings,
+  reasoningEffortProviderId,
+  modelSelection,
 }: GetProviderOptionsParams): Record<string, any> {
   const providerOptions: Record<string, any> = {
     "dyad-engine": {
@@ -55,39 +58,57 @@ export function getProviderOptions({
     },
     openai: {
       reasoningSummary: "auto",
-      reasoningEffort: getThinkingBudgetEffort(settings.thinkingBudget),
+      reasoningEffort: getModelEffort(
+        modelSelection,
+      ) as OpenAIResponsesProviderOptions["reasoningEffort"],
     } satisfies OpenAIResponsesProviderOptions,
   };
+  if (reasoningEffortProviderId) {
+    providerOptions[reasoningEffortProviderId] = {
+      reasoningEffort: getModelEffort(modelSelection),
+    };
+  }
 
   // Conditionally include Google thinking config only for supported models
-  const selectedModelName = settings.selectedModel.name || "";
+  const selectedModelName = modelSelection.name || "";
   const providerId = builtinProviderId;
   const isVertex = providerId === "vertex";
   const isGoogle = providerId === "google";
   const isPartnerModel = selectedModelName.includes("/");
   const isGeminiModel = selectedModelName.startsWith("gemini");
   const isFlashLite = selectedModelName.includes("flash-lite");
+  const effortLevel = getModelEffort(modelSelection);
+  const isKnownGeminiEffort = ["minimal", "low", "medium", "high"].includes(
+    effortLevel,
+  );
+  const thinkingConfig = {
+    includeThoughts: true,
+    ...(selectedModelName.startsWith("gemini-3") && isKnownGeminiEffort
+      ? {
+          thinkingLevel: effortLevel as "minimal" | "low" | "medium" | "high",
+        }
+      : isKnownGeminiEffort
+        ? { thinkingBudget: getGeminiThinkingBudgetTokens(effortLevel) }
+        : {}),
+  } satisfies GoogleGenerativeAIProviderOptions["thinkingConfig"];
 
-  // Keep Google provider behavior unchanged: always include includeThoughts
-  if (isGoogle) {
+  // Always request thought summaries; recognized effort levels additionally
+  // configure the model-family-specific effort control.
+  if (isGoogle && isGeminiModel && !isFlashLite && !isPartnerModel) {
     providerOptions.google = {
-      thinkingConfig: {
-        includeThoughts: true,
-      },
+      thinkingConfig,
     } satisfies GoogleGenerativeAIProviderOptions;
   }
 
   // Vertex-specific fix: only enable thinking on supported Gemini models
   if (isVertex && isGeminiModel && !isFlashLite && !isPartnerModel) {
     providerOptions.google = {
-      thinkingConfig: {
-        includeThoughts: true,
-      },
+      thinkingConfig,
     } satisfies GoogleGenerativeAIProviderOptions;
   }
 
   if (providerId === "anthropic") {
-    providerOptions.anthropic = getAnthropicProviderOptions(settings);
+    providerOptions.anthropic = getAnthropicProviderOptions(modelSelection);
   }
 
   return providerOptions;
@@ -100,14 +121,17 @@ export const DYAD_INTERNAL_REQUEST_ID_HEADER =
 
 export interface GetAiHeadersParams {
   builtinProviderId: string | undefined;
+  dyadRequestId?: string;
 }
 
 /**
- * Returns extra AI request headers for the provider (e.g. beta flags).
- * Currently none; reserved for future provider-specific headers.
+ * Returns request-scoped AI headers used by provider wrappers and diagnostics.
+ * Provider-specific headers (e.g. beta flags) can also be added here.
  */
 export function getAiHeaders(
-  _params: GetAiHeadersParams,
+  params: GetAiHeadersParams,
 ): Record<string, string> | undefined {
-  return undefined;
+  return params.dyadRequestId
+    ? { [DYAD_INTERNAL_REQUEST_ID_HEADER]: params.dyadRequestId }
+    : undefined;
 }

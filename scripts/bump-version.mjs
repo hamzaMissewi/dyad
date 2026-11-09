@@ -5,6 +5,7 @@ import { execSync } from "child_process";
 import { createInterface } from "readline";
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
+import { promotePreviousBeta } from "./promote-previous-beta.mjs";
 
 // ANSI colors
 const bold = (s) => `\x1b[1m${s}\x1b[0m`;
@@ -48,6 +49,7 @@ const options = [];
 // Current version stable: drop beta prerelease tag
 options.push({
   label: "Current version stable",
+  promotable: true,
   version: formatVersion({
     major: parsed.major,
     minor: parsed.minor,
@@ -67,6 +69,13 @@ options.push({
   }),
 });
 
+// Custom version: prompt for an exact version after selection
+options.push({
+  label: "Custom version",
+  version: null,
+  custom: true,
+});
+
 // Next beta: keep version, bump beta number (only if currently a beta)
 if (parsed.beta != null) {
   options.push({
@@ -83,7 +92,7 @@ console.log();
 options.forEach((opt, i) => {
   const num = bold(`  ${i + 1})`);
   const label = opt.label.padEnd(24);
-  const ver = magenta(`v${opt.version}`);
+  const ver = opt.custom ? dim("enter manually") : magenta(`v${opt.version}`);
   console.log(`${num} ${label} ${dim("→")} ${ver}`);
 });
 console.log();
@@ -91,15 +100,66 @@ console.log();
 const rl = createInterface({ input: process.stdin, output: process.stdout });
 
 rl.question(`  ${bold("Select option:")} `, (answer) => {
-  rl.close();
   const index = parseInt(answer) - 1;
   if (isNaN(index) || index < 0 || index >= options.length) {
+    rl.close();
     console.error(red("\n  Invalid selection.\n"));
     process.exit(1);
   }
 
   const selected = options[index];
-  const newVersion = selected.version;
+  if (selected.promotable) {
+    console.log(
+      "\n  1) Use previous beta and create release branch (recommended)",
+    );
+    console.log("  2) Promote current HEAD to stable\n");
+    rl.question(`  ${bold("Select option:")} `, async (choice) => {
+      try {
+        if (choice.trim() === "1") {
+          await promotePreviousBeta({
+            cwd: resolve(__dirname, ".."),
+            stableVersion: selected.version,
+            confirm: (message) =>
+              new Promise((resolveAnswer) =>
+                rl.question(message, resolveAnswer),
+              ),
+          });
+        } else if (choice.trim() === "2") {
+          bumpVersion(selected.version);
+        } else {
+          throw new Error("Invalid selection.");
+        }
+      } catch (error) {
+        console.error(red(`\n  ${error.message}\n`));
+        process.exitCode = 1;
+      } finally {
+        rl.close();
+      }
+    });
+    return;
+  }
+  if (selected.custom) {
+    rl.question(`  ${bold("Enter version:")} `, (customVersion) => {
+      rl.close();
+      bumpVersion(normalizeCustomVersion(customVersion));
+    });
+    return;
+  }
+
+  rl.close();
+  bumpVersion(selected.version);
+});
+
+function step(msg) {
+  console.log(`  ${green("✔")} ${msg}`);
+}
+
+function normalizeCustomVersion(version) {
+  const normalized = version.trim().replace(/^v/i, "");
+  return formatVersion(parseVersion(normalized));
+}
+
+function bumpVersion(newVersion) {
   const tag = `v${newVersion}`;
   const branchTag = tag.replaceAll(".", "-");
   const branch = `bump-to-${branchTag}`;
@@ -138,10 +198,6 @@ rl.question(`  ${bold("Select option:")} `, (answer) => {
   console.log(green(bold(`  Done!`)) + ` PR created for ${green(tag)}`);
   console.log(`  ${cyan(prUrl)}`);
   console.log();
-});
-
-function step(msg) {
-  console.log(`  ${green("✔")} ${msg}`);
 }
 
 function deleteExistingBranch(branch) {

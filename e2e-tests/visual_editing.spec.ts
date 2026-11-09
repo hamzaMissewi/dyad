@@ -5,18 +5,20 @@ const fs = require("fs");
 const path = require("path");
 
 async function saveVisualChanges(page: Page) {
+  const saveButton = page.getByRole("button", { name: "Save Changes" });
+
   await expect(async () => {
-    const saveButton = page.getByRole("button", { name: "Save Changes" });
     await expect(saveButton).toBeVisible({ timeout: 1_000 });
     await expect(saveButton).toBeEnabled({ timeout: 1_000 });
-    await saveButton.click();
   }).toPass({ timeout: Timeout.MEDIUM });
+
+  await saveButton.click();
 }
 
 testSkipIfWindows("edit style of one selected component", async ({ po }) => {
-  await po.setUpDyadPro();
+  await po.setUpDyadPro({ autoApprove: true });
   await po.sendPrompt("tc=basic");
-  await po.previewPanel.clickTogglePreviewPanel();
+  await po.previewPanel.ensurePreviewPanelOpen();
   await po.previewPanel.clickPreviewPickElement();
 
   // Select a component
@@ -82,9 +84,9 @@ testSkipIfWindows("edit style of one selected component", async ({ po }) => {
 });
 
 testSkipIfWindows("edit text of the selected component", async ({ po }) => {
-  await po.setUpDyadPro();
+  await po.setUpDyadPro({ autoApprove: true });
   await po.sendPrompt("tc=basic");
-  await po.previewPanel.clickTogglePreviewPanel();
+  await po.previewPanel.ensurePreviewPanelOpen();
   await po.previewPanel.clickPreviewPickElement();
 
   // Click on component that contains static text
@@ -151,9 +153,8 @@ testSkipIfWindows("edit text of the selected component", async ({ po }) => {
 });
 
 testSkipIfWindows("swap image via URL", async ({ po }) => {
-  await po.setUpDyadPro();
+  await po.setUpDyadPro({ autoApprove: true });
   await po.sendPrompt("tc=image-basic");
-  await po.approveProposal();
 
   // Wait for the app to rebuild with the new code
   await po.previewPanel.clickPreviewPickElement();
@@ -225,9 +226,9 @@ testSkipIfWindows("swap image via URL", async ({ po }) => {
 });
 
 testSkipIfWindows("discard changes", async ({ po }) => {
-  await po.setUpDyadPro();
+  await po.setUpDyadPro({ autoApprove: true });
   await po.sendPrompt("tc=basic");
-  await po.previewPanel.clickTogglePreviewPanel();
+  await po.previewPanel.ensurePreviewPanelOpen();
   await po.previewPanel.clickPreviewPickElement();
 
   // Select a component

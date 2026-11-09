@@ -2,6 +2,8 @@ import { z } from "zod";
 import { defineContract, createClient } from "../contracts/core";
 import { APP_FRAMEWORK_TYPES } from "../../lib/framework_constants";
 import { ChatModeSchema } from "../../lib/schemas";
+import type { AppRunInvocationRef } from "@/app_run/state";
+import type { LinkedRemoteColumns } from "@/shared/linked_remote";
 
 // =============================================================================
 // App Schemas
@@ -20,6 +22,10 @@ export const AppBaseSchema = z.object({
   githubOrg: z.string().nullable(),
   githubRepo: z.string().nullable(),
   githubBranch: z.string().nullable(),
+  gitlabInstanceUrl: z.string().nullable(),
+  gitlabProjectId: z.number().nullable(),
+  gitlabProjectPath: z.string().nullable(),
+  gitlabBranch: z.string().nullable(),
   supabaseProjectId: z.string().nullable(),
   supabaseParentProjectId: z.string().nullable(),
   supabaseOrganizationSlug: z.string().nullable(),
@@ -35,8 +41,41 @@ export const AppBaseSchema = z.object({
   installCommand: z.string().nullable(),
   startCommand: z.string().nullable(),
   isFavorite: z.boolean(),
+  testingEnabled: z.boolean(),
   collectionId: z.number().nullable(),
 });
+
+type MutuallyAssignable<Left, Right> = [Left] extends [Right]
+  ? [Right] extends [Left]
+    ? true
+    : false
+  : false;
+type AssertTrue<Value extends true> = Value;
+
+// LinkedRemoteColumns is written by hand because src/shared cannot import this
+// schema. Every field on it is optional, so a renamed column would otherwise
+// still type-check at every call site and leave the app reading as unlinked.
+const linkedRemoteColumnsTypeAssertion: AssertTrue<
+  MutuallyAssignable<
+    Pick<z.infer<typeof AppBaseSchema>, keyof LinkedRemoteColumns>,
+    Required<LinkedRemoteColumns>
+  >
+> = true;
+void linkedRemoteColumnsTypeAssertion;
+
+/**
+ * Which publishing destinations the app is connected to in Dyad: a Vercel
+ * project on the app row, or a Cloudflare or Coolify connection row. It says
+ * nothing about whether the deployment is still live on the other side.
+ */
+export const DeploymentProvidersInUseSchema = z.object({
+  vercel: z.boolean(),
+  cloudflare: z.boolean(),
+  coolify: z.boolean(),
+});
+export type DeploymentProvidersInUse = z.infer<
+  typeof DeploymentProvidersInUseSchema
+>;
 
 /**
  * Schema for a full App object as returned from the database with computed fields.
@@ -48,6 +87,7 @@ export const AppSchema = AppBaseSchema.extend({
   supabaseProjectName: z.string().nullable(),
   vercelTeamSlug: z.string().nullable(),
   resolvedPath: z.string().optional(),
+  deploymentProvidersInUse: DeploymentProvidersInUseSchema,
 });
 
 export type App = z.infer<typeof AppSchema>;
@@ -58,6 +98,7 @@ export type App = z.infer<typeof AppSchema>;
 export const CreateAppParamsSchema = z.object({
   name: z.string().min(1),
   initialChatMode: ChatModeSchema.optional(),
+  firstPromptCreationOperationId: z.string().min(1).optional(),
 });
 
 /**
@@ -125,6 +166,31 @@ export const RenameAppParamsSchema = z.object({
   appId: z.number(),
   appName: z.string(),
   appPath: z.string(),
+  // When true, name/path collisions are resolved by appending a numeric
+  // suffix (atomically, under the app lock) instead of throwing Conflict.
+  // Used by blueprint approval so generated names never block the flow.
+  autoResolveConflicts: z.boolean().optional(),
+});
+
+/**
+ * Schema for rename app result: the final display name and stored path,
+ * which may differ from the requested ones when conflicts were auto-resolved.
+ */
+export const RenameAppResultSchema = z.object({
+  name: z.string(),
+  path: z.string(),
+});
+
+/**
+ * Schema for previewing the folder name an app display name resolves to.
+ */
+export const PreviewAppFolderNameParamsSchema = z.object({
+  name: z.string(),
+  appId: z.number().optional(),
+});
+
+export const PreviewAppFolderNameResultSchema = z.object({
+  folderName: z.string(),
 });
 
 /**
@@ -134,11 +200,23 @@ export const AppIdParamsSchema = z.object({
   appId: z.number(),
 });
 
+export const AppRunInvocationRefSchema: z.ZodType<AppRunInvocationRef> =
+  z.object({
+    kind: z.literal("app-run"),
+    entityKey: z.number(),
+    operationId: z.string().min(1),
+  });
+
+export const RunAppParamsSchema = AppIdParamsSchema.extend({
+  invocationRef: AppRunInvocationRefSchema.optional(),
+});
+
 /**
  * Schema for restart app params (with optional removeNodeModules).
  */
 export const RestartAppParamsSchema = z.object({
   appId: z.number(),
+  invocationRef: AppRunInvocationRefSchema.optional(),
   removeNodeModules: z.boolean().optional(),
   recreateSandbox: z.boolean().optional(),
 });
@@ -303,6 +381,18 @@ export const AddToFavoriteResultSchema = z.object({
 });
 
 /**
+ * Schema for setting the per-app E2E testing opt-in flag.
+ */
+export const SetTestingEnabledParamsSchema = z.object({
+  appId: z.number(),
+  enabled: z.boolean(),
+});
+
+export const SetTestingEnabledResultSchema = z.object({
+  testingEnabled: z.boolean(),
+});
+
+/**
  * Schema for update app commands params.
  */
 export const UpdateAppCommandsParamsSchema = z.object({
@@ -346,6 +436,11 @@ export const appContracts = {
     channel: "create-app",
     input: CreateAppParamsSchema,
     output: CreateAppResultSchema,
+    invalidates: () => [
+      { family: "apps" },
+      { family: "chats" },
+      { family: "app-name" },
+    ],
   }),
 
   getApp: defineContract({
@@ -364,29 +459,66 @@ export const appContracts = {
     channel: "delete-app",
     input: DeleteAppParamsSchema,
     output: z.void(),
+    invalidates: () => [
+      { family: "apps" },
+      { family: "chats" },
+      { family: "app-collections" },
+      { family: "app-name" },
+    ],
+    originHandles: () => [{ family: "apps" }, { family: "app-collections" }],
   }),
 
   deleteApps: defineContract({
     channel: "delete-apps",
     input: DeleteAppsParamsSchema,
     output: DeleteAppsResultSchema,
+    invalidates: (_input, output) =>
+      output.results.some((result) => result.success)
+        ? [
+            { family: "apps" },
+            { family: "chats" },
+            { family: "app-collections" },
+            { family: "app-name" },
+          ]
+        : [],
+    originHandles: (_input, output) =>
+      output.results.some((result) => result.success)
+        ? [{ family: "apps" }, { family: "app-collections" }]
+        : [],
   }),
 
   copyApp: defineContract({
     channel: "copy-app",
     input: CopyAppParamsSchema,
     output: CopyAppResultSchema,
+    invalidates: () => [
+      { family: "apps" },
+      { family: "chats" },
+      { family: "app-name" },
+    ],
   }),
 
   renameApp: defineContract({
     channel: "rename-app",
     input: RenameAppParamsSchema,
-    output: z.void(),
+    output: RenameAppResultSchema,
+    invalidates: (input) => [
+      { family: "apps" },
+      { family: "app", appId: input.appId },
+      { family: "app-name" },
+    ],
+    originHandles: () => [{ family: "apps" }],
+  }),
+
+  previewAppFolderName: defineContract({
+    channel: "preview-app-folder-name",
+    input: PreviewAppFolderNameParamsSchema,
+    output: PreviewAppFolderNameResultSchema,
   }),
 
   runApp: defineContract({
     channel: "run-app",
-    input: AppIdParamsSchema,
+    input: RunAppParamsSchema,
     output: z.void(),
   }),
 
@@ -418,6 +550,7 @@ export const appContracts = {
     channel: "edit-app-file",
     input: EditAppFileParamsSchema,
     output: EditAppFileResultSchema,
+    invalidates: (input) => [{ family: "versions", appId: input.appId }],
   }),
 
   readAppFile: defineContract({
@@ -442,18 +575,43 @@ export const appContracts = {
     channel: "change-app-location",
     input: ChangeAppLocationParamsSchema,
     output: ChangeAppLocationResultSchema,
+    invalidates: (input) => [
+      { family: "apps" },
+      { family: "app", appId: input.appId },
+      { family: "app-name" },
+    ],
   }),
 
   renameBranch: defineContract({
     channel: "rename-branch",
     input: RenameBranchParamsSchema,
     output: z.void(),
+    invalidates: (input) => [
+      { family: "branches", appId: input.appId },
+      { family: "versions", appId: input.appId },
+    ],
   }),
 
   addToFavorite: defineContract({
     channel: "add-to-favorite",
     input: AppIdParamsSchema,
     output: AddToFavoriteResultSchema,
+    invalidates: (input) => [
+      { family: "apps" },
+      { family: "app", appId: input.appId },
+    ],
+    originHandles: () => [{ family: "apps" }],
+  }),
+
+  setTestingEnabled: defineContract({
+    channel: "set-testing-enabled",
+    input: SetTestingEnabledParamsSchema,
+    output: SetTestingEnabledResultSchema,
+    invalidates: (input) => [
+      { family: "apps" },
+      { family: "app", appId: input.appId },
+    ],
+    originHandles: (input) => [{ family: "app", appId: input.appId }],
   }),
 
   selectAppLocation: defineContract({
@@ -478,6 +636,7 @@ export const appContracts = {
     channel: "update-app-commands",
     input: UpdateAppCommandsParamsSchema,
     output: z.void(),
+    invalidates: (input) => [{ family: "app", appId: input.appId }],
   }),
 
   /**

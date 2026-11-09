@@ -32,8 +32,10 @@ import { isIpcInvokeEnvelope, unwrapIpcEnvelope } from "@/ipc/contracts/core";
 import {
   VALID_INVOKE_CHANNELS,
   VALID_RECEIVE_CHANNELS,
+  VALID_SEND_CHANNELS,
 } from "@/ipc/preload/channels";
 import type { ElectronMockShared } from "./electron_mock";
+import { configureTrustedRenderer } from "@/ipc/utils/renderer_security";
 
 type Listener = (...args: unknown[]) => void;
 
@@ -89,6 +91,7 @@ export interface RendererIpcBridge {
   /** The fake IpcMainInvokeEvent handed to every invoked handler. */
   fakeEvent: {
     sender: {
+      id: number;
       isDestroyed: () => boolean;
       isCrashed: () => boolean;
       send: (channel: string, ...args: unknown[]) => void;
@@ -135,6 +138,11 @@ export function installRendererIpcBridge(
     );
   }
 
+  configureTrustedRenderer({
+    devServerUrl: "http://localhost:5173",
+    packagedRendererUrl: "file:///app/renderer/main_window/index.html",
+  });
+
   const listeners = new Map<string, Set<Listener>>();
   const onceWaiters = new Map<string, Set<OnceWaiter>>();
   const missingChannels = new Set<string>();
@@ -150,6 +158,12 @@ export function installRendererIpcBridge(
   const assertValidInvokeChannel = (channel: string) => {
     if (!validateChannels) return;
     if (!(VALID_INVOKE_CHANNELS as readonly string[]).includes(channel)) {
+      throw new Error(`Invalid channel: ${channel}`);
+    }
+  };
+  const assertValidSendChannel = (channel: string) => {
+    if (!validateChannels) return;
+    if (!(VALID_SEND_CHANNELS as readonly string[]).includes(channel)) {
       throw new Error(`Invalid channel: ${channel}`);
     }
   };
@@ -227,12 +241,29 @@ export function installRendererIpcBridge(
   // The fake IpcMainInvokeEvent. Its sender.send IS the renderer event bus:
   // main-process code calling `event.sender.send(...)` (e.g. safeSend in
   // chat_stream_handlers) lands directly in window.electron listeners.
+  const frame = { url: "http://localhost:5173/" };
   const fakeEvent = {
     sender: {
+      id: 1,
+      mainFrame: frame,
       isDestroyed: () => false,
       isCrashed: () => false,
       send,
     },
+    senderFrame: frame,
+  };
+
+  // The renderer's one-way `ipcRenderer.send`: fans out to the ipcMain.on
+  // listeners captured by the electron mock, matching preload's `send` ->
+  // main's `ipcMain.on`. Fire-and-forget, so there's no reply to await.
+  const sendToMain = (channel: string, ...args: unknown[]) => {
+    assertValidSendChannel(channel);
+    const clonedArgs = cloneAcrossBoundary(args, `send-to-main ${channel}`);
+    const subs = shared.ipcListeners?.get(channel);
+    if (!subs?.length) return;
+    for (const listener of Array.from(subs)) {
+      listener(fakeEvent, ...clonedArgs);
+    }
   };
 
   const invokeRaw = (channel: string, ...args: unknown[]) => {
@@ -296,6 +327,7 @@ export function installRendererIpcBridge(
       ),
     invokeEnvelope: (channel: string, ...args: unknown[]) =>
       invokeRaw(channel, ...args),
+    send: (channel: string, ...args: unknown[]) => sendToMain(channel, ...args),
     on: (channel: string, listener: Listener) => {
       if (!isValidReceiveChannel(channel)) {
         // Same behavior as preload.ts's `on`.
@@ -384,22 +416,31 @@ export function installRendererIpcBridge(
   const settleInFlight = async (timeoutMs = 5_000): Promise<void> => {
     const deadline = Date.now() + timeoutMs;
     // A settling invoke can schedule follow-up invokes (a query's onSuccess,
-    // a dependent query), so drain repeatedly until the set stays empty.
+    // a dependent query), so drain repeatedly until the set stays empty for a
+    // complete event-loop turn. Waiting only for the currently tracked
+    // promises is insufficient: their renderer-side `.then()` continuations
+    // run after the raw invoke leaves `inFlight` and can enqueue more work.
     // On timeout this THROWS (listing the stuck channels) instead of
     // returning: a silent success here made a deadlocked handler
     // indistinguishable from a clean teardown.
-    while (inFlight.size > 0) {
+    while (true) {
       const remainingMs = deadline - Date.now();
       if (remainingMs <= 0) {
         throw settleTimeoutError(timeoutMs);
       }
-      const didSettle = await waitForBatchOrTimeout(
-        Array.from(inFlight.keys()),
-        remainingMs,
-      );
-      if (!didSettle && inFlight.size > 0) {
-        throw settleTimeoutError(timeoutMs);
+      if (inFlight.size > 0) {
+        const didSettle = await waitForBatchOrTimeout(
+          Array.from(inFlight.keys()),
+          remainingMs,
+        );
+        if (!didSettle && inFlight.size > 0) {
+          throw settleTimeoutError(timeoutMs);
+        }
+        continue;
       }
+
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      if (inFlight.size === 0) return;
     }
   };
 

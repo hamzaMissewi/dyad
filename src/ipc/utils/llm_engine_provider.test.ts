@@ -6,7 +6,10 @@ import type {
 } from "@ai-sdk/provider";
 
 import type { UserSettings } from "../../lib/schemas";
-import { createDyadEngine } from "./llm_engine_provider";
+import {
+  createDyadEngine,
+  transcribeWithDyadEngine,
+} from "./llm_engine_provider";
 
 describe("createDyadEngine", () => {
   test("uses Anthropic messages API for Anthropic engine models", async () => {
@@ -24,8 +27,12 @@ describe("createDyadEngine", () => {
         enableWebSearch: false,
       },
       settings: {
-        thinkingBudget: "medium",
-      } as UserSettings,
+        selectedModel: {
+          provider: "anthropic",
+          name: "claude-sonnet-4-20250514",
+          effortLevel: "medium",
+        },
+      } as unknown as UserSettings,
       fetch: async (input, init) => {
         requests.push({ input, init });
 
@@ -71,17 +78,26 @@ describe("createDyadEngine", () => {
     expect(String(request.input)).toBe(
       "https://engine.example.test/v1/messages",
     );
-    expect(request.init?.headers).toMatchObject({
-      authorization: "Bearer dyad-pro-key",
-      "X-Dyad-Request-Id": "request-1:attempt-1",
-    });
+    expect(new Headers(request.init?.headers).get("authorization")).toBe(
+      "Bearer dyad-pro-key",
+    );
+    expect(new Headers(request.init?.headers).get("X-Dyad-Request-Id")).toBe(
+      "request-1:attempt-1",
+    );
+    expect(new Headers(request.init?.headers).get("anthropic-beta")).toContain(
+      "thinking-binding-controls-2026-08-01",
+    );
 
     const body = JSON.parse(String(request.init?.body));
     expect(body).toMatchObject({
       model: "claude-sonnet-4-20250514",
       messages: [{ role: "user", content: [{ type: "text", text: "Hello" }] }],
       system: [{ type: "text", text: "You are concise." }],
-      thinking: { type: "adaptive", display: "summarized" },
+      thinking: {
+        type: "adaptive",
+        display: "summarized",
+        block_binding: { prefix_mismatch_behavior: "drop_block" },
+      },
       output_config: { effort: "medium" },
       dyad_options: {
         app_id: 42,
@@ -212,5 +228,34 @@ describe("createDyadEngine", () => {
       "X-Dyad-Request-Id": "visible-turn-1:attempt-1",
       "X-Dyad-Free-Quota-Key": "visible-turn-1",
     });
+  });
+});
+
+describe("transcribeWithDyadEngine", () => {
+  test("uses the Dyad transcription model alias", async () => {
+    let request: { input: RequestInfo | URL; init?: RequestInit } | undefined;
+
+    const text = await transcribeWithDyadEngine(
+      Buffer.from("audio"),
+      "recording.webm",
+      "request-1",
+      {
+        apiKey: "dyad-pro-key",
+        baseURL: "https://engine.example.test/v1",
+        dyadOptions: {},
+        settings: {} as UserSettings,
+        fetch: async (input, init) => {
+          request = { input, init };
+          return Response.json({ text: "transcribed" });
+        },
+      },
+    );
+
+    expect(text).toBe("transcribed");
+    expect(String(request?.input)).toBe(
+      "https://engine.example.test/v1/audio/transcriptions",
+    );
+    const formData = request?.init?.body as FormData;
+    expect(formData.get("model")).toBe("dyad/transcribe");
   });
 });

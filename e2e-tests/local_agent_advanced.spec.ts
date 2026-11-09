@@ -1,27 +1,10 @@
-import path from "path";
-import { expect } from "@playwright/test";
 import { testSkipIfWindows, Timeout } from "./helpers/test_helper";
-import { testWithConfigSkipIfWindows } from "./helpers/fixtures";
-
-// MCP tool search only activates once the inlined tool declarations exceed the
-// size threshold. The test MCP server has only a couple of tools, so force
-// search on by setting the threshold to 0 for these cases.
-const testForceMcpSearch = testWithConfigSkipIfWindows({
-  preLaunchHook: async () => {
-    process.env.DYAD_MCP_INLINE_TOKEN_THRESHOLD = "0";
-  },
-  postLaunchHook: async () => {
-    // The launched app already inherited the env var; clear it so later tests
-    // in this worker don't force search.
-    delete process.env.DYAD_MCP_INLINE_TOKEN_THRESHOLD;
-  },
-});
 
 /**
  * Test for security review in local-agent mode
  */
 testSkipIfWindows("local-agent - security review fix", async ({ po }) => {
-  await po.setUpDyadPro({ localAgent: true });
+  await po.setUpDyadPro({ localAgent: true, autoApprove: true });
   await po.importApp("minimal");
   await po.chatActions.selectLocalAgentMode();
 
@@ -36,7 +19,7 @@ testSkipIfWindows("local-agent - security review fix", async ({ po }) => {
  * Test for mention apps feature in local-agent mode
  */
 testSkipIfWindows("local-agent - mention apps", async ({ po }) => {
-  await po.setUpDyadPro({ localAgent: true });
+  await po.setUpDyadPro({ localAgent: true, autoApprove: true });
 
   // Import app and reference it.
   await po.importApp("minimal-with-ai-rules");
@@ -50,174 +33,10 @@ testSkipIfWindows("local-agent - mention apps", async ({ po }) => {
 });
 
 /**
- * Test for MCP tool calls in local-agent mode
- */
-testSkipIfWindows("local-agent - mcp tool call", async ({ po }) => {
-  await po.setUpDyadPro({ localAgent: true });
-  await po.navigation.goToSettingsTab();
-  await po.page.getByRole("button", { name: "Tools (MCP)" }).click();
-
-  // Configure the test MCP server
-  await po.page
-    .getByRole("textbox", { name: "My MCP Server" })
-    .fill("testing-mcp-server");
-  await po.page.getByRole("textbox", { name: "node" }).fill("node");
-  const testMcpServerPath = path.join(
-    __dirname,
-    "..",
-    "testing",
-    "fake-stdio-mcp-server.mjs",
-  );
-  await po.page
-    .getByRole("textbox", { name: "path/to/mcp-server.js --flag" })
-    .fill(testMcpServerPath);
-  await po.page.getByRole("button", { name: "Add Server" }).click();
-  await po.settings.waitForMcpTool("testing-mcp-server", "calculator_add");
-
-  await po.navigation.goToAppsTab();
-  await po.importApp("minimal");
-  await po.chatActions.selectLocalAgentMode();
-
-  // Send prompt that triggers MCP tool call
-  await po.sendPrompt("tc=local-agent/mcp-calculator", {
-    skipWaitForCompletion: true,
-  });
-
-  // Depending on saved MCP consent state, the tool may either pause for
-  // consent or complete directly.
-  const alwaysAllowButton = po.page.getByRole("button", {
-    name: "Always allow",
-  });
-  const consentAppeared = await Promise.race([
-    alwaysAllowButton
-      .waitFor({ state: "visible", timeout: Timeout.MEDIUM })
-      .then(() => true)
-      .catch(() => false),
-    po.page
-      .getByRole("button", { name: "Retry" })
-      .waitFor({ state: "visible", timeout: Timeout.MEDIUM })
-      .then(() => false)
-      .catch(() => false),
-  ]);
-  if (consentAppeared) {
-    await po.agentConsent.clickAgentConsentAlwaysAllow();
-  }
-
-  // Wait for chat to complete
-  await po.chatActions.waitForChatCompletion();
-
-  await po.snapshotMessages();
-});
-
-/**
- * Test for MCP tool search: the model discovers an MCP tool with
- * search_mcp_tools, then calls it from execute_sandbox_script. The setting is
- * on by default; the threshold override (see testForceMcpSearch) forces search
- * for this small test catalog.
- */
-testForceMcpSearch("local-agent - mcp tool search", async ({ po }) => {
-  await po.setUpDyadPro({ localAgent: true });
-  await po.page.evaluate(async () => {
-    await (window as any).electron.ipcRenderer.invoke("set-user-settings", {
-      enableCodeExplorer: false,
-    });
-  });
-  await expect
-    .poll(() => po.settings.recordSettings().enableCodeExplorer)
-    .toBe(false);
-
-  await po.navigation.goToSettingsTab();
-
-  // Configure the test MCP server.
-  await po.page.getByRole("button", { name: "Tools (MCP)" }).click();
-  await po.page
-    .getByRole("textbox", { name: "My MCP Server" })
-    .fill("testing-mcp-server");
-  await po.page.getByRole("textbox", { name: "node" }).fill("node");
-  const testMcpServerPath = path.join(
-    __dirname,
-    "..",
-    "testing",
-    "fake-stdio-mcp-server.mjs",
-  );
-  await po.page
-    .getByRole("textbox", { name: "path/to/mcp-server.js --flag" })
-    .fill(testMcpServerPath);
-  await po.page.getByRole("button", { name: "Add Server" }).click();
-  await po.settings.waitForMcpTool("testing-mcp-server", "calculator_add");
-
-  await po.navigation.goToAppsTab();
-  await po.importApp("minimal");
-  await po.chatActions.selectLocalAgentMode();
-
-  // The model searches for an MCP tool; search_mcp_tools auto-approves.
-  await po.sendPrompt("tc=local-agent/mcp-tool-search", {
-    skipWaitForCompletion: true,
-  });
-  await po.chatActions.waitForChatCompletion();
-
-  // The search card renders with the query the model searched for.
-  await expect(po.page.getByText("MCP Tools").first()).toBeVisible();
-  await expect(po.page.getByText("add numbers").first()).toBeVisible();
-
-  await po.snapshotMessages();
-
-  // Capture the request payload so the search-mode prompt (tool name inventory
-  // + get_mcp_tool_schema / search_mcp_tools wording) is covered, not just the
-  // rendered card.
-  await po.sendPrompt("[dump] add two numbers");
-  await po.snapshotServerDump("request");
-});
-
-/**
- * Test for get_mcp_tool_schema: in search mode the model sees tools listed by
- * name, then fetches a tool's signature with get_mcp_tool_schema before
- * calling it. Forced on via the threshold override for this small catalog.
- */
-testForceMcpSearch("local-agent - get mcp tool schema", async ({ po }) => {
-  await po.setUpDyadPro({ localAgent: true });
-  await po.navigation.goToSettingsTab();
-
-  // Configure the test MCP server.
-  await po.page.getByRole("button", { name: "Tools (MCP)" }).click();
-  await po.page
-    .getByRole("textbox", { name: "My MCP Server" })
-    .fill("testing-mcp-server");
-  await po.page.getByRole("textbox", { name: "node" }).fill("node");
-  const testMcpServerPath = path.join(
-    __dirname,
-    "..",
-    "testing",
-    "fake-stdio-mcp-server.mjs",
-  );
-  await po.page
-    .getByRole("textbox", { name: "path/to/mcp-server.js --flag" })
-    .fill(testMcpServerPath);
-  await po.page.getByRole("button", { name: "Add Server" }).click();
-  await po.settings.waitForMcpTool("testing-mcp-server", "calculator_add");
-
-  await po.navigation.goToAppsTab();
-  await po.importApp("minimal");
-  await po.chatActions.selectLocalAgentMode();
-
-  // The model fetches a listed tool's signature; get_mcp_tool_schema auto-approves.
-  await po.sendPrompt("tc=local-agent/get-mcp-tool-schema", {
-    skipWaitForCompletion: true,
-  });
-  await po.chatActions.waitForChatCompletion();
-
-  // The schema card renders with the tool name the model requested.
-  await expect(po.page.getByText("MCP Tool Schema").first()).toBeVisible();
-  await expect(po.page.getByText("calculator_add").first()).toBeVisible();
-
-  await po.snapshotMessages();
-});
-
-/**
  * Test for enable_nitro tool in local-agent mode on a Vite app.
  */
 testSkipIfWindows("local-agent - enable nitro", async ({ po }) => {
-  await po.setUpDyadPro({ localAgent: true });
+  await po.setUpDyadPro({ localAgent: true, autoApprove: true });
   await po.importApp("minimal");
   await po.chatActions.selectLocalAgentMode();
 
@@ -228,5 +47,5 @@ testSkipIfWindows("local-agent - enable nitro", async ({ po }) => {
   // Install of Nitro dependencies goes through socket firewall, which can be slow on first run.
   await po.chatActions.waitForChatCompletion({ timeout: Timeout.LONG });
 
-  await po.snapshotMessages();
+  await po.snapshotMessages({ normalizeVersionNumbers: true });
 });

@@ -1,6 +1,5 @@
 import { useState, useEffect } from "react";
 import { createPortal } from "react-dom";
-import { useAtomValue } from "jotai";
 import {
   Loader2,
   CheckCircle2,
@@ -19,13 +18,13 @@ import {
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { imageGenerationJobsAtom } from "@/atoms/imageGenerationAtoms";
+import { useImageGenerationJobs } from "@/image_generation/hooks";
 import type {
-  ImageGenerationJob,
+  ImageGenerationJobView,
   ImageGenerationStatus,
-} from "@/atoms/imageGenerationAtoms";
-import { buildDyadMediaUrl } from "@/lib/dyadMediaUrl";
-import { useCancelImageGeneration } from "@/hooks/useGenerateImage";
+} from "@/image_generation/state";
+import { buildDyadMediaUrlForApp } from "@/lib/dyadMediaUrl";
+import { useGenerateImage } from "@/hooks/useGenerateImage";
 import { ImageLightbox } from "@/components/chat/ImageLightbox";
 
 const THEME_LABELS: Record<string, string> = {
@@ -39,6 +38,10 @@ function StatusIcon({ status }: { status: ImageGenerationStatus }) {
   switch (status) {
     case "pending":
       return <Loader2 className="w-4 h-4 text-primary animate-spin shrink-0" />;
+    case "cancelling":
+      return (
+        <Loader2 className="w-4 h-4 text-muted-foreground animate-spin shrink-0" />
+      );
     case "success":
       return <CheckCircle2 className="w-4 h-4 text-green-500 shrink-0" />;
     case "error":
@@ -54,6 +57,12 @@ function StatusLabel({ status }: { status: ImageGenerationStatus }) {
       return (
         <Badge variant="secondary" className="text-xs">
           Generating
+        </Badge>
+      );
+    case "cancelling":
+      return (
+        <Badge variant="secondary" className="text-xs text-muted-foreground">
+          Cancelling
         </Badge>
       );
     case "success":
@@ -94,9 +103,9 @@ function RelativeTime({ timestamp }: { timestamp: number }) {
   return <span className="text-xs text-muted-foreground">{label}</span>;
 }
 
-function ImageGenerationCard({ job }: { job: ImageGenerationJob }) {
+function ImageGenerationCard({ job }: { job: ImageGenerationJobView }) {
   const [expanded, setExpanded] = useState(false);
-  const cancelGeneration = useCancelImageGeneration();
+  const { cancel } = useGenerateImage();
   const [imgError, setImgError] = useState(false);
   const [lightboxOpen, setLightboxOpen] = useState(false);
 
@@ -134,10 +143,18 @@ function ImageGenerationCard({ job }: { job: ImageGenerationJob }) {
 
           {/* Image preview or placeholder */}
           <div>
-            {job.status === "pending" ? (
+            {job.status === "pending" || job.status === "cancelling" ? (
               <div className="w-full aspect-video max-w-xs rounded-lg border-2 border-dashed border-muted-foreground/25 flex flex-col items-center justify-center gap-2 bg-muted/10">
-                <Loader2 className="h-6 w-6 text-primary animate-spin" />
-                <p className="text-xs text-muted-foreground">Generating...</p>
+                <Loader2
+                  className={`h-6 w-6 animate-spin ${
+                    job.status === "pending"
+                      ? "text-primary"
+                      : "text-muted-foreground"
+                  }`}
+                />
+                <p className="text-xs text-muted-foreground">
+                  {job.status === "pending" ? "Generating..." : "Cancelling..."}
+                </p>
               </div>
             ) : job.status === "success" && job.result ? (
               imgError ? (
@@ -151,8 +168,8 @@ function ImageGenerationCard({ job }: { job: ImageGenerationJob }) {
                   onClick={() => setLightboxOpen(true)}
                 >
                   <img
-                    src={buildDyadMediaUrl(
-                      job.result.appPath,
+                    src={buildDyadMediaUrlForApp(
+                      job.result.appId,
                       job.result.fileName,
                     )}
                     alt="Generated image"
@@ -192,7 +209,7 @@ function ImageGenerationCard({ job }: { job: ImageGenerationJob }) {
               size="sm"
               variant="outline"
               className="text-xs"
-              onClick={() => cancelGeneration(job.id)}
+              onClick={() => cancel(job.id)}
             >
               Cancel
             </Button>
@@ -204,8 +221,8 @@ function ImageGenerationCard({ job }: { job: ImageGenerationJob }) {
         job.result &&
         createPortal(
           <ImageLightbox
-            imageUrl={buildDyadMediaUrl(
-              job.result.appPath,
+            imageUrl={buildDyadMediaUrlForApp(
+              job.result.appId,
               job.result.fileName,
             )}
             alt={job.prompt}
@@ -225,7 +242,7 @@ export function ImageGenerationProgressDialog({
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
-  const recentJobs = useAtomValue(imageGenerationJobsAtom);
+  const recentJobs = useImageGenerationJobs();
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>

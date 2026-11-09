@@ -14,13 +14,25 @@ If a workflow's behavior depends on a deterministic check (identity comparisons,
 - When one branch doesn't need judgment (e.g., posting a fixed reply), drop the LLM entirely and use `gh` directly.
 - Add `github.event.*.user.type != 'Bot'` to prevent bot-comment loops when the same workflow can be triggered by its own output.
 
+For maintainer comment commands on external PRs, verify the commenter’s current repository write permission in a job without secrets before starting Claude. Do not authorize from `author_association` or the PR author. Use a comment-specific workflow concurrency key so an unauthorized comment cannot cancel a running review before authorization. After authorization, use one PR-number concurrency group across review generation and posting (e.g. a reusable-workflow call job); automatic and manual triggers must share it. Posting steps must also skip cancellation rather than use `always()`.
+
 ## Split LLM decisions from credentialed mutations
 
+`actions/checkout` rejects fork PR heads under `pull_request_target` unless `allow-unsafe-pr-checkout: true` is explicit. Use that opt-in only for the Windows reviewer's intentional, author-allowlisted code execution; keep trusted helper checkouts on the base SHA without the opt-in.
+
 When a Claude workflow needs write credentials, prefer a two-job shape: the Claude job runs with read-only permissions and uploads a constrained JSON/Markdown artifact, then a separate `needs:` job downloads the artifact, checks out trusted helper scripts from `github.sha`, validates the artifact, creates the GitHub App token, and performs deterministic GitHub mutations.
+
+When a headless Claude job must write local handoff artifacts, exclude project/local settings with `claude_args --setting-sources user`, explicitly pre-approve its inspection tools, and scope `Edit(...)` to the output directory via `--allowedTools`. Without the setting-source restriction, the repository's broad project allowlist merges with the scoped rule and defeats the intended boundary. After the action, verify every mandatory file with `test -s` before upload: `actions/upload-artifact`'s `if-no-files-found: error` still succeeds when only one of several listed paths exists, and Claude Code can report a successful session after denied tool calls.
+
+When validating Markdown tables from an agent artifact, recognize separator rows by matching the complete row or every cell, not with a substring check such as `line.includes("---")`. Valid filenames and issue titles can contain three consecutive hyphens, and dropping one such row makes the summary and structured findings disagree.
+
+If a PR review run is green but inline comments are missing, inspect the separate `post-claude-review` job: findings validation uses `continue-on-error` and can skip all inline comments while still posting the summary. Check the artifact for presentation-only title differences before treating the finding as absent.
 
 ## Harden the agent's permissions — `.claude/settings.json` merges into CI
 
 Both `claude-code-action` and `claude-code-base-action` read `.claude/settings.json` from the workspace after `actions/checkout`, and the project's file is committed (tracked in git). **`permissions.allow` arrays merge across scopes — they do not replace each other.** From the Claude Code docs: _"Array settings merge across scopes. When the same array-valued setting (such as `permissions.allow`) appears in multiple scopes, the arrays are concatenated and deduplicated, not replaced."_ ([source](https://code.claude.com/docs/en/settings)).
+
+When upgrading the standalone `claude-code-base-action`, do not infer its bundled Claude Code version from the latest release tag: the repository can continue receiving immutable sync commits after tagged releases stop. Inspect `action.yml` at the exact commit, pin that SHA, and annotate the bundled CLI version so model compatibility is reviewable. Also verify its declared inputs: versions that do not declare `model` or `allowed_tools` ignore those top-level inputs with an `Unexpected input(s)` warning, so pass the equivalent `--model` and `--allowedTools` flags through `claude_args`.
 
 This has two consequences that bite in CI:
 
@@ -32,7 +44,7 @@ This has two consequences that bite in CI:
 **How to apply** (layered defenses, pick what fits the job):
 
 1. **Skip `actions/checkout` entirely** when the agent doesn't need repo contents (classification, summarization, structured-output jobs). Without checkout, `.claude/settings.json` is never in the workspace.
-2. **Strip the file after checkout** when the job does need the repo: add a step `run: rm -f .claude/settings.json .claude/settings.local.json` immediately after `actions/checkout`, before invoking the action. This is the right move for fork checkouts where the file is attacker-controlled.
+2. **Disable project/local setting sources** when the job needs the repo but not its Claude configuration: pass `--setting-sources user` in `claude_args`. This is more reliable than deleting `.claude/settings*.json` before `claude-code-action`, because newer action versions restore sensitive configuration paths from the trusted base ref before launching Claude. For `claude-code-base-action`, which does not restore project configuration, stripping the files after checkout remains an option.
 3. **Pass an inline `settings:` input** with an explicit `deny` list. This merges too, but `deny` beats `allow`, so it's an additional belt-and-suspenders layer. The action's `settings` input accepts a JSON string or a file path. Example for a tool-less classifier:
    ```yaml
    settings: |
@@ -46,3 +58,26 @@ This has two consequences that bite in CI:
 4. **For untrusted-input jobs, combine all three.** `closed-issue-comment.yml` is the reference example: no checkout, defensive `rm` tripwire (in case checkout gets re-added), and an inline deny-all `settings:`.
 
 **Verify before merging a new claude-code-action workflow:** mentally compute the effective allowlist as `project .claude/settings.json` ∪ `allowed_tools input` ∪ `inline settings allow`, minus any `deny`. If that union is wider than the job actually needs — especially if the job handles untrusted input or checks out a fork — apply the mitigations above.
+
+## Scope `Write`/`Edit`/`Read` rules to absolute workspace paths
+
+`--allowedTools` path patterns follow gitignore-style anchoring: `//path` is absolute, `/path` is relative to the project root, and a bare `path` is relative to the **shell's current directory**. That last one moves: Claude Code auto-allows read-only Bash such as `cd` and `jq` even when `Bash` is not in the allowlist, and the shell keeps its directory between calls. In the PR #4712 review run the model ran `cd /home/runner/work/dyad/dyad/tmp/pr-review && jq ...`, after which `Edit(tmp/pr-review/**)` resolved to `tmp/pr-review/tmp/pr-review/**` and both output writes were denied ("Claude requested permissions to write to ..., but you haven't granted it yet"), failing the job. Runs whose model `cd`s back to the repo root pass, which makes this look like a flake.
+
+Earlier, `claude-triage.yml` granted `Edit(/tmp/issue-triage/**)` while the decision file lived in the workspace, so every write was denied (`permission_denials_count: 13`, dyad-sh/dyad#4427).
+
+Anchor path rules to the checkout with `/${{ github.workspace }}/...` (the workspace is already absolute, so this yields `//home/runner/...`), and name the exact output files rather than a directory glob: `Edit(/${{ github.workspace }}/tmp/issue-triage/triage.json)`. An `Edit` rule also covers `Write` creating the file. To check a rule change locally, run `claude -p --setting-sources user --allowedTools "..."` in a scratch git repo, have it `cd` into a subdirectory before writing, and read `permission_denials` from `--output-format json`.
+
+When reviewing untrusted PR text in a credentialed process, disabling shell tools is insufficient: unscoped readers can expose `/proc`, user state, or runner temp files through public review artifacts. Scope reads and enforce canonical paths for Read/Grep/Glob in a trusted `PreToolUse` hook, including recursive-search and symlink checks. Use CLI >=2.1.295 with hook `onFailure: "block"` for launch errors and timeouts; a shell `|| exit 2` only covers failures after the shell starts.
+
+## Proxy authentication and diagnostics
+
+- A GitHub debug rerun does not enable the actions' `show_full_output` input. When a run reports `is_error: true` without its underlying error, temporarily enable that input to expose Claude's response; full output includes tool results and is visible in public Actions logs.
+
+- All Claude workflow jobs use `claude-opus-5-5`, connect to Tailscale with `tag:gha-dyad` and route Claude requests to `http://100.73.172.24:8081` using `secrets.UNDERCLASS_KEY` for the `anthropic_api_key` input. Keep `ANTHROPIC_BASE_URL` scoped to the Claude step and Tailscale credentials scoped to the connection step; the separate GitHub mutation jobs do not need tailnet access. Full-output logging is off by default. Use an Opus 5.5-compatible CLI pin (the full action bundles 2.1.280; the base action bundles 2.1.300), not the older 2.1.216/2.1.219 pins.
+
+## Issue triage (`claude-triage.yml`) layout
+
+- Read issue environment variables with individually allowlisted literal commands such as `Bash(printenv ISSUE_NUMBER)` and matching prompt instructions. `Bash(echo:*)` does not pre-approve `echo "$ISSUE_NUMBER"`: Claude Code can reject variable expansion with "A variable in this command can't be checked before it runs". Never guess the triggering issue from recent issues when metadata cannot be read.
+- The agent only writes `tmp/issue-triage/triage.json`; `scripts/issue-triage/triage-comment.mjs` validates it (enum fields, link-host allowlist, @-mention stripping, length caps, `fixedIn` must be a published release) and composes the single reporter-facing comment. To change what the bot tells reporters, add or edit an entry in `.github/prompts/triage-playbook.md` first; edit the prompt only for behavior rules.
+- Trusted context (current version, `gh release list` minus drafts, GitHub/Supabase `status.json`, playbook) comes from `scripts/issue-triage/prepare-context.mjs` in a trusted step and reaches the prompt through `TEMPLATE_VARS_PATH` in `render-template.mjs`; the apply job rebuilds it rather than trusting the agent's artifact.
+- Preview a decision without posting: `node scripts/issue-triage/preview.mjs scripts/issue-triage/examples/node-not-found.json`. A missing or invalid decision still posts a fallback comment and adds `triage/failed`; `apply-triage` runs with `if: always()` for that reason.

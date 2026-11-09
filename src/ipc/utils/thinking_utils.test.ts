@@ -2,44 +2,58 @@ import { describe, expect, it } from "vitest";
 import {
   getAnthropicProviderOptions,
   getExtraProviderOptionsForEngine,
+  getModelEffort,
   getOpenAIProviderOptions,
-  getThinkingBudgetEffort,
 } from "@/ipc/utils/thinking_utils";
-import type { UserSettings } from "@/lib/schemas";
+import type { ModelSelection } from "@/lib/schemas";
 
-const baseSettings = {
-  thinkingBudget: "medium",
-  selectedChatMode: "build",
-} as UserSettings;
+const selection = (effortLevel: string): ModelSelection => ({
+  provider: "openai",
+  name: "test-model",
+  effortLevel,
+});
 
-describe("getThinkingBudgetEffort", () => {
-  it("maps thinking budget settings to effort", () => {
-    expect(getThinkingBudgetEffort("low")).toBe("low");
-    expect(getThinkingBudgetEffort("medium")).toBe("medium");
-    expect(getThinkingBudgetEffort("high")).toBe("high");
-    expect(getThinkingBudgetEffort(undefined)).toBe("medium");
+describe("getModelEffort", () => {
+  it("requires and returns the resolved model selection effort", () => {
+    expect(getModelEffort(selection("medium"))).toBe("medium");
   });
 });
 
 describe("getOpenAIProviderOptions", () => {
-  it("maps thinking budget to reasoning_effort for build mode", () => {
-    expect(getOpenAIProviderOptions(baseSettings)).toEqual({
-      reasoning_effort: "medium",
+  it("uses Responses reasoning options for the Value alias", () => {
+    expect(
+      getOpenAIProviderOptions({
+        provider: "auto",
+        name: "value",
+        effortLevel: "medium",
+      }),
+    ).toEqual({
+      reasoning: { summary: "detailed", effort: "medium" },
+      include: ["reasoning.encrypted_content"],
+      store: false,
     });
   });
 
-  it("maps thinking budget to reasoning effort for local-agent mode", () => {
+  it.each(["low", "medium", "high", "xhigh", "max"])(
+    "maps %s effort to Responses options",
+    (effort) => {
+      expect(getOpenAIProviderOptions(selection(effort))).toEqual({
+        reasoning: { summary: "detailed", effort },
+        include: ["reasoning.encrypted_content"],
+        store: false,
+      });
+    },
+  );
+
+  it("uses the resolved OpenAI provider for an Auto selection", () => {
     expect(
-      getOpenAIProviderOptions({
-        ...baseSettings,
-        selectedChatMode: "local-agent",
-        thinkingBudget: "high",
+      getExtraProviderOptionsForEngine("openai", {
+        provider: "auto",
+        name: "auto",
+        effortLevel: "high",
       }),
     ).toEqual({
-      reasoning: {
-        summary: "detailed",
-        effort: "high",
-      },
+      reasoning: { summary: "detailed", effort: "high" },
       include: ["reasoning.encrypted_content"],
       store: false,
     });
@@ -49,76 +63,36 @@ describe("getOpenAIProviderOptions", () => {
 describe("getExtraProviderOptions", () => {
   it("returns OpenAI engine body reasoning options", () => {
     expect(
-      getExtraProviderOptionsForEngine("openai", {
-        ...baseSettings,
-        thinkingBudget: "low",
-      }),
+      getExtraProviderOptionsForEngine("openai", selection("low")),
     ).toEqual({
-      reasoning_effort: "low",
+      reasoning: { summary: "detailed", effort: "low" },
+      include: ["reasoning.encrypted_content"],
+      store: false,
     });
   });
 
   it("returns Anthropic engine body thinking options", () => {
-    expect(getExtraProviderOptionsForEngine("anthropic", baseSettings)).toEqual(
-      {
-        thinking: {
-          type: "adaptive",
-          display: "summarized",
-        },
-        output_config: { effort: "medium" },
-      },
-    );
-  });
-
-  it("maps Anthropic thinking budget settings to effort", () => {
     expect(
-      getExtraProviderOptionsForEngine("anthropic", {
-        ...baseSettings,
-        thinkingBudget: "low",
-      }),
+      getExtraProviderOptionsForEngine("anthropic", selection("medium")),
     ).toEqual({
-      thinking: {
-        type: "adaptive",
-        display: "summarized",
-      },
-      output_config: { effort: "low" },
-    });
-
-    expect(
-      getExtraProviderOptionsForEngine("anthropic", {
-        ...baseSettings,
-        thinkingBudget: "high",
-      }),
-    ).toEqual({
-      thinking: {
-        type: "adaptive",
-        display: "summarized",
-      },
-      output_config: { effort: "high" },
+      thinking: { type: "adaptive", display: "summarized" },
+      output_config: { effort: "medium" },
     });
   });
 
-  it("keeps Gemini gateway thinking options unchanged", () => {
-    expect(getExtraProviderOptionsForEngine("google", baseSettings)).toEqual({
-      thinking: {
-        type: "enabled",
-        include_thoughts: true,
-        budget_tokens: 4_000,
-      },
-    });
-  });
-
-  it("maps Gemini high thinking budget to dynamic budget", () => {
+  it.each([
+    ["low", 1_000],
+    ["medium", 4_000],
+    ["high", -1],
+    ["minimal", 0],
+  ])("maps Gemini %s effort to gateway budget %s", (effort, budget) => {
     expect(
-      getExtraProviderOptionsForEngine("google", {
-        ...baseSettings,
-        thinkingBudget: "high",
-      }),
+      getExtraProviderOptionsForEngine("google", selection(effort)),
     ).toEqual({
       thinking: {
         type: "enabled",
         include_thoughts: true,
-        budget_tokens: -1,
+        budget_tokens: budget,
       },
     });
   });
@@ -126,11 +100,8 @@ describe("getExtraProviderOptions", () => {
 
 describe("getAnthropicProviderOptions", () => {
   it("returns AI SDK Anthropic provider options", () => {
-    expect(getAnthropicProviderOptions(baseSettings)).toEqual({
-      thinking: {
-        type: "adaptive",
-        display: "summarized",
-      },
+    expect(getAnthropicProviderOptions(selection("medium"))).toEqual({
+      thinking: { type: "adaptive", display: "summarized" },
       effort: "medium",
       sendReasoning: true,
     });

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   advanceParser,
+  closeUnclosedSuggestedPrompts,
   getParserBlocks,
   initialParserState,
   parseFullMessage,
@@ -62,6 +63,55 @@ describe("streamingMessageParser", () => {
         inProgress: false,
       },
       { kind: "markdown", content: "\nAfter", complete: false },
+    ]);
+  });
+
+  it("parses a plugin suggestion card, including one still streaming", () => {
+    const content =
+      '<dyad-suggest-plugin slug="vercel" reason="Read the build logs." outcome="pending"></dyad-suggest-plugin>';
+    const { blocks } = parseFullMessage(content);
+    expect(blocksToShape(blocks)).toEqual([
+      {
+        kind: "custom-tag",
+        tag: "dyad-suggest-plugin",
+        attributes: {
+          slug: "vercel",
+          reason: "Read the build logs.",
+          outcome: "pending",
+        },
+        content: "",
+        complete: true,
+        inProgress: false,
+      },
+    ]);
+
+    // A partial tag streams as an open custom-tag block, not as markdown.
+    const partial = feedAll(content, [20, 60]);
+    const open = getParserBlocks(partial).find(
+      (b) => b.kind === "custom-tag" && b.tag === "dyad-suggest-plugin",
+    );
+    expect(open).toBeDefined();
+  });
+
+  it("parses an inline sub-agent mount point", () => {
+    const content =
+      '<dyad-subagent chat-id="7" thread-id="explorer-1" persona="explorer" task-name="Trace auth"></dyad-subagent>';
+    const { blocks } = parseFullMessage(content);
+
+    expect(blocksToShape(blocks)).toEqual([
+      {
+        kind: "custom-tag",
+        tag: "dyad-subagent",
+        attributes: {
+          "chat-id": "7",
+          "thread-id": "explorer-1",
+          persona: "explorer",
+          "task-name": "Trace auth",
+        },
+        content: "",
+        complete: true,
+        inProgress: false,
+      },
     ]);
   });
 
@@ -298,5 +348,90 @@ trailing`;
       throw new Error("expected custom-tag");
     expect(finalBlocks[0].attributes.path).toBe("b.ts");
     expect(finalBlocks[0].content).toBe("new");
+  });
+});
+
+describe("streamingMessageParser suggested prompts", () => {
+  it("parses dyad-suggested-prompts as a custom tag so it never renders as text", () => {
+    const content =
+      "Done!\n<dyad-suggested-prompts>\nAdd a dark mode toggle\n</dyad-suggested-prompts>";
+    const { blocks } = parseFullMessage(content);
+    expect(blocksToShape(blocks)).toEqual([
+      { kind: "markdown", content: "Done!\n", complete: true },
+      {
+        kind: "custom-tag",
+        tag: "dyad-suggested-prompts",
+        attributes: {},
+        content: "\nAdd a dark mode toggle\n",
+        complete: true,
+        inProgress: false,
+      },
+    ]);
+  });
+
+  it("ends an unclosed suggestions block at the next Dyad tag", () => {
+    const content =
+      'Done!\n<dyad-suggested-prompts>\nAdd a dark\n\n<dyad-step-limit steps="50" limit="50">Paused.</dyad-step-limit>';
+    expect(blocksToShape(parseFullMessage(content).blocks)).toEqual([
+      { kind: "markdown", content: "Done!\n", complete: true },
+      {
+        kind: "custom-tag",
+        tag: "dyad-suggested-prompts",
+        attributes: {},
+        content: "\nAdd a dark\n\n",
+        complete: false,
+        inProgress: false,
+      },
+      {
+        kind: "custom-tag",
+        tag: "dyad-step-limit",
+        attributes: { steps: "50", limit: "50" },
+        content: "Paused.",
+        complete: true,
+        inProgress: false,
+      },
+    ]);
+  });
+
+  it("keeps ordinary angle brackets inside a suggestions block", () => {
+    const content =
+      "<dyad-suggested-prompts>\nAdd a <Footer> component\n</dyad-suggested-prompts>";
+    const blocks = parseFullMessage(content).blocks;
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0]).toMatchObject({
+      tag: "dyad-suggested-prompts",
+      content: "\nAdd a <Footer> component\n",
+      complete: true,
+    });
+  });
+
+  it("matches the full parse when the next Dyad tag is split across chunks", () => {
+    const content =
+      '<dyad-suggested-prompts>\nAdd <B>\n<dyad-st<dyad-output type="error" message="x">boom</dyad-output>';
+    const full = blocksToShape(parseFullMessage(content).blocks);
+    for (let split = 1; split < content.length; split++) {
+      let state = advanceParser(initialParserState(), content.slice(0, split));
+      state = advanceParser(state, content);
+      expect(blocksToShape(getParserBlocks(state))).toEqual(full);
+    }
+    expect(full.at(-1)).toMatchObject({ tag: "dyad-output", complete: true });
+  });
+});
+
+describe("closeUnclosedSuggestedPrompts", () => {
+  it("closes before the next recognized tag, or at the end", () => {
+    expect(
+      closeUnclosedSuggestedPrompts(
+        "<dyad-suggested-prompts>\nAdd <Footer>\n<dyad-step-limit>Paused.</dyad-step-limit>",
+      ),
+    ).toBe(
+      "<dyad-suggested-prompts>\nAdd <Footer>\n</dyad-suggested-prompts><dyad-step-limit>Paused.</dyad-step-limit>",
+    );
+    expect(closeUnclosedSuggestedPrompts("<dyad-suggested-prompts>\nAdd")).toBe(
+      "<dyad-suggested-prompts>\nAdd</dyad-suggested-prompts>",
+    );
+    const closed =
+      "<dyad-suggested-prompts>\nAdd\n</dyad-suggested-prompts>\n<dyad-output>x</dyad-output>";
+    expect(closeUnclosedSuggestedPrompts(closed)).toBe(closed);
   });
 });

@@ -3,6 +3,11 @@ import { z } from "zod";
 import { ToolDefinition, AgentContext } from "./types";
 import { ExecuteAddDependencyError } from "@/ipc/processors/executeAddDependency";
 import { ensureNitroOnViteApp } from "@/ipc/utils/nitro_setup";
+import { trackAppMutation } from "./tool_invocation";
+import {
+  appOperationCoordinator,
+  readAppResource,
+} from "@/ipc/services/app_operation_coordinator";
 
 const enableNitroSchema = z.object({
   reason: z
@@ -46,6 +51,9 @@ export const enableNitroTool: ToolDefinition<
 
   getConsentPreview: (args) => `Add Nitro server layer (${args.reason})`,
 
+  shouldTrackMutation: (_args, result) =>
+    result.startsWith("Nitro server layer added"),
+
   buildXml: () => `<dyad-enable-nitro></dyad-enable-nitro>`,
 
   execute: async (_args, ctx: AgentContext) => {
@@ -58,7 +66,15 @@ export const enableNitroTool: ToolDefinition<
     }
 
     try {
-      const result = await ensureNitroOnViteApp(ctx.appPath);
+      const result = await appOperationCoordinator.run(
+        {
+          appId: ctx.appId,
+          operation: "install the Local Agent Nitro integration",
+          resources: [readAppResource("app-path"), "repository-worktree"],
+          refuseWhenRecording: "enable Nitro",
+        },
+        () => ensureNitroOnViteApp(ctx.appPath),
+      );
       for (const warningMessage of result.warningMessages) {
         ctx.onWarningMessage?.(warningMessage);
       }
@@ -68,6 +84,12 @@ export const enableNitroTool: ToolDefinition<
         for (const warningMessage of error.warningMessages) {
           ctx.onWarningMessage?.(warningMessage);
         }
+        trackAppMutation(
+          ctx,
+          "enable_nitro",
+          error.completedPackages.length > 0,
+          error.completedPackages.length > 0,
+        );
       }
       throw error;
     }

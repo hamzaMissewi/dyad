@@ -6,6 +6,32 @@ import {
 } from "@/ipc/utils/retryWithRateLimit";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
+it("cancels a server-directed rate-limit wait without another request", async () => {
+  const controller = new AbortController();
+  const request = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+    new Response(null, {
+      status: 429,
+      headers: { "Retry-After": "3600" },
+    }),
+  );
+  try {
+    const pending = fetchWithRetry(
+      "https://provider.test",
+      { signal: controller.signal },
+      "test",
+    );
+    const rejected = expect(pending).rejects.toMatchObject({
+      name: "AbortError",
+    });
+    await Promise.resolve();
+    controller.abort();
+    await rejected;
+    expect(request).toHaveBeenCalledTimes(1);
+  } finally {
+    request.mockRestore();
+  }
+});
+
 describe("RateLimitError", () => {
   it("should be an instance of Error", () => {
     const mockResponse = new Response(null, { status: 429 });
@@ -570,5 +596,32 @@ describe("fetchWithRetry", () => {
 
     expect(result).toBe(successResponse);
     expect(fetch).toHaveBeenCalledWith("https://example.com/api", undefined);
+  });
+
+  it("applies attemptTimeoutMs to each request, not to the rate-limit wait", async () => {
+    vi.useRealTimers();
+    const signals: AbortSignal[] = [];
+    vi.mocked(fetch).mockImplementation(async (_input, init) => {
+      signals.push(init!.signal!);
+      return signals.length === 1
+        ? new Response(null, { status: 429, headers: { "Retry-After": "0" } })
+        : new Response(null, { status: 200 });
+    });
+    const caller = new AbortController();
+
+    const result = await fetchWithRetry(
+      "https://example.com/api",
+      { method: "PUT", signal: caller.signal },
+      "test-fetch",
+      { attemptTimeoutMs: 60_000 },
+    );
+
+    expect(result.status).toBe(200);
+    // Each attempt gets its own deadline, combined with the caller's signal.
+    expect(signals).toHaveLength(2);
+    expect(signals[0]).not.toBe(caller.signal);
+    expect(signals[1]).not.toBe(signals[0]);
+    caller.abort();
+    expect(signals.every((signal) => signal.aborted)).toBe(true);
   });
 });

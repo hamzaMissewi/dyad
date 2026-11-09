@@ -7,19 +7,26 @@ import React, {
 } from "react";
 import { useAtom, useAtomValue, useSetAtom } from "jotai";
 import { Button } from "@/components/ui/button";
-import { Check, FileText } from "lucide-react";
+import { AlertCircle, Check, FileText } from "lucide-react";
 import { VanillaMarkdownParser } from "@/components/chat/DyadMarkdownParser";
 import {
   clearPlanAnnotations,
   planAcceptInNewChatByChatIdAtom,
   planAnnotationsAtom,
-  planStateAtom,
 } from "@/atoms/planAtoms";
-import { previewModeAtom } from "@/atoms/appAtoms";
+import { previewModeAtom, selectedAppIdAtom } from "@/atoms/appAtoms";
 import { selectedChatIdAtom } from "@/atoms/chatAtoms";
 import { useStreamChat } from "@/hooks/useStreamChat";
 import { usePlan } from "@/hooks/usePlan";
 import { useChatMode } from "@/hooks/useChatMode";
+import { usePlanDocument } from "@/hooks/usePlanDocument";
+import { showError } from "@/lib/toast";
+import { sha256Hex } from "@/lib/browser_hash";
+import { serializePlanDocument } from "@/plan_handoff/transport";
+import {
+  usePlanHandoff,
+  usePlanHandoffState,
+} from "@/plan_handoff/usePlanHandoff";
 import { SelectionCommentButton } from "./plan/SelectionCommentButton";
 import { CommentsFloatingButton } from "./plan/CommentsFloatingButton";
 import { CommentPopover } from "./plan/CommentPopover";
@@ -30,22 +37,49 @@ import {
 
 export const PlanPanel: React.FC = () => {
   const chatId = useAtomValue(selectedChatIdAtom);
-  const planState = useAtomValue(planStateAtom);
+  const appId = useAtomValue(selectedAppIdAtom);
+  const planData = usePlanDocument(chatId);
+  const handoff = usePlanHandoffState(chatId);
+  const document = planData ? serializePlanDocument(planData) : null;
+  const [version, setVersion] = useState<{
+    document: string;
+    hash: string;
+  } | null>(null);
+  useEffect(() => {
+    let active = true;
+    if (document)
+      void sha256Hex(document).then((hash) => {
+        if (active) setVersion({ document, hash });
+      });
+    return () => {
+      active = false;
+    };
+  }, [document]);
+  const sameVersion =
+    version?.document === document && version?.hash === handoff.planVersion;
+  const handoffFailure =
+    handoff.phase === "failed" && (!handoff.planVersion || sameVersion)
+      ? (handoff.failure ?? "Plan implementation could not be started.")
+      : null;
+  const isAccepted =
+    sameVersion &&
+    handoff.phase !== "idle" &&
+    handoff.phase !== "failed" &&
+    handoff.phase !== "cancelled";
   const previewMode = useAtomValue(previewModeAtom);
   const setPreviewMode = useSetAtom(previewModeAtom);
   const { streamMessage, isStreaming } = useStreamChat();
   const { savedPlan } = usePlan();
   const { selectedMode } = useChatMode(chatId);
+  const { acceptPlan } = usePlanHandoff();
 
   const annotations = useAtomValue(planAnnotationsAtom);
   const planContentRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
 
-  const planData = chatId ? planState.plansByChatId.get(chatId) : null;
   const currentPlan = planData?.content ?? null;
   const currentTitle = planData?.title ?? null;
   const currentSummary = planData?.summary ?? null;
-  const isAccepted = chatId ? planState.acceptedChatIds.has(chatId) : false;
   // A persisted plan only counts as accepted once its status says so. Drafts
   // are persisted too (so they survive a restart) but must still offer the
   // accept buttons. We also require the saved-plan content to match what's
@@ -79,6 +113,12 @@ export const PlanPanel: React.FC = () => {
     ? (acceptInNewChatByChatId.get(chatId) ?? null)
     : null;
   const [isSendingComments, setIsSendingComments] = useState(false);
+
+  useEffect(() => {
+    if (handoffFailure) {
+      setIsSubmitting(false);
+    }
+  }, [handoffFailure]);
 
   const chatAnnotations = useMemo(
     () => (chatId ? (annotations.get(chatId) ?? []) : []),
@@ -174,24 +214,26 @@ export const PlanPanel: React.FC = () => {
   }, [chatId, isSendingComments, annotations, streamMessage, setAnnotations]);
 
   const handleAccept = (useNewChat: boolean) => {
-    if (!chatId) return;
-    if (selectedMode !== "plan") return;
+    if (!chatId || !appId) return;
+    if (!handoffFailure && selectedMode !== "plan") return;
     if (isSubmitting) return;
     setIsSubmitting(true);
 
-    // Record the choice so usePlanEvents can route the implementation to a new
-    // chat or continue in the current one once the exit_plan event fires.
+    // The host handoff consumes this destination alongside the displayed
+    // immutable plan version; no model-generated approval turn is needed.
     setPlanAcceptInNewChat((prev) => {
       const next = new Map(prev);
       next.set(chatId, useNewChat);
       return next;
     });
 
-    streamMessage({
-      chatId,
-      prompt:
-        "I accept this plan. Call the exit_plan tool now with confirmation: true to begin implementation.",
-    });
+    void acceptPlan({ chatId, appId })
+      .catch((error) => {
+        showError(error);
+      })
+      .finally(() => {
+        setIsSubmitting(false);
+      });
   };
 
   // Don't render anything if there's no plan - effect will switch to preview mode
@@ -259,7 +301,35 @@ export const PlanPanel: React.FC = () => {
       )}
 
       <div className="border-t p-4 space-y-4 bg-background">
-        {isAccepted || isAcceptedPlan ? (
+        {handoffFailure ? (
+          <div className="flex flex-col gap-2">
+            <div className="flex items-start gap-2 text-red-700 dark:text-red-300">
+              <AlertCircle size={16} className="mt-0.5 shrink-0" />
+              <span className="text-sm font-medium">
+                Failed to start implementation: {handoffFailure}
+              </span>
+            </div>
+            <Button
+              onClick={() => handleAccept(true)}
+              disabled={isStreaming || isSubmitting}
+              className="w-full"
+              data-testid="accept-plan-new-chat"
+            >
+              <Check size={16} className="mr-2" />
+              Retry in a new chat
+            </Button>
+            <Button
+              onClick={() => handleAccept(false)}
+              disabled={isStreaming || isSubmitting}
+              variant="outline"
+              className="w-full"
+              data-testid="accept-plan-continue-here"
+            >
+              <Check size={16} className="mr-2" />
+              Retry in this chat
+            </Button>
+          </div>
+        ) : isAccepted || isAcceptedPlan ? (
           <div className="flex items-center gap-2 text-green-700 dark:text-green-300">
             <Check size={16} />
             <span className="text-sm font-medium">

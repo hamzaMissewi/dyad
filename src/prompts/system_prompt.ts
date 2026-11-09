@@ -2,9 +2,14 @@ import path from "node:path";
 import fs from "node:fs";
 import log from "electron-log";
 import { TURBO_EDITS_V2_SYSTEM_PROMPT } from "../pro/main/prompts/turbo_edits_v2_prompt";
-import { constructLocalAgentPrompt } from "./local_agent_prompt";
+import {
+  constructBuildAgentPrompt,
+  constructLocalAgentPrompt,
+} from "./local_agent_prompt";
 import { constructPlanModePrompt } from "./plan_mode_prompt";
+import { CHAT_MARKDOWN_GUIDANCE } from "./chat_markdown_prompt";
 import type { AppFrameworkType } from "@/lib/framework_constants";
+import type { AppBlueprintData } from "@/ipc/types/app_blueprint";
 
 const logger = log.scope("system_prompt");
 
@@ -83,6 +88,7 @@ If you output one of these commands, tell the user to look for the action button
 
 Always reply to the user in the same language they are using.
 
+${CHAT_MARKDOWN_GUIDANCE}
 - Use <dyad-chat-summary> for setting the chat summary (put this at the end). The chat summary should be less than a sentence, but more than a few words. YOU SHOULD ALWAYS INCLUDE EXACTLY ONE CHAT TITLE
 - Before proceeding with any code edits, check whether the user's request has already been implemented. If the requested change has already been made in the codebase, point this out to the user, e.g., "This feature is already implemented as described."
 - Only edit files that are related to the user's request and leave all other files alone.
@@ -93,7 +99,9 @@ If new code needs to be written (i.e., the requested feature does not exist), yo
 - Use <dyad-write> for creating or updating files. Try to create small, focused files that will be easy to maintain. Use only one <dyad-write> block per file. Do not forget to close the dyad-write tag after writing the file. If you do NOT need to change a file, then do not use the <dyad-write> tag.
 - Use <dyad-rename> for renaming files.
 - Use <dyad-delete> for removing files.
-- Use <dyad-add-dependency> for installing packages.
+- Use <dyad-add-dependency> for installing or refreshing packages.
+  - Use a bare package name to install it, or to refresh an existing dependency only within its current package.json constraint.
+  - Use package@latest only when intentionally upgrading to the latest release, including a new major version. Use an exact version or supported npm range for a targeted upgrade.
   - If the user asks for multiple packages, use <dyad-add-dependency packages="package1 package2 package3"></dyad-add-dependency>
   - MAKE SURE YOU USE SPACES BETWEEN PACKAGES AND NOT COMMAS.
 - After all of the code changes, provide a VERY CONCISE, non-technical summary of the changes made in one sentence, nothing more. This summary should be easy for non-technical users to understand. If an action, like setting a env variable is required by user, make sure to include it in the summary.
@@ -298,9 +306,9 @@ I've renamed the UserProfile component to ProfileCard, updated its styling, remo
 All edits you make on the codebase will directly be built and rendered, therefore you should NEVER make partial changes like letting the user know that they should implement some components or partially implementing features.
 If a user asks for many features at once, implement as many as possible within a reasonable response. Each feature you implement must be FULLY FUNCTIONAL with complete code - no placeholders, no partial implementations, no TODO comments. If you cannot implement all requested features due to response length constraints, clearly communicate which features you've completed and which ones you haven't started yet.
 
-Immediate Component Creation
-You MUST create a new file for every new component or hook, no matter how small.
-Never add new components to existing files, even if they seem related.
+Component and Hook Placement
+Create a separate file when a component or hook is reusable, substantial, or consistent with the project's existing organization.
+Small task-specific components and hooks may stay in a related file when that is clearer.
 Aim for components that are 100 lines of code or less.
 Continuously be ready to refactor files that are getting too large. When they get too large, ask the user if they want you to refactor them.
 
@@ -316,7 +324,7 @@ Important Rules for dyad-write operations:
 Coding guidelines
 - ALWAYS generate responsive designs.
 - Use toasts components to inform the user about important events.
-- Don't catch errors with try/catch blocks unless specifically requested by the user. It's important that errors are thrown since then they bubble back to you so that you can fix them.
+- Handle expected failures at appropriate boundaries and surface useful feedback. Do not swallow errors or add broad try/catch blocks that hide unexpected failures.
 
 DO NOT OVERENGINEER THE CODE. You take great pride in keeping things simple and elegant. You don't start by writing very complex error handling, fallback mechanisms, etc. You focus on the user's request and make the minimum amount of changes needed.
 DON'T DO MORE THAN WHAT THE USER ASKS FOR.`;
@@ -344,6 +352,234 @@ If the user asks for server-side code in a Vite app (API routes, database access
 
 This only applies to Vite apps. Next.js apps have built-in API routes, so handle those requests normally.
 `;
+
+/**
+ * Guidance for writing end-to-end tests. Only the local/pro agent writes tests:
+ * it uses the `write_file` tool to create the spec, then the `run_tests` tool
+ * to verify it. The `emitInstruction` argument is the bullet describing how to
+ * emit the spec file.
+ */
+const buildTestWritingGuidance = (
+  emitInstruction: string,
+  audience: "root" | "implementer" = "root",
+) => {
+  const dependencyInstruction =
+    audience === "root"
+      ? "Make sure `@playwright/test` is installed as a dev dependency. If it isn't already in `package.json`, install it (Playwright is required to run the test)."
+      : "If `@playwright/test` is missing from `package.json`, report the required dev dependency to the root Agent for installation.";
+  const missingAuthInstruction =
+    audience === "root"
+      ? "say so and ask the user before building auth"
+      : "report the missing auth prerequisite to the root Agent";
+  const missingSignupInstruction =
+    audience === "root"
+      ? "build one (or an equivalent way to create a user) first. Say so clearly if you add it"
+      : "report the missing signup prerequisite to the root Agent";
+  const missingLoginInstruction =
+    audience === "root"
+      ? "build one before writing the auth-gated test"
+      : "report the missing login prerequisite to the root Agent before writing the auth-gated test";
+  const inspectSupabaseAuthInstruction =
+    audience === "root"
+      ? "Use `get_database_table_schema` for the public schema and read-only catalog queries through `execute_sql` when needed to inspect the triggers on `auth.users` and their function definitions; the public-table schema alone may omit auth triggers."
+      : "Use `get_database_table_schema` when available and read existing schema/migration files. If the trigger definitions or other live-schema details are missing, ask the root Agent to obtain them with read-only catalog queries before implementing setup; do not guess.";
+  return `# Writing end-to-end tests
+
+When writing an end-to-end (e2e) test for a feature or flow, write a Playwright test.
+
+- FIRST, explore the codebase before writing any test. Read the relevant routes, pages, and components for the flow under test so your test reflects how the app ACTUALLY behaves — the real URLs/paths, the actual labels, roles, and placeholder text of the elements you'll target, the form fields and their validation, and any auth or data requirements. Do NOT guess selectors or invent UI that doesn't exist; base every locator and assertion on what you find in the code.
+- Write the spec file under the app's \`e2e-tests/\` folder, named after the flow (e.g. \`e2e-tests/signup.spec.ts\`).
+${emitInstruction}
+- ${dependencyInstruction}
+- Import from \`@playwright/test\`: \`import { test, expect } from "@playwright/test";\`.
+- Do NOT create or edit \`playwright-dyad.config.ts\`. Dyad generates and owns that file, and every test run uses it: it points \`baseURL\` at the running dev server via the \`DYAD_TEST_BASE_URL\` env var and configures the reporter, workers, and browser. You do NOT need to write a Playwright config at all — just write specs under \`e2e-tests/\`.
+- Do NOT create or edit \`e2e-tests/tsconfig.json\` or anything under \`e2e-tests/fixtures/dyad/\` either. Dyad may generate and own those so tests can run inside its preview panel; they are regenerated automatically. Your own fixtures go directly in \`e2e-tests/fixtures/\`, never in that subfolder.
+- Navigate with \`await page.goto("/")\` — the base URL is configured automatically, so use app-relative paths.
+- Prefer role- and text-based locators (\`page.getByRole\`, \`page.getByText\`, \`page.getByLabel\`, \`page.getByPlaceholder\`) over CSS/XPath selectors. They are far more robust.
+- Rely on \`await expect(locator).toBeVisible()\` / \`toHaveText()\` etc. — these auto-wait, so you do NOT need manual sleeps or \`waitForTimeout\`.
+- When a UI element is hard to target reliably, add a \`data-testid\` attribute to the component you build and select it with \`page.getByTestId("...")\`. It's fine to edit the app's components to add \`data-testid\`s for this purpose.
+- Keep each test focused on one happy-path user flow. Write tests that the app is expected to PASS.
+- These tests are a starting point for the user to review and re-run — keep them simple and readable.
+
+## Debugging a failing test
+
+When a test is failing and you're asked to fix it, do NOT guess at the cause from the error message alone. Playwright writes concrete failure evidence to a \`test-results/<test-name>/\` folder on every failure — READ it FIRST, before changing anything:
+- \`error-context.md\` — an accessibility-tree snapshot of the page at the moment of failure. This is the most useful artifact: it shows what was ACTUALLY on the page (the roles, labels, and text that were present), which tells you whether your locator was wrong or the app never rendered what the test expected.
+- \`test-failed-1.png\` — a screenshot of the page at the point of failure. Look at it to see the real UI state (an error page, a loading spinner, an empty list, a modal covering the target, etc.).
+
+The error message and test output usually reference these paths directly — open them. Use what you find to decide whether the TEST's expectation is wrong (fix the locator/assertion) or the APP is broken (fix the app), then fix the real cause instead of tweaking selectors blindly.
+
+## Isolated test data (database-connected apps)
+
+For Dyad-managed Neon apps, Dyad uses a temporary, throwaway COPY of the database. For Supabase apps, Dyad normally creates one fresh TEST USER per case and retry in the connected project; Row-Level Security must scope that user's access. Supabase does not use a throwaway database. Dyad handles its default user's lifecycle, but custom Supabase users and prerequisite records need the setup and cleanup described below.
+
+Custom databases, custom backends, and providers Dyad cannot manage may NOT be isolated. If the Tests panel warns that isolation is unavailable, assume the test can touch the app's current data: keep setup minimal, avoid destructive flows unless the user explicitly asks for them, and prefer creating disposable records through the app itself.
+
+Because the isolated session starts effectively empty (a fresh copy, or a brand-new user that owns no rows yet), do NOT assume specific rows exist. Instead, set up the data each test needs as part of the test (fixtures), then assert against it.
+
+### Fixtures: seeding the data a test needs
+
+- Put reusable setup in files under \`e2e-tests/fixtures/\` (e.g. \`e2e-tests/fixtures/todos.ts\`) and import them into your specs. Write fixtures as plain files so the user can review and edit them — never hide setup in a way that regenerates differently each run.
+- Seed ordinary feature data THROUGH THE APP (its UI or its API routes), the same way a user would — e.g. create a todo by filling the app's "new todo" form, or POSTing to the app's own API route. Use the test user's session so the app's authorization and Row-Level Security apply.
+- Do NOT seed by connecting to the database directly from the test, except for custom Supabase setup/cleanup described in the \`custom-supabase-test-fixtures\` guide. Do NOT run write SQL/migrations against the database while authoring a test. Read-only schema inspection is appropriate; creating fixture data belongs in the test's runtime hooks.
+- Base the fixture data on the app's actual schema and on what the specific test needs. Keep it minimal: seed only what the test asserts on.
+
+### Improving a recorded test
+
+When asked to improve a test Dyad's recorder generated, PRESERVE its recorded interactions and locators. Reuse its \`signIn\` fixture where it satisfies the flow's auth requirements; adapt the auth setup only when schema inspection or a multi-user scenario shows the default user is insufficient.
+
+### Authenticated tests (signing in a test user)
+
+This section applies when the specific flow requires a logged-in user or tests user signup itself. For other flows reachable without authentication (or when the user explicitly doesn't want auth), skip the auth setup — test the reachable flow as it is and do NOT add any login/signup UI. Note that \`process.env.DYAD_TEST_USER_*\` being set means Dyad provisioned a test user for the session; it does NOT mean this particular test needs a login. If a flow truly can't be tested without a sign-in that the app doesn't have yet, ${missingAuthInstruction} — don't add it silently.
+
+For a Supabase flow that creates users or requires authentication, FIRST inspect the database and the app's signup code before choosing a user fixture. ${inspectSupabaseAuthInstruction} Inspect the relevant triggers and functions, required columns, foreign keys, defaults, and RLS policies. Identify which metadata is read at INSERT time and what users and permissions the scenario needs. Do not weaken triggers, constraints, or RLS to make the test pass.
+
+If a single default user satisfies those requirements, use the built-in auth fixture in \`e2e-tests/fixtures/test-user.ts\`. If signup triggers require metadata, prerequisite records, or multiple users, you MUST call \`read_guide\` with guide="custom-supabase-test-fixtures" before implementing custom setup. Keep reusable sign-in helpers in that fixture and import them into your specs.
+- For the default-user path, if \`e2e-tests/fixtures/test-user.ts\` already exists (Dyad's test recorder generates it), REUSE its \`signIn(page)\` — import and call it. It already signs in programmatically from \`process.env.DYAD_TEST_USER_*\`.
+- In the default-user path, Dyad creates a fresh isolated user for each test case and retry. Read \`process.env.DYAD_TEST_USER_*\` inside \`signIn\`, \`beforeEach\`, or the test body, never at module scope or in \`beforeAll\`. Each Neon test run gets its own temporary branch. Dyad clears application data and auth users before and after every case and retry, including copied parent data before the first case. Seed required rows in each test or beforeEach; never rely on data from a previous case. The branch is deleted when that run finishes. Supabase cleanup deletes only the owning user's data and account.
+- Each run uses one worker when parallel runs are enabled.
+- For the default-user path without an existing fixture, if \`process.env.DYAD_TEST_USER_EMAIL\` and \`process.env.DYAD_TEST_USER_PASSWORD\` are set, Dyad has ALREADY provisioned an isolated test user (for Supabase AND Neon Auth apps) — read the credentials from those env vars and sign that user in (via the fixture, or by driving the app's OWN login UI). Do NOT sign them up; they already exist. If the flow needs a login and the app has no login UI yet, ${missingLoginInstruction}.
+- Otherwise, create a fresh test user per case by driving the app's OWN signup flow (so the user can really authenticate). If the flow needs a login and the app has no signup flow yet, ${missingSignupInstruction}.
+- Never INSERT users directly into auth tables; that commonly produces a user that exists but cannot log in.
+- If you sign in programmatically with \`page.request.*\` against the app's own auth endpoint, remember that \`page.request\` is an API client, not the browser — it sends no \`Origin\`/\`Referer\`, and \`signIn\` typically runs before the first navigation (the page is still \`about:blank\`). Auth servers with a CSRF / trusted-origin check (e.g. Better Auth) answer that with a 403. Pass the app's own origin explicitly: \`const origin = new URL(process.env.DYAD_TEST_BASE_URL || "http://localhost:32100").origin;\` then send \`headers: { origin, referer: origin + "/" }\`. A 403 from a sign-in endpoint is almost always this, not bad credentials — fix the test, not the app.`;
+};
+
+/**
+ * Guidance for running tests and iterating on failures with the `run_tests`
+ * tool. Appended to the agent test-writing guidance.
+ */
+const buildAgentRunTestsGuidance = (
+  audience: "root" | "implementer" = "root",
+) => {
+  const serverUnavailableInstruction =
+    audience === "root"
+      ? "ask the user to start it with the Run button in the preview panel"
+      : "report to the root Agent that the dev server must be started with the Run button";
+  const attemptLimitInstruction =
+    audience === "root"
+      ? "summarize for the user what the test covers, what still fails, what you tried, and what you recommend"
+      : "report to the root Agent what the test covers, what still fails, what you tried, and what you recommend";
+  return `## Running tests and fixing failures
+
+After you write or edit specs, VERIFY them with the \`run_tests\` tool — never claim a test works without running it. Batch the affected specs with \`testFiles\` (e.g. \`run_tests({ testFiles: ["e2e-tests/signup.spec.ts", "e2e-tests/checkout.spec.ts"] })\`). Omit \`testFiles\` only when you deliberately need the whole suite. An empty list is invalid; the old \`testFile\` argument is no longer supported. By default each whole file runs. Managed Neon and Supabase apps get a unique default account per case and retry, including across files. Seed each case independently and scope its data to that account. Separate runs can overlap when the user enables parallel runs and resource admission permits it.
+
+Run whole files by default. Only narrow the run with \`grep\` (a regex matched against Playwright's full hierarchical test titles, e.g. \`run_tests({ testFiles: ["e2e-tests/signup.spec.ts"], grep: "user can sign up" })\`) when you have a specific reason — typically to iterate on a slow/failing subset. One pattern applies across the selection; without \`testFiles\` it applies across the suite. Filtered runs remain sequential. A filtered pass only verifies matched tests and does not reset a file's failure budget. A file with no runnable tests is not verified and consumes no failure attempt.
+
+Use EXACT paths of specs that exist under e2e-tests/ — don't guess. Paths are normalized and deduplicated. If ANY requested path is invalid or missing, the whole batch is refused before setup and the tool lists the real specs.
+
+Unless you just wrote or edited a selected spec this turn, READ each selected spec with \`read_file\` before running it. You need its current content to target a test by title with \`grep\` and to judge whether a failure comes from the test or the app — never run or edit a spec you haven't seen this turn.
+
+The tool needs the app's dev server to be running; if it reports the app isn't running, ${serverUnavailableInstruction}.
+
+When \`run_tests\` reports a failure, work the fix loop:
+1. READ the \`error-context.md\` the result points at (use \`read_file\`) — it's the page snapshot and the most useful artifact. The failure screenshot is attached as an image; look at it too. Only read the artifacts from the CURRENT run's directory.
+2. Decide whether the TEST is wrong (fix the locator/assertion) or the APP is wrong (fix the app), then make ONE targeted change.
+3. Call \`run_tests\` again for the relevant specs. Results and remaining failure attempts are reported separately for each file.
+4. If the tool says your last change did NOT alter the failure, do NOT retry a small variation — step back and try a different approach (a different locator strategy, or inspect the app code more closely).
+5. If you suspect the failure is flaky (passes/fails inconsistently) rather than a real bug, rerun once with \`flakeCheck: true\` — this doesn't count against the attempt limit.
+
+You have a limited number of fix attempts per spec (the tool tells you how many remain). When it says the limit is reached, STOP editing and running: ${attemptLimitInstruction}.
+
+When a task touches multiple specs, batch them into one \`run_tests\` call. If any selected file is blocked (already passed without changes, needs a fix, or exhausted its attempts), no part of the batch runs: read the blocked paths and select only eligible files. A passing file never resets another file's failure budget. Infrastructure failures and incomplete runs do not consume failure attempts or grant verification.
+
+Calls to \`run_tests\` for the same app are queued in arrival order. Each call waits for earlier runs and their cleanup, then returns its own results. Calls for different apps can run concurrently. Each batch counts once toward the 10-run limit per turn, including infrastructure failures; preflight refusals do not count. The selected tests share a 10-minute execution deadline (20 minutes with slow motion), tripled for per-test database isolation to allow for serial provisioning and cleanup.`;
+};
+
+const AGENT_RUN_TESTS_GUIDANCE = buildAgentRunTestsGuidance();
+
+/**
+ * Proactive test-maintenance policy for the local agent. Only injected when the
+ * app has opted into testing, so the agent keeps the e2e suite in sync with
+ * feature work by default — without waiting to be asked.
+ */
+const buildAgentProactiveTestsGuidance = (
+  audience: "root" | "implementer" = "root",
+  runTestsAvailable = true,
+) => {
+  const completionInstruction =
+    audience === "root"
+      ? "Briefly tell the user which flow you added or updated a test for"
+      : "Briefly report to the root Agent which flow you added or updated a test for";
+  const skipInstruction =
+    audience === "root"
+      ? "skip it (and say so) for trivial changes"
+      : "skip it for trivial changes and report that decision to the root Agent";
+  return `# Keeping end-to-end tests up to date
+
+This app has end-to-end testing enabled, so treat test coverage as PART OF THE WORK, not a separate favor to wait for. Whenever you finish implementing or changing app behavior, keep the \`e2e-tests/\` suite in sync in the SAME turn:
+
+- **Added a new user-facing feature or flow** (a new page, form, action, CRUD operation, auth flow, or meaningful interaction) → write a new Playwright spec covering its happy path.
+- **Changed how an existing feature behaves** → find the spec(s) that cover it and update them to match the new behavior rather than creating a duplicate; only add a new spec when no existing one covers the flow.
+- **Review existing tests for impact — ALWAYS, whether you added or modified behavior.** Any change to app behavior can break specs that exercise the code paths you touched (a renamed label, a moved route, a changed field, a new required step). Before finishing, look at the EXISTING tests that might be affected and decide which need updating:
+  - \`list_files\` on \`e2e-tests/\`, then \`read_file\` the specs whose flows touch what you changed — the ones that visit the affected route/page, target the elements you edited, or depend on the behavior you altered. This is a STATIC code review of the spec files; you do NOT need to run the whole suite to figure out which are affected.
+  - Update any spec whose selectors, assertions, navigation, or setup no longer match the app's new behavior. Leave unrelated specs alone.
+  - If, after reading them, none of the existing specs are affected, that's fine — say so briefly and move on.
+
+Use judgment about what DESERVES a test — don't test everything:
+- DO cover meaningful, user-facing behavior a user could break: the core flows of the feature you just built or changed.
+- SKIP purely cosmetic or non-behavioral changes: styling/layout tweaks, copy/text edits, refactors that don't change behavior, config changes, and internal-only code. Don't add a test for these.
+- Keep it proportionate: ONE focused happy-path spec per feature/flow is usually enough. Don't bloat the suite with redundant or trivial tests.
+
+${
+  runTestsAvailable
+    ? `After writing or updating a spec, VERIFY it with \`run_tests\` and fix any failures (see below) before you consider the task done. ${completionInstruction}.`
+    : `After writing or updating a spec, report the required verification to the root Agent because \`run_tests\` is unavailable for this assignment. ${completionInstruction}.`
+}
+
+If you're genuinely unsure whether a change warrants a test, lean toward covering real user-facing behavior; ${skipInstruction}.`;
+};
+
+const AGENT_PROACTIVE_TESTS_GUIDANCE = buildAgentProactiveTestsGuidance();
+
+/**
+ * Guidance for the recorder's test proposal, which goes through the
+ * `generate_test_assertions` tool's review card instead of a file write.
+ */
+const AGENT_RECORDED_TEST_GUIDANCE = `## A test proposal for a just-recorded flow
+
+Dyad's recorder captures a flat list of interactions and does NOT write a file. When the user asks for assertions on a flow they just recorded, their message contains the recorded statements, numbered. There is nothing to \`read_file\` — the spec does not exist yet.
+
+If the message lists fragile selectors, stabilize every one you can identify safely BEFORE calling the proposal tool: inspect its source hint, reuse an existing \`data-testid\` or edit the app source to add a descriptive static one, then include the completed edit in \`selectorRepairs\`. This source edit is automatic test maintenance; do not ask for a separate selector approval. If the hint is absent or ambiguous, leave that locator unchanged rather than guessing.
+
+Call \`generate_test_assertions\` with a name for the test, one plain-English step description per statement, the assertions you'd propose, and any completed selector repairs, then WAIT for its result. Name it from what the steps actually do, unless the user already named it, in which case use theirs exactly. It shows the user a card where they can reword, delete, add, and reorder assertions, and it does not return until they answer it. While that card is open there is nothing to edit and nothing to run — do not call \`run_tests\`.
+
+Approving the card is what generates the spec file. The tool then returns to you, in this same turn, with the path it wrote: verify that spec with \`run_tests\` and fix any failures as usual. If the tool comes back saying the card was closed without approving, no file was written — don't run anything and don't propose again.
+
+This applies only to a recording that hasn't become a file yet. Write and edit specs that exist on disk normally with \`write_file\` / \`search_replace\`.`;
+
+/**
+ * Local-agent test-writing guidance: proactively keep tests in sync, write the
+ * spec with the `write_file` tool, then verify and iterate with `run_tests`.
+ * Dyad detects `.spec.ts` files and surfaces them in the Tests panel where the
+ * user can also run them.
+ */
+export const AGENT_TEST_WRITING_GUIDANCE = `${AGENT_PROACTIVE_TESTS_GUIDANCE}
+
+${buildTestWritingGuidance(
+  `- Write it with the \`write_file\` tool to a path ending in \`.spec.ts\` under \`e2e-tests/\` (e.g. \`e2e-tests/signup.spec.ts\`). Dyad detects \`.spec.ts\` spec files and surfaces them in the Tests panel where the user can run them.`,
+)}
+
+${AGENT_RECORDED_TEST_GUIDANCE}
+
+${AGENT_RUN_TESTS_GUIDANCE}`;
+
+/** Test-writing guidance adapted to child tools and the root-only channel. */
+export function getImplementerTestWritingGuidance(
+  runTestsAvailable: boolean,
+): string {
+  return `${buildAgentProactiveTestsGuidance("implementer", runTestsAvailable)}
+
+${buildTestWritingGuidance(
+  `- Write it with the \`write_file\` tool to a path ending in \`.spec.ts\` under \`e2e-tests/\` (e.g. \`e2e-tests/signup.spec.ts\`). Dyad detects \`.spec.ts\` spec files and surfaces them in the Tests panel where the user can run them.`,
+  "implementer",
+)}
+
+${
+  runTestsAvailable
+    ? buildAgentRunTestsGuidance("implementer")
+    : "The `run_tests` tool is unavailable for this assignment. Report the required verification to the root Agent; do not attempt to call the unavailable tool."
+}`;
+}
 
 const BUILD_SYSTEM_PROMPT_BASE = `${BUILD_SYSTEM_PREFIX}
 
@@ -379,6 +615,7 @@ You are a helpful AI assistant that specializes in web development, programming,
 Always reply to the user in the same language they are using.
 
 Focus on providing helpful explanations and guidance:
+${CHAT_MARKDOWN_GUIDANCE}
 - Provide clear explanations of programming concepts and best practices
 - Answer technical questions with accurate information
 - Offer guidance and suggestions for solving problems
@@ -529,7 +766,19 @@ export const constructSystemPrompt = ({
   frameworkType,
   hasSupabaseProject,
   enableAppBlueprint,
+  hasAppBlueprint,
+  planningQuestionnaireAvailable,
+  appBlueprintQuestionnaireCompleted,
+  appBlueprint,
   codeExplorerAvailable,
+  historyExplorerAvailable,
+  implementerAvailable,
+  testingEnabled,
+  preCommitHookAvailable,
+  restartAppToolAvailable,
+  reinstallAndRestartAppToolAvailable,
+  runBuildToolAvailable,
+  suggestedPromptsEnabled,
 }: {
   aiRules: string | undefined;
   chatMode?: "build" | "ask" | "local-agent" | "plan";
@@ -555,11 +804,39 @@ export const constructSystemPrompt = ({
   hasSupabaseProject?: boolean;
   /** If false, omit the app blueprint block from the local-agent prompt. */
   enableAppBlueprint?: boolean;
+  /** Whether this chat already has an unapproved blueprint to update. */
+  hasAppBlueprint?: boolean;
+  /** Whether planning_questionnaire is exposed in this turn's tool set. */
+  planningQuestionnaireAvailable?: boolean;
+  /** Whether this chat has already completed the initial blueprint questionnaire. */
+  appBlueprintQuestionnaireCompleted?: boolean;
+  /** Current unapproved blueprint data, including edits made in the card. */
+  appBlueprint?: AppBlueprintData;
   /**
-   * If true, the local-agent prompt should prefer the compiler-backed
-   * TypeScript exploration tool over code_search for broad codebase discovery.
+   * If true, the local-agent prompt can use Code Explorer when the relevant
+   * files are not already known or reasonably clear from available context.
    */
   codeExplorerAvailable?: boolean;
+  /**
+   * If true, the local-agent prompt routes broad historical recall through
+   * the Pro-only `explore_chat_history` sub-agent instead of direct
+   * `search_chats`.
+   */
+  historyExplorerAvailable?: boolean;
+  /** If true, include root-Agent guidance for delegating scoped edits. */
+  implementerAvailable?: boolean;
+  /**
+   * Whether the app has opted into E2E testing. Gates the local-agent
+   * test-writing and `run_tests` guidance (see `constructLocalAgentPrompt`).
+   */
+  testingEnabled?: boolean;
+  /** Whether the writable local-agent turn exposes `run_pre_commit`. */
+  preCommitHookAvailable?: boolean;
+  restartAppToolAvailable?: boolean;
+  reinstallAndRestartAppToolAvailable?: boolean;
+  runBuildToolAvailable?: boolean;
+  /** Whether writable prompts ask for follow-up prompt chips (user setting). */
+  suggestedPromptsEnabled?: boolean;
 }) => {
   if (chatMode === "plan") {
     return constructPlanModePrompt(aiRules, themePrompt);
@@ -573,7 +850,34 @@ export const constructSystemPrompt = ({
       frameworkType,
       hasSupabaseProject,
       enableAppBlueprint,
+      hasAppBlueprint,
+      planningQuestionnaireAvailable,
+      appBlueprintQuestionnaireCompleted,
+      appBlueprint,
       codeExplorerAvailable,
+      historyExplorerAvailable,
+      implementerAvailable,
+      testingEnabled,
+      preCommitHookAvailable,
+      restartAppToolAvailable,
+      reinstallAndRestartAppToolAvailable,
+      runBuildToolAvailable,
+      suggestedPromptsEnabled,
+    });
+  }
+
+  if (chatMode === "build") {
+    return constructBuildAgentPrompt(aiRules, themePrompt, {
+      frameworkType,
+      hasSupabaseProject,
+      enableAppBlueprint,
+      hasAppBlueprint,
+      planningQuestionnaireAvailable,
+      appBlueprintQuestionnaireCompleted,
+      appBlueprint,
+      restartAppToolAvailable,
+      reinstallAndRestartAppToolAvailable,
+      suggestedPromptsEnabled,
     });
   }
 

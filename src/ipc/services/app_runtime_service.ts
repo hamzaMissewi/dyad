@@ -1,45 +1,105 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import util from "node:util";
 import fixPath from "fix-path";
 import killPort from "kill-port";
 import log from "electron-log";
+import { eq } from "drizzle-orm";
+
+import {
+  getAppPreviewHostname,
+  getPreviewCookieNamespace,
+} from "../../../shared/preview_hostname";
+import {
+  ensureSupabasePreviewRedirects,
+  resolveSupabasePreviewTarget,
+} from "./supabase_preview_redirect_service";
+import {
+  clearPreviewNamespacedCookies,
+  clearSharedPreviewSessionCookies,
+} from "./preview_storage";
+import { isPreviewCookieIsolationEnabled } from "./preview_cookie_isolation";
+import {
+  samePreviewAuthTarget,
+  type PreviewAuthTarget,
+} from "./preview_auth_target";
+import { abortable } from "../utils/abortable";
+import {
+  neonPreviewDomainService,
+  resolveNeonPreviewTarget,
+  type NeonPreviewTarget,
+} from "./neon_preview_domain_service";
 
 import { getAppPort, getAppProxyPort } from "../../../shared/ports";
+import { db } from "@/db";
+import { apps } from "@/db/schema";
 import { readSettings } from "@/main/settings";
 import {
   shouldShowPnpmMinimumReleaseAgeWarning,
   type RuntimeMode2,
 } from "@/lib/schemas";
-import type { AppOutput } from "@/ipc/types/misc";
+import type { AppRuntimeOutput } from "@/ipc/types/app_runtime";
+import type { ConsoleEntry } from "@/ipc/types/supabase";
+import type { AppRunInvocationRef, PreviewAuthStatus } from "@/app_run/state";
+import {
+  CancellationTombstones,
+  createInvocationRef,
+  invocationRegistryKey,
+  sameInvocationRef,
+} from "@/state_machines/invocation_ref";
 import { DyadError, DyadErrorKind } from "@/errors/dyad_error";
-import { addLog } from "@/lib/log_store";
-import { safeSend } from "@/ipc/utils/safe_sender";
+import { assertAppFolderExists } from "@/ipc/utils/app_git_repository";
+import { addLog, clearLogs } from "@/lib/log_store";
+import { ProcessOutputLogLimiter } from "@/ipc/utils/process_output_log_limiter";
+import { getDyadAppPath } from "@/paths/paths";
 import { startProxy } from "@/ipc/utils/start_proxy_server";
 import {
   buildCloudSandboxFileMap,
   CloudSandboxApiError,
   createCloudSandbox,
   destroyCloudSandbox,
+  queueCloudSandboxSnapshotSync,
   registerRunningCloudSandbox,
   setCloudSandboxSyncUpdateListener,
   streamCloudSandboxLogs,
   uploadCloudSandboxFiles,
+  restartCloudSandbox,
 } from "@/ipc/utils/cloud_sandbox_provider";
 import {
   processCounter,
   removeAppIfCurrentProcess,
+  removeDockerVolumesForApp,
   runningApps,
+  stopAppByInfo,
+  type RunningAppInfo,
 } from "@/ipc/utils/process_manager";
+import {
+  appOperationCoordinator,
+  readAppResource,
+  type AppOperationRequest,
+} from "@/ipc/services/app_operation_coordinator";
+import { APP_RUN_INVOCATION_KIND } from "@/app_run/state";
 import {
   ensurePnpmAllowBuildsConfigured,
   getPackageManagerCommandEnv,
   getPnpmMinimumReleaseAgeSupport,
+  isPnpmIgnoredBuildsError,
+  parsePnpmIgnoredBuildsFromOutput,
   type PackageManager,
   PNPM_PM_ON_FAIL_IGNORE_ARG,
   PNPM_INSTALL_POLICY_ARGS,
+  getBestEffortPnpmRebuildCommand,
 } from "@/ipc/utils/socket_firewall";
+import {
+  recordAndReportDeniedPnpmBuilds,
+  resolvePnpmIgnoredBuilds,
+} from "@/ipc/utils/pnpm_denied_builds";
+import {
+  getManagedPnpmMajorVersion,
+  isPnpmVersionMigrationNeeded,
+} from "@/ipc/utils/pnpm_migration";
 import {
   choosePackageManagerFromSignal,
   getPackageManagerSignal,
@@ -47,6 +107,15 @@ import {
 } from "@/ipc/utils/package_manager_selection";
 
 const logger = log.scope("app_runtime_service");
+const pnpmVersionMigrationNotifiedAppIds = new Set<number>();
+
+/**
+ * Transport-neutral output boundary captured by a runtime producer.
+ *
+ * IPC is one adapter today; the future main-hosted actor can consume these
+ * callbacks directly without manufacturing an Electron event.
+ */
+export type { AppRuntimeOutput } from "@/ipc/types/app_runtime";
 
 // Needed, otherwise Electron on macOS/Linux may not find node/pnpm.
 fixPath();
@@ -90,6 +159,19 @@ function getPnpmRunCommand(): string {
   return `pnpm ${PNPM_PM_ON_FAIL_IGNORE_ARG} run dev`;
 }
 
+function buildPnpmInstallAndRunCommand(input: {
+  promotedPackages: string[];
+  port: number;
+}): string {
+  return [
+    getPnpmInstallCommand(),
+    getBestEffortPnpmRebuildCommand(input.promotedPackages),
+    `${getPnpmRunCommand()} --port ${input.port}`,
+  ]
+    .filter(Boolean)
+    .join(" && ");
+}
+
 function getNpmInstallCommand(): string {
   return "npm install --legacy-peer-deps";
 }
@@ -113,9 +195,14 @@ async function getDefaultCommand({
 }): Promise<AppRuntimeCommand> {
   const port = getAppPort(appId);
   if (runtimeMode === "docker") {
-    await ensurePnpmAllowBuildsConfigured({ appPath });
+    const allowBuildsResult = await ensurePnpmAllowBuildsConfigured({
+      appPath,
+    });
     return {
-      command: `${getPnpmInstallCommand()} && ${getPnpmRunCommand()} --port ${port}`,
+      command: buildPnpmInstallAndRunCommand({
+        promotedPackages: allowBuildsResult.promotedPackages,
+        port,
+      }),
       isCustom: false,
       packageManager: "pnpm",
     };
@@ -147,9 +234,12 @@ async function getDefaultCommand({
     };
   }
 
-  await ensurePnpmAllowBuildsConfigured({ appPath });
+  const allowBuildsResult = await ensurePnpmAllowBuildsConfigured({ appPath });
   return {
-    command: `${getPnpmInstallCommand()} && ${getPnpmRunCommand()} --port ${port}`,
+    command: buildPnpmInstallAndRunCommand({
+      promotedPackages: allowBuildsResult.promotedPackages,
+      port,
+    }),
     isCustom: false,
     packageManager: "pnpm",
   };
@@ -189,11 +279,11 @@ async function getCommand({
 
 function emitPnpmMinimumReleaseAgeWarning({
   appId,
-  event,
+  output,
   message,
 }: {
   appId: number;
-  event: Electron.IpcMainInvokeEvent;
+  output: AppRuntimeOutput;
   message: string;
 }) {
   const settings = readSettings();
@@ -201,185 +291,616 @@ function emitPnpmMinimumReleaseAgeWarning({
     return;
   }
 
-  safeSend(event.sender, "app:output", {
+  output.send({
     type: "package-manager-warning",
+    warningKind: "release-age",
     message,
     appId,
   });
 }
 
+interface PreviewAuthContext {
+  target: PreviewAuthTarget | null;
+  status?: PreviewAuthStatus;
+}
+
+interface PreviewAuthOptions {
+  hostname: string;
+  isNeon: boolean;
+  neonAuthTarget?: NeonPreviewTarget | null;
+  signal?: AbortSignal;
+}
+
+async function resolvePreviewAuthContext(
+  appId: number,
+  isNeon: boolean,
+  neonAuthTarget?: NeonPreviewTarget | null,
+): Promise<PreviewAuthContext> {
+  const previewAuth: PreviewAuthContext = { target: null };
+  try {
+    if (isNeon) {
+      const target =
+        neonAuthTarget === undefined
+          ? await resolveNeonPreviewTarget(appId)
+          : neonAuthTarget;
+      if (target) previewAuth.target = { provider: "neon", ...target };
+    } else {
+      const target = await resolveSupabasePreviewTarget(appId);
+      if (target) previewAuth.target = { provider: "supabase", ...target };
+    }
+  } catch (error) {
+    previewAuth.status = {
+      provider: isNeon ? "neon" : "supabase",
+      state: "error",
+      message: `Could not determine this app's ${isNeon ? "Neon Auth branch" : "Supabase project"}. Authentication redirects may fail. Restart and retry.`,
+    };
+    logger.warn(previewAuth.status.message, error);
+  }
+  return previewAuth;
+}
+
+async function initializeRunningPreviewAuth(
+  appId: number,
+  appInfo: RunningAppInfo,
+  options: PreviewAuthOptions,
+): Promise<void> {
+  if (options.hostname === "localhost") return;
+  // Publish the runtime before reading the association, so provider changes
+  // can reconcile it even during this lookup. Neon configuration is protected
+  // by the caller's runtime-config claim; Supabase is a single DB snapshot.
+  // Do not acquire provider admission inside the runtime operation: a queued
+  // provider writer may itself be waiting for our runtime-config claim.
+  const targetRevision = appInfo.previewAuthTargetRevision;
+  const authPreview = await resolvePreviewAuthContext(
+    appId,
+    options.isNeon,
+    options.neonAuthTarget,
+  );
+  if (
+    runningApps.get(appId) !== appInfo ||
+    appInfo.previewAuthTargetRevision !== targetRevision ||
+    appInfo.stopRequested ||
+    appInfo.proxyAbortController?.signal.aborted ||
+    options.signal?.aborted
+  )
+    return;
+  // The dev server can publish its URL while the lookup is pending.
+  await reconcileRunningPreviewAuth(
+    appId,
+    authPreview.target,
+    undefined,
+    authPreview.status,
+  );
+}
+
 export async function executeApp({
+  neonAuthTarget,
+  previewAbortSignal,
   appPath,
   appId,
-  event,
+  output,
   isNeon,
   installCommand,
   startCommand,
+  invocationRef,
 }: {
+  neonAuthTarget?: NeonPreviewTarget | null;
+  previewAbortSignal?: AbortSignal;
   appPath: string;
   appId: number;
-  event: Electron.IpcMainInvokeEvent;
+  output: AppRuntimeOutput;
   isNeon: boolean;
   installCommand?: string | null;
   startCommand?: string | null;
+  invocationRef?: AppRunInvocationRef;
 }): Promise<void> {
   const settings = readSettings();
+  const previewAuthOptions: PreviewAuthOptions = {
+    hostname: settings.enableAppPreviewDomains
+      ? getAppPreviewHostname(appId)
+      : "localhost",
+    isNeon,
+    neonAuthTarget,
+    signal: previewAbortSignal,
+  };
+  previewAbortSignal?.throwIfAborted();
   const runtimeMode = settings.runtimeMode2 ?? "host";
 
   if (runtimeMode === "docker") {
     await executeAppInDocker({
       appPath,
       appId,
-      event,
+      output,
       isNeon,
       installCommand,
       startCommand,
+      invocationRef,
+      previewAuthOptions,
     });
   } else if (runtimeMode === "cloud") {
     await executeAppInCloud({
       appPath,
       appId,
-      event,
+      output,
       installCommand,
       startCommand,
+      invocationRef,
+      previewAuthOptions,
     });
   } else {
+    notifyPnpmVersionMigrationAvailable({ appPath, appId, output });
     await executeAppLocalNode({
       appPath,
       appId,
-      event,
+      output,
       isNeon,
       installCommand,
       startCommand,
+      invocationRef,
+      previewAuthOptions,
     });
+  }
+}
+
+// Discovery nudge for the consented "Migrate to pnpm N" app upgrade: the
+// contradiction (old pin/lockfile vs the managed pnpm) only bites outside
+// Dyad (CI, deploys, teammates), so surface it in the console the user is
+// already watching instead of failing or silently rewriting the pin.
+function notifyPnpmVersionMigrationAvailable({
+  appPath,
+  appId,
+  output,
+}: {
+  appPath: string;
+  appId: number;
+  output: AppRuntimeOutput;
+}): void {
+  try {
+    if (!isPnpmVersionMigrationNeeded(appPath)) {
+      return;
+    }
+    const managedMajor = getManagedPnpmMajorVersion();
+    if (!pnpmVersionMigrationNotifiedAppIds.has(appId)) {
+      output.send({
+        type: "stdout",
+        message: `This pnpm app needs a pnpm ${managedMajor} migration (pre-9 lockfile or pnpm <= 8 pin). Dyad already runs pnpm ${managedMajor}, so deploys, CI, and teammates' installs can drift without the matching project pin. Open App Details -> App Upgrades and apply "Migrate to pnpm ${managedMajor}".`,
+        appId,
+      });
+      pnpmVersionMigrationNotifiedAppIds.add(appId);
+    }
+    output.send({
+      type: "package-manager-warning",
+      warningKind: "pnpm-migration",
+      message: `This app pins an older pnpm that can't read the lockfile Dyad writes. Migrate to pnpm ${managedMajor} so CI, deploys, and teammates can install it reliably.`,
+      appId,
+    });
+  } catch (error) {
+    logger.warn("Failed to check pnpm version migration status:", error);
   }
 }
 
 export function emitProxyServerStarted({
   appId,
-  event,
+  output,
   proxyUrl,
   originalUrl,
   mode,
+  invocationRef,
+  previewAuth,
 }: {
   appId: number;
-  event: Electron.IpcMainInvokeEvent;
+  output: AppRuntimeOutput;
   proxyUrl: string;
   originalUrl: string;
   mode: RuntimeMode2;
+  invocationRef?: AppRunInvocationRef;
+  previewAuth?: PreviewAuthStatus;
 }) {
-  safeSend(event.sender, "app:output", {
+  output.send({
     type: "stdout",
     message: `[dyad-proxy-server]started=[${proxyUrl}] original=[${originalUrl}] mode=[${mode}]`,
     appId,
+    invocationRef,
+    previewAuth,
   });
+}
+
+/** Caller owns provider/runtime configuration admission. */
+export async function reconcileRunningNeonPreview(
+  appId: number,
+  target?: NeonPreviewTarget | null,
+  outputOverride?: AppRuntimeOutput,
+): Promise<void> {
+  return reconcileRunningPreviewAuth(
+    appId,
+    target ? { provider: "neon", ...target } : target,
+    outputOverride,
+  );
+}
+
+/** Caller owns provider admission; captures the target before background work. */
+export async function reconcileRunningSupabasePreview(appId: number) {
+  const appInfo = runningApps.get(appId);
+  if (!appInfo) return;
+  if (
+    appInfo.previewHostname === "localhost" ||
+    (appInfo.proxyUrl
+      ? new URL(appInfo.proxyUrl).hostname === "localhost"
+      : !appInfo.previewHostname && !readSettings().enableAppPreviewDomains)
+  )
+    return;
+  const target = await resolveSupabasePreviewTarget(appId);
+  if (runningApps.get(appId) !== appInfo) return;
+  await reconcileRunningPreviewAuth(
+    appId,
+    target ? { provider: "supabase", ...target } : null,
+  );
+}
+
+async function reconcileRunningPreviewAuth(
+  appId: number,
+  target?: PreviewAuthTarget | null,
+  outputOverride?: AppRuntimeOutput,
+  initialStatus?: PreviewAuthStatus,
+): Promise<void> {
+  const appInfo = runningApps.get(appId);
+  if (!appInfo) return;
+  if (target !== undefined) {
+    appInfo.previewAuthTarget = target;
+    appInfo.previewAuthTargetRevision =
+      (appInfo.previewAuthTargetRevision ?? 0) + 1;
+    if (target === null || initialStatus !== undefined)
+      appInfo.previewAuth = initialStatus;
+  }
+  if (!appInfo.proxyUrl) return;
+  const output = outputOverride ?? appInfo.output;
+  await registerPreviewOrigin(appId, appInfo, appInfo.proxyUrl, target, output);
+  if (
+    !output ||
+    !appInfo.originalUrl ||
+    runningApps.get(appId) !== appInfo ||
+    appInfo.proxyAbortController?.signal.aborted ||
+    appInfo.previewAbortSignal?.aborted
+  )
+    return;
+  emitProxyServerStarted({
+    appId,
+    output,
+    proxyUrl: appInfo.proxyUrl,
+    originalUrl: appInfo.originalUrl,
+    mode: appInfo.mode,
+    invocationRef: appInfo.invocationRef,
+    previewAuth: appInfo.previewAuth,
+  });
+}
+
+async function registerPreviewOrigin(
+  appId: number,
+  appInfo: RunningAppInfo,
+  proxyUrl: string,
+  target = appInfo.previewAuthTarget,
+  output = appInfo.output,
+) {
+  if (runningApps.get(appId) !== appInfo || appInfo.stopRequested) return;
+  // The opt-in is applied when starting the proxy. Use its actual address so
+  // changing the setting does not alter an already-running preview's auth.
+  if (
+    appInfo.previewHostname === "localhost" ||
+    new URL(proxyUrl).hostname !== getAppPreviewHostname(appId)
+  )
+    return;
+  const previous = appInfo.previewAuthRegistration;
+  const origin = new URL(proxyUrl).origin;
+  if (
+    target &&
+    previous &&
+    !previous.controller.signal.aborted &&
+    previous.origin === origin &&
+    previous.invocationRef === appInfo.invocationRef &&
+    previous.output === output &&
+    samePreviewAuthTarget(previous.target, target)
+  )
+    return;
+
+  previous?.controller.abort();
+  appInfo.previewAuthRegistration = undefined;
+  if (!target) {
+    if (appInfo.previewAuth?.state === "pending")
+      appInfo.previewAuth = undefined;
+    await previous?.settled;
+    return;
+  }
+  const controller = (appInfo.proxyAbortController ??= new AbortController());
+  const registrationController = new AbortController();
+  const signal = AbortSignal.any([
+    controller.signal,
+    registrationController.signal,
+    ...(appInfo.previewAbortSignal ? [appInfo.previewAbortSignal] : []),
+  ]);
+  if (signal.aborted) return;
+  const invocationRef = appInfo.invocationRef;
+  const registration = {
+    target,
+    origin,
+    invocationRef,
+    output,
+    controller: registrationController,
+    settled: Promise.resolve(),
+  };
+  const current = () =>
+    runningApps.get(appId) === appInfo &&
+    appInfo.previewAuthRegistration === registration &&
+    appInfo.invocationRef === invocationRef &&
+    samePreviewAuthTarget(appInfo.previewAuthTarget, target) &&
+    !signal.aborted;
+
+  // Startup or provider reconciliation captures an immutable target. Ownership
+  // of this additive remote mutation then belongs to the runtime: stop drains
+  // it, and branch reconciliation cancels and drains the previous registration.
+  // Never reread mutable provider configuration from the background continuation.
+  appInfo.previewAuthRegistration = registration;
+  appInfo.previewAuth = { provider: target.provider, state: "pending" };
+  registration.settled = Promise.resolve()
+    .then(async () => {
+      await previous?.settled;
+      if (!current()) return;
+      await abortable(
+        target.provider === "neon"
+          ? neonPreviewDomainService.ensureTrustedDomain({
+              appId,
+              processId: appInfo.processId,
+              invocationRef,
+              target: {
+                projectId: target.projectId,
+                branchId: target.branchId,
+              },
+              origin,
+              signal,
+            })
+          : ensureSupabasePreviewRedirects({ appId, target, origin, signal }),
+        signal,
+      );
+    })
+    .catch((error) => {
+      if (!current()) return;
+      // Provider errors may contain credentials or private data. Only publish
+      // fixed, actionable copy to the renderer.
+      appInfo.previewAuth = {
+        provider: target.provider,
+        state: "error",
+        message:
+          target.provider === "neon"
+            ? "Neon could not register this app's preview address. OAuth sign-in and authentication redirects may not work. Restart and retry."
+            : "Supabase could not register this app's preview redirect URLs. Authentication redirects may not work. Check your Supabase connection, then restart and retry.",
+      };
+      logger.warn(
+        `${target.provider} preview registration failed for app ${appId}`,
+        error,
+      );
+    })
+    .then(() => {
+      if (!current()) return;
+      if (appInfo.previewAuth?.state === "pending")
+        appInfo.previewAuth = undefined;
+      if (output && appInfo.proxyUrl === proxyUrl && appInfo.originalUrl) {
+        emitProxyServerStarted({
+          appId,
+          output,
+          proxyUrl,
+          originalUrl: appInfo.originalUrl,
+          mode: appInfo.mode,
+          invocationRef,
+          previewAuth: appInfo.previewAuth,
+        });
+      }
+    })
+    .catch((error) =>
+      logger.warn("Failed to publish preview auth status", error),
+    )
+    .finally(() => {
+      if (appInfo.previewAuthRegistration === registration)
+        appInfo.previewAuthRegistration = undefined;
+    });
 }
 
 export async function ensureProxyForRunningApp({
   appId,
-  event,
+  output,
   originalUrl,
   mode,
+  invocationRef,
 }: {
   appId: number;
-  event: Electron.IpcMainInvokeEvent;
+  output: AppRuntimeOutput;
   originalUrl: string;
   mode: RuntimeMode2;
+  invocationRef?: AppRunInvocationRef;
 }): Promise<void> {
   const appInfo = runningApps.get(appId);
-  if (!appInfo) {
+  if (
+    !appInfo ||
+    (invocationRef &&
+      (!appInfo.invocationRef ||
+        !sameInvocationRef(appInfo.invocationRef, invocationRef)))
+  )
     return;
+  const hostname = (appInfo.previewHostname ??= readSettings()
+    .enableAppPreviewDomains
+    ? getAppPreviewHostname(appId)
+    : "localhost");
+  const cookieIsolationEnabled = isPreviewCookieIsolationEnabled();
+  // Install the promise before the first asynchronous boundary: dev servers
+  // can print their URL more than once before the proxy has bound.
+  while (appInfo.proxyStartup) {
+    await appInfo.proxyStartup;
+    if (
+      appInfo.proxyWorker &&
+      appInfo.proxyUrl &&
+      new URL(appInfo.proxyUrl).hostname === hostname &&
+      appInfo.originalUrl === originalUrl &&
+      appInfo.proxyAuthToken ===
+        (mode === "cloud" ? appInfo.cloudPreviewAuthToken : undefined)
+    )
+      return;
   }
-
   const proxyAuthToken =
     mode === "cloud" ? appInfo.cloudPreviewAuthToken : undefined;
-
-  if (
-    appInfo.proxyWorker &&
-    appInfo.originalUrl === originalUrl &&
-    appInfo.proxyAuthToken === proxyAuthToken &&
-    appInfo.proxyUrl
-  ) {
-    emitProxyServerStarted({
-      appId,
-      event,
-      proxyUrl: appInfo.proxyUrl,
-      originalUrl,
-      mode,
-    });
-    return;
-  }
-
-  if (appInfo.proxyWorker) {
-    await appInfo.proxyWorker.terminate();
-    appInfo.proxyWorker = undefined;
-  }
-
-  // Prefer the deterministic port so the iframe origin stays stable across
-  // restarts — otherwise origin-scoped browser state (auth sessions,
-  // localStorage) gets orphaned and users appear logged out. If that port is
-  // already taken (by a foreign service, or another Dyad app in the rare 10k
-  // overlap), the proxy worker scans the fallback band upward rather than
-  // killing whatever holds the port.
-  const proxyPort = getAppProxyPort(appId);
-
-  const proxyWorker = await startProxy(originalUrl, {
-    port: proxyPort,
-    onStarted: (proxyUrl) => {
-      const latestAppInfo = runningApps.get(appId);
-      if (latestAppInfo) {
-        latestAppInfo.proxyUrl = proxyUrl;
-        latestAppInfo.originalUrl = originalUrl;
-        latestAppInfo.proxyAuthToken = proxyAuthToken;
-      }
+  const startup = Promise.resolve().then(async () => {
+    if (
+      runningApps.get(appId) !== appInfo ||
+      appInfo.stopRequested ||
+      appInfo.proxyAbortController?.signal.aborted ||
+      appInfo.previewAbortSignal?.aborted
+    )
+      return;
+    if (
+      appInfo.proxyWorker &&
+      appInfo.proxyUrl &&
+      new URL(appInfo.proxyUrl).hostname === hostname &&
+      appInfo.originalUrl === originalUrl &&
+      appInfo.proxyAuthToken === proxyAuthToken &&
+      appInfo.authBootstrapToken
+    ) {
+      // Repeated dev-server log lines do not acquire provider admission.
+      // Explicit lifecycle/configuration operations reconcile under their claims.
       emitProxyServerStarted({
         appId,
-        event,
+        output,
+        proxyUrl: appInfo.proxyUrl,
+        originalUrl,
+        mode,
+        invocationRef,
+        previewAuth: appInfo.previewAuth,
+      });
+      return;
+    }
+    appInfo.proxyAbortController?.abort();
+    const controller = new AbortController();
+    appInfo.proxyAbortController = controller;
+    const signal = appInfo.previewAbortSignal
+      ? AbortSignal.any([controller.signal, appInfo.previewAbortSignal])
+      : controller.signal;
+    const current = () =>
+      runningApps.get(appId) === appInfo &&
+      appInfo.proxyAbortController === controller &&
+      !appInfo.stopRequested &&
+      !signal.aborted;
+    if (appInfo.proxyWorker) await appInfo.proxyWorker.terminate();
+    if (!current()) return;
+    appInfo.proxyWorker = undefined;
+    appInfo.proxyUrl = undefined;
+    appInfo.proxyStartupError = undefined;
+    const authBootstrapToken = randomUUID();
+    let resolveReady!: (url: string) => void;
+    let rejectReady!: (error: unknown) => void;
+    const readyPromise = new Promise<string>((resolve, reject) => {
+      resolveReady = resolve;
+      rejectReady = reject;
+    });
+    // Observe rejection immediately, including synchronous worker-launch failure.
+    const readyUrl = abortable(readyPromise, signal);
+    void readyUrl.catch(() => undefined);
+    let worker: RunningAppInfo["proxyWorker"];
+    try {
+      if (!cookieIsolationEnabled) {
+        // Retire hidden localhost credentials even on app-specific domains,
+        // so returning to isolated localhost cannot restore an old login.
+        await clearPreviewNamespacedCookies(appId);
+      } else if (hostname === "localhost") {
+        // Do not serve requests until legacy shared credentials are gone.
+        await clearSharedPreviewSessionCookies();
+      }
+      if (!current()) return;
+      worker = await startProxy(originalUrl, {
+        port: getAppProxyPort(appId),
+        hostname,
+        // App-specific hostnames already isolate cookies.
+        cookieNamespace:
+          hostname === "localhost" && cookieIsolationEnabled
+            ? getPreviewCookieNamespace(appId)
+            : undefined,
+        authBootstrapToken,
+        signal,
+        onStarted: resolveReady,
+        onError: rejectReady,
+        fixedHeaders:
+          mode === "cloud" && proxyAuthToken
+            ? { Authorization: "Bearer " + proxyAuthToken }
+            : undefined,
+      });
+      if (!current()) {
+        return;
+      }
+      appInfo.proxyWorker = worker;
+      appInfo.originalUrl = originalUrl;
+      appInfo.proxyAuthToken = proxyAuthToken;
+      appInfo.authBootstrapToken = authBootstrapToken;
+      const proxyUrl = await readyUrl;
+      if (!current()) return;
+      appInfo.proxyUrl = proxyUrl;
+      await registerPreviewOrigin(appId, appInfo, proxyUrl, undefined, output);
+      if (!current()) return;
+      emitProxyServerStarted({
+        appId,
+        output,
         proxyUrl,
         originalUrl,
         mode,
+        invocationRef,
+        previewAuth: appInfo.previewAuth,
       });
-    },
-    onError: (error) => {
-      logger.error(`Failed to start proxy for app ${appId}:`, error);
-      safeSend(event.sender, "app:output", {
+    } catch (error) {
+      if (!current()) return;
+      appInfo.proxyStartupError =
+        error instanceof Error ? error : new Error(String(error));
+      output.send({
         type: "stderr",
-        message: `[dyad-proxy-server] ${error.message}`,
         appId,
+        invocationRef,
+        message: "[dyad-proxy-server] " + appInfo.proxyStartupError.message,
       });
-    },
-    fixedHeaders:
-      mode === "cloud" && proxyAuthToken
-        ? {
-            Authorization: `Bearer ${proxyAuthToken}`,
-          }
-        : undefined,
+      controller.abort();
+    } finally {
+      // Cancellation can win during launch, readiness, or registration. The
+      // local handle still belongs to this attempt even after map replacement.
+      if (worker && !current()) {
+        await worker.terminate();
+        if (appInfo.proxyWorker === worker) {
+          appInfo.proxyWorker = undefined;
+          appInfo.proxyUrl = undefined;
+          appInfo.authBootstrapToken = undefined;
+        }
+      }
+    }
   });
-
-  const latestAppInfo = runningApps.get(appId);
-  if (latestAppInfo) {
-    latestAppInfo.proxyWorker = proxyWorker;
-    latestAppInfo.originalUrl = originalUrl;
-    latestAppInfo.proxyAuthToken = proxyAuthToken;
-  } else {
-    await proxyWorker.terminate();
+  appInfo.proxyStartup = startup;
+  try {
+    await startup;
+  } finally {
+    if (appInfo.proxyStartup === startup) appInfo.proxyStartup = undefined;
   }
 }
 
 async function executeAppLocalNode({
+  previewAuthOptions,
   appPath,
   appId,
-  event,
+  output,
   isNeon,
   installCommand,
   startCommand,
+  invocationRef,
+  ignoredBuildsSelfHealAttempted = false,
 }: {
+  previewAuthOptions: PreviewAuthOptions;
   appPath: string;
   appId: number;
-  event: Electron.IpcMainInvokeEvent;
+  output: AppRuntimeOutput;
   isNeon: boolean;
   installCommand?: string | null;
   startCommand?: string | null;
+  invocationRef?: AppRunInvocationRef;
+  ignoredBuildsSelfHealAttempted?: boolean;
 }): Promise<void> {
   const command = await getCommand({
     runtimeMode: "host",
@@ -388,7 +909,7 @@ async function executeAppLocalNode({
     installCommand,
     startCommand,
     onPnpmMinimumReleaseAgeWarning: (message) =>
-      emitPnpmMinimumReleaseAgeWarning({ appId, event, message }),
+      emitPnpmMinimumReleaseAgeWarning({ appId, output, message }),
   });
   let env = { ...process.env };
   if (!command.isCustom && command.packageManager === "pnpm") {
@@ -446,51 +967,63 @@ Details: ${details || "n/a"}
   }
 
   const currentProcessId = processCounter.increment();
-  runningApps.set(appId, {
+  const appInfo: RunningAppInfo = {
+    proxyAbortController: new AbortController(),
+    previewAbortSignal: previewAuthOptions.signal,
+    previewHostname: previewAuthOptions.hostname,
     process: spawnedProcess,
     processId: currentProcessId,
+    invocationRef,
     mode: "host",
-    rendererSender: event.sender,
+    output,
     lastViewedAt: Date.now(),
-  });
+  };
+  runningApps.set(appId, appInfo);
 
   listenToProcess({
     process: spawnedProcess,
     appId,
+    appPath,
     isNeon,
-    event,
+    output,
+    invocationRef,
+    onPnpmIgnoredBuildsFailure:
+      command.isCustom && !ignoredBuildsSelfHealAttempted
+        ? async (processOutput) => {
+            const healed = await selfHealDeniedPnpmBuilds({
+              appPath,
+              output: processOutput,
+              telemetrySource: "self-heal",
+            });
+            if (!healed) {
+              return false;
+            }
+
+            // Per "Transparent Over Magical": tell the user why the
+            // process restarted instead of silently reinstalling.
+            output.send({
+              type: "stdout",
+              message:
+                "pnpm blocked dependency build scripts. Dyad recorded the decision in pnpm-workspace.yaml and is reinstalling...",
+              appId,
+            });
+
+            await executeAppLocalNode({
+              appPath,
+              appId,
+              output,
+              isNeon,
+              installCommand,
+              startCommand,
+              invocationRef,
+              ignoredBuildsSelfHealAttempted: true,
+              previewAuthOptions,
+            });
+            return true;
+          }
+        : undefined,
   });
-}
-
-const APP_OUTPUT_FLUSH_INTERVAL_MS = 100;
-
-const pendingOutputs = new Map<Electron.WebContents, AppOutput[]>();
-let flushTimer: ReturnType<typeof setTimeout> | null = null;
-
-function enqueueAppOutput(
-  sender: Electron.WebContents,
-  output: AppOutput,
-): void {
-  let queue = pendingOutputs.get(sender);
-  if (!queue) {
-    queue = [];
-    pendingOutputs.set(sender, queue);
-  }
-  queue.push(output);
-
-  if (!flushTimer) {
-    flushTimer = setTimeout(flushAllAppOutputs, APP_OUTPUT_FLUSH_INTERVAL_MS);
-  }
-}
-
-function flushAllAppOutputs(): void {
-  flushTimer = null;
-  for (const [sender, outputs] of pendingOutputs) {
-    if (outputs.length > 0) {
-      safeSend(sender, "app:output-batch", outputs);
-    }
-  }
-  pendingOutputs.clear();
+  await initializeRunningPreviewAuth(appId, appInfo, previewAuthOptions);
 }
 
 let cloudSandboxSyncUpdateListenerRegistered = false;
@@ -509,8 +1042,8 @@ export function registerCloudSandboxSyncUpdateListener(): void {
     const previousErrorMessage = appInfo.cloudSyncErrorMessage ?? null;
     appInfo.cloudSyncErrorMessage = errorMessage ?? undefined;
 
-    const sender = appInfo.rendererSender;
-    if (!sender) {
+    const output = appInfo.output;
+    if (!output) {
       return;
     }
 
@@ -527,7 +1060,7 @@ export function registerCloudSandboxSyncUpdateListener(): void {
         appId,
       });
 
-      safeSend(sender, "app:output", {
+      output.send({
         type: "sync-error",
         message: errorMessage,
         appId,
@@ -550,7 +1083,7 @@ export function registerCloudSandboxSyncUpdateListener(): void {
       appId,
     });
 
-    safeSend(sender, "app:output", {
+    output.send({
       type: "sync-recovered",
       message: recoveredMessage,
       appId,
@@ -560,22 +1093,78 @@ export function registerCloudSandboxSyncUpdateListener(): void {
   cloudSandboxSyncUpdateListenerRegistered = true;
 }
 
+// Records builds that a successful install skipped (the "Ignored build
+// scripts" warning path) so the decision lands in pnpm-workspace.yaml and a
+// later plain `pnpm install` (export/CI/Rebuild) cannot fail on
+// ERR_PNPM_IGNORED_BUILDS. Best-effort: reads [] when .modules.yaml is
+// absent (npm apps, Docker-volume installs).
+async function recordIgnoredBuildsAfterInstall(appPath: string): Promise<void> {
+  try {
+    const ignoredBuilds = await resolvePnpmIgnoredBuilds(appPath);
+    await recordAndReportDeniedPnpmBuilds({
+      appPath,
+      ignoredBuilds,
+      source: "app-run",
+    });
+  } catch (error) {
+    logger.warn("Failed to record ignored pnpm builds after install:", error);
+  }
+}
+
 function listenToProcess({
   process: spawnedProcess,
   appId,
+  appPath,
   isNeon,
-  event,
+  output,
+  invocationRef,
+  onPnpmIgnoredBuildsFailure,
 }: {
   process: ChildProcess;
   appId: number;
+  appPath?: string;
   isNeon: boolean;
-  event: Electron.IpcMainInvokeEvent;
+  output: AppRuntimeOutput;
+  invocationRef?: AppRunInvocationRef;
+  onPnpmIgnoredBuildsFailure?: (output: string) => Promise<boolean>;
 }) {
+  // Rolling tail, kept only while a self-heal callback could still use it:
+  // dev servers run for hours and unbounded accumulation would leak memory.
+  // The ERR_PNPM_IGNORED_BUILDS marker appears at the end of a failed
+  // install, so a bounded tail is sufficient for the close-handler check.
+  const MAX_PROCESS_OUTPUT_TAIL_LENGTH = 64 * 1024;
+  let processOutput = "";
+  let ignoredBuildsRecordedAfterInstall = false;
+  const appendProcessOutput = (message: string) => {
+    if (!onPnpmIgnoredBuildsFailure) {
+      return;
+    }
+    processOutput = (processOutput + message).slice(
+      -MAX_PROCESS_OUTPUT_TAIL_LENGTH,
+    );
+  };
+  // Every chunk still reaches the log store and the renderer; only the copy
+  // in main.log is capped, because those file writes are synchronous.
+  const outputLogLimiter = new ProcessOutputLogLimiter();
+  const logPrefix = `App ${appId} (PID: ${spawnedProcess.pid})`;
+  const logOutput = (stream: "stdout" | "stderr", message: string) => {
+    const admitted = outputLogLimiter.admit(message);
+    if (!admitted) {
+      return;
+    }
+    if (admitted.suppressedNote) {
+      logger.warn(`${logPrefix} ${admitted.suppressedNote}`);
+    }
+    if (stream === "stdout") {
+      logger.debug(`${logPrefix} stdout: ${admitted.message}`);
+    } else {
+      logger.error(`${logPrefix} stderr: ${admitted.message}`);
+    }
+  };
   spawnedProcess.stdout?.on("data", async (data) => {
     const message = util.stripVTControlCharacters(data.toString());
-    logger.debug(
-      `App ${appId} (PID: ${spawnedProcess.pid}) stdout: ${message}`,
-    );
+    appendProcessOutput(message);
+    logOutput("stdout", message);
 
     addLog({
       level: "info",
@@ -595,13 +1184,13 @@ function listenToProcess({
     const inputRequestPattern = /\s*›\s*\([yY]\/[nN]\)\s*$/;
     const isInputRequest = inputRequestPattern.test(message);
     if (isInputRequest) {
-      safeSend(event.sender, "app:output", {
+      output.send({
         type: "input-requested",
         message,
         appId,
       });
     } else {
-      enqueueAppOutput(event.sender, {
+      output.enqueue({
         type: "stdout",
         message,
         appId,
@@ -610,11 +1199,20 @@ function listenToProcess({
       const urlMatch = message.match(/(https?:\/\/localhost:\d+\/?)/);
       if (urlMatch) {
         const originalUrl = urlMatch[1];
+        // The dev-server URL appearing means the install phase completed
+        // successfully — the one point in the `install && dev` chain where
+        // ignored builds can be read and recorded.
+        if (appPath && !ignoredBuildsRecordedAfterInstall) {
+          ignoredBuildsRecordedAfterInstall = true;
+          await recordIgnoredBuildsAfterInstall(appPath);
+        }
+        if (runningApps.get(appId)?.process !== spawnedProcess) return;
         await ensureProxyForRunningApp({
           appId,
-          event,
+          output,
           originalUrl,
           mode: "host",
+          invocationRef,
         });
       }
     }
@@ -622,9 +1220,8 @@ function listenToProcess({
 
   spawnedProcess.stderr?.on("data", async (data) => {
     const message = util.stripVTControlCharacters(data.toString());
-    logger.error(
-      `App ${appId} (PID: ${spawnedProcess.pid}) stderr: ${message}`,
-    );
+    appendProcessOutput(message);
+    logOutput("stderr", message);
 
     addLog({
       level: "error",
@@ -634,7 +1231,7 @@ function listenToProcess({
       appId,
     });
 
-    enqueueAppOutput(event.sender, {
+    output.enqueue({
       type: "stderr",
       message,
       appId,
@@ -642,25 +1239,61 @@ function listenToProcess({
   });
 
   spawnedProcess.on("close", (code, signal) => {
-    logger.log(
-      `App ${appId} (PID: ${spawnedProcess.pid}) process closed with code ${code}, signal ${signal}.`,
-    );
-    flushAllAppOutputs();
-    const currentAppInfo = runningApps.get(appId);
-    if (!currentAppInfo || currentAppInfo.process !== spawnedProcess) {
-      removeAppIfCurrentProcess(appId, spawnedProcess);
-      return;
-    }
+    void (async () => {
+      try {
+        const suppressedNote = outputLogLimiter.takeSuppressedNote();
+        if (suppressedNote) {
+          logger.warn(`${logPrefix} ${suppressedNote}`);
+        }
+        logger.log(
+          `App ${appId} (PID: ${spawnedProcess.pid}) process closed with code ${code}, signal ${signal}.`,
+        );
+        output.flush();
+        const currentAppInfo = runningApps.get(appId);
+        if (!currentAppInfo || currentAppInfo.process !== spawnedProcess) {
+          removeAppIfCurrentProcess(appId, spawnedProcess);
+          return;
+        }
 
-    safeSend(event.sender, "app:output", {
-      type: "app-exit",
-      message: `App process exited with code ${code ?? "null"}`,
-      appId,
-      exitCode: code,
-      signal,
-      timestamp: Date.now(),
-    });
-    removeAppIfCurrentProcess(appId, spawnedProcess);
+        if (
+          code !== 0 &&
+          onPnpmIgnoredBuildsFailure &&
+          isPnpmIgnoredBuildsError(processOutput)
+        ) {
+          let retried = false;
+          try {
+            retried = await onPnpmIgnoredBuildsFailure(processOutput);
+          } catch (error) {
+            logger.warn(
+              `Failed to self-heal pnpm ignored builds for app ${appId}:`,
+              error,
+            );
+          }
+          if (retried) {
+            return;
+          }
+        }
+
+        output.send({
+          type: "app-exit",
+          message: `App process exited with code ${code ?? "null"}`,
+          appId,
+          invocationRef,
+          exitCode: code,
+          signal,
+          timestamp: Date.now(),
+        });
+        removeAppIfCurrentProcess(appId, spawnedProcess);
+      } catch (error) {
+        // The close handler is a critical lifecycle point; never let an
+        // unexpected error leave a stale runningApps entry behind.
+        logger.error(
+          `Unexpected error in close handler for app ${appId}:`,
+          error,
+        );
+        removeAppIfCurrentProcess(appId, spawnedProcess);
+      }
+    })();
   });
 
   spawnedProcess.on("error", (err) => {
@@ -671,20 +1304,64 @@ function listenToProcess({
   });
 }
 
+async function selfHealDeniedPnpmBuilds({
+  appPath,
+  output,
+  telemetrySource,
+  removeNodeModules = true,
+}: {
+  appPath: string;
+  output: string;
+  telemetrySource: "self-heal";
+  // Docker installs use the container volume, not host node_modules, and an
+  // explicit `pkg: false` entry passes even a fast-path install — so the
+  // Docker caller skips the host cleanup.
+  removeNodeModules?: boolean;
+}): Promise<boolean> {
+  const ignoredBuilds = await resolvePnpmIgnoredBuilds(appPath, output);
+  // recordDeniedPnpmBuilds may also promote previously auto-denied packages
+  // as a side effect; no explicit `pnpm rebuild` is needed here because
+  // node_modules is removed below, so the retry's fresh install runs build
+  // scripts for newly-allowed packages natively.
+  const { deniedBuilds } = await recordAndReportDeniedPnpmBuilds({
+    appPath,
+    ignoredBuilds,
+    source: telemetrySource,
+  });
+  if (deniedBuilds.length === 0) {
+    return false;
+  }
+
+  if (removeNodeModules) {
+    await fs.promises.rm(path.join(appPath, "node_modules"), {
+      recursive: true,
+      force: true,
+    });
+  }
+
+  return true;
+}
+
 async function executeAppInDocker({
+  previewAuthOptions,
   appPath,
   appId,
-  event,
+  output,
   isNeon,
   installCommand,
   startCommand,
+  invocationRef,
+  ignoredBuildsSelfHealAttempted = false,
 }: {
+  previewAuthOptions: PreviewAuthOptions;
   appPath: string;
   appId: number;
-  event: Electron.IpcMainInvokeEvent;
+  output: AppRuntimeOutput;
   isNeon: boolean;
   installCommand?: string | null;
   startCommand?: string | null;
+  invocationRef?: AppRunInvocationRef;
+  ignoredBuildsSelfHealAttempted?: boolean;
 }): Promise<void> {
   const containerName = `dyad-app-${appId}`;
 
@@ -803,7 +1480,7 @@ RUN npm install -g pnpm
           installCommand,
           startCommand,
           onPnpmMinimumReleaseAgeWarning: (message) =>
-            emitPnpmMinimumReleaseAgeWarning({ appId, event, message }),
+            emitPnpmMinimumReleaseAgeWarning({ appId, output, message }),
         })
       ).command,
     ],
@@ -852,35 +1529,86 @@ ${errorOutput || "(empty)"}`,
   }
 
   const currentProcessId = processCounter.increment();
-  runningApps.set(appId, {
+  const appInfo: RunningAppInfo = {
+    proxyAbortController: new AbortController(),
+    previewAbortSignal: previewAuthOptions.signal,
+    previewHostname: previewAuthOptions.hostname,
     process,
     processId: currentProcessId,
+    invocationRef,
     mode: "docker",
-    rendererSender: event.sender,
+    output,
     containerName,
     lastViewedAt: Date.now(),
-  });
+  };
+  runningApps.set(appId, appInfo);
 
+  // Mirrors the host path: custom `install && start` chains run strict pnpm
+  // inside the container, so an ERR_PNPM_IGNORED_BUILDS exit needs the same
+  // record-denials-and-retry treatment (executeAppInDocker is restart-safe —
+  // it stops and removes the previous container first).
+  const hasCustomCommands = !!installCommand?.trim() && !!startCommand?.trim();
   listenToProcess({
     process,
     appId,
+    appPath,
     isNeon,
-    event,
+    output,
+    invocationRef,
+    onPnpmIgnoredBuildsFailure:
+      hasCustomCommands && !ignoredBuildsSelfHealAttempted
+        ? async (processOutput) => {
+            const healed = await selfHealDeniedPnpmBuilds({
+              appPath,
+              output: processOutput,
+              telemetrySource: "self-heal",
+              removeNodeModules: false,
+            });
+            if (!healed) {
+              return false;
+            }
+
+            output.send({
+              type: "stdout",
+              message:
+                "pnpm blocked dependency build scripts. Dyad recorded the decision in pnpm-workspace.yaml and is reinstalling...",
+              appId,
+            });
+
+            await executeAppInDocker({
+              appPath,
+              appId,
+              output,
+              isNeon,
+              installCommand,
+              startCommand,
+              invocationRef,
+              ignoredBuildsSelfHealAttempted: true,
+              previewAuthOptions,
+            });
+            return true;
+          }
+        : undefined,
   });
+  await initializeRunningPreviewAuth(appId, appInfo, previewAuthOptions);
 }
 
 async function executeAppInCloud({
+  previewAuthOptions,
   appPath,
   appId,
-  event,
+  output,
   installCommand,
   startCommand,
+  invocationRef,
 }: {
+  previewAuthOptions: PreviewAuthOptions;
   appPath: string;
   appId: number;
-  event: Electron.IpcMainInvokeEvent;
+  output: AppRuntimeOutput;
   installCommand?: string | null;
   startCommand?: string | null;
+  invocationRef?: AppRunInvocationRef;
 }): Promise<void> {
   const currentProcessId = processCounter.increment();
   let sandboxId: string | undefined;
@@ -929,34 +1657,46 @@ async function executeAppInCloud({
   }
 
   const cloudLogAbortController = new AbortController();
-  runningApps.set(appId, {
+  const appInfo: RunningAppInfo = {
+    proxyAbortController: new AbortController(),
+    previewAbortSignal: previewAuthOptions.signal,
+    previewHostname: previewAuthOptions.hostname,
     process: null,
     processId: currentProcessId,
+    invocationRef,
     mode: "cloud",
-    rendererSender: event.sender,
+    output,
     cloudSandboxId: sandboxId,
     cloudPreviewUrl: resolvedPreviewUrl,
     cloudPreviewAuthToken: resolvedPreviewAuthToken,
     cloudLogAbortController,
     lastViewedAt: Date.now(),
     originalUrl: resolvedPreviewUrl,
-  });
+  };
+  runningApps.set(appId, appInfo);
   registerRunningCloudSandbox({
     appId,
     appPath,
     sandboxId,
   });
+  // File-write notifications emitted during the initial snapshot are ignored
+  // until registration. Queue one non-blocking full sync now so an edit that
+  // raced that upload cannot leave the new preview permanently stale.
+  queueCloudSandboxSnapshotSync({ appId, fullSync: true, immediate: true });
 
+  await initializeRunningPreviewAuth(appId, appInfo, previewAuthOptions);
   await ensureProxyForRunningApp({
     appId,
-    event,
+    output,
     originalUrl: resolvedPreviewUrl,
     mode: "cloud",
+    invocationRef,
   });
 
   startCloudSandboxLogStream({
     appId,
-    event,
+    appPath,
+    output,
     sandboxId,
     cloudLogAbortController,
   });
@@ -964,10 +1704,55 @@ async function executeAppInCloud({
 
 export function startCloudSandboxLogStream(input: {
   appId: number;
-  event: Electron.IpcMainInvokeEvent;
+  appPath?: string;
+  output: AppRuntimeOutput;
   sandboxId: string;
   cloudLogAbortController: AbortController;
 }) {
+  // The sandbox install runs remotely and node_modules is never synced back,
+  // so the only way to observe ignored builds is the "Ignored build scripts"
+  // line in the streamed install output. Keep a bounded tail across chunks
+  // (the line may be split) and record denials locally once, best-effort.
+  const MAX_LOG_TAIL_LENGTH = 16 * 1024;
+  let logTail = "";
+  let ignoredBuildsRecorded = false;
+  const maybeRecordIgnoredBuilds = (message: string) => {
+    if (!input.appPath || ignoredBuildsRecorded) {
+      return;
+    }
+    logTail = (logTail + message).slice(-MAX_LOG_TAIL_LENGTH);
+    const ignoredBuilds = parsePnpmIgnoredBuildsFromOutput(logTail);
+    if (ignoredBuilds.length === 0) {
+      return;
+    }
+    ignoredBuildsRecorded = true;
+    const appPath = input.appPath;
+    void (async () => {
+      try {
+        // Output-only on purpose: the install ran remotely, so the local
+        // .modules.yaml (if any) does not describe this sandbox.
+        await appOperationCoordinator.run(
+          {
+            appId: input.appId,
+            operation: "record-cloud-pnpm-build-policy",
+            resources: [readAppResource("app-path"), "repository"],
+          },
+          () =>
+            recordAndReportDeniedPnpmBuilds({
+              appPath,
+              ignoredBuilds,
+              source: "cloud-sandbox",
+            }),
+        );
+      } catch (error) {
+        logger.warn(
+          "Failed to record ignored pnpm builds from cloud sandbox logs:",
+          error,
+        );
+      }
+    })();
+  };
+
   void (async () => {
     try {
       for await (const message of streamCloudSandboxLogs(
@@ -979,6 +1764,8 @@ export function startCloudSandboxLogStream(input: {
           return;
         }
 
+        maybeRecordIgnoredBuilds(message);
+
         addLog({
           level: "info",
           type: "server",
@@ -987,7 +1774,7 @@ export function startCloudSandboxLogStream(input: {
           appId: input.appId,
         });
 
-        safeSend(input.event.sender, "app:output", {
+        input.output.send({
           type: "stdout",
           message,
           appId: input.appId,
@@ -1011,7 +1798,7 @@ export function startCloudSandboxLogStream(input: {
         appId: input.appId,
       });
 
-      safeSend(input.event.sender, "app:output", {
+      input.output.send({
         type: "stderr",
         message,
         appId: input.appId,
@@ -1076,3 +1863,662 @@ export async function cleanUpPort(port: number) {
     await killProcessOnPort(port);
   }
 }
+
+interface RuntimeAppRecord {
+  id: number;
+  path: string;
+  neonProjectId: string | null;
+  installCommand: string | null;
+  startCommand: string | null;
+}
+
+export interface AppRuntimeServiceDependencies {
+  runSerialized<T>(
+    appId: number,
+    lifecycle: AppRuntimeLifecycle,
+    operation: () => Promise<T>,
+  ): Promise<T>;
+  findApp(appId: number): Promise<RuntimeAppRecord | undefined>;
+  resolveAppPath(relativePath: string): string;
+  /** Throws a classified error when the resolved app folder is unusable. */
+  assertAppFolderExists(appPath: string): Promise<void>;
+  getRunningApp(appId: number): RunningAppInfo | undefined;
+  deleteRunningApp(appId: number): void;
+  getProcessCounter(): number;
+  startProcess(input: {
+    appPath: string;
+    appId: number;
+    output: AppRuntimeOutput;
+    isNeon: boolean;
+    installCommand?: string | null;
+    startCommand?: string | null;
+    invocationRef?: AppRunInvocationRef;
+  }): Promise<void>;
+  stopProcess(appId: number, appInfo: RunningAppInfo): Promise<void>;
+  removeCurrentProcess(appId: number, process: ChildProcess): void;
+  cleanPort(port: number): Promise<void>;
+  restartSandbox(sandboxId: string): Promise<{
+    previewUrl: string;
+    previewAuthToken: string;
+  }>;
+  ensureProxy(input: {
+    appId: number;
+    output: AppRuntimeOutput;
+    originalUrl: string;
+    mode: RuntimeMode2;
+    invocationRef?: AppRunInvocationRef;
+  }): Promise<void>;
+  startCloudLogs(input: {
+    appId: number;
+    appPath?: string;
+    output: AppRuntimeOutput;
+    sandboxId: string;
+    cloudLogAbortController: AbortController;
+  }): void;
+  addLog(entry: ConsoleEntry): void;
+  clearLogs(appId: number): void;
+  readRuntimeMode(): RuntimeMode2;
+  removeNodeModules(appPath: string): Promise<void>;
+  removeDockerVolumes(appId: number): Promise<void>;
+  waitForReady(appId: number, timeoutMs?: number): Promise<void>;
+  createId(): string;
+  now(): number;
+}
+
+export type AppRuntimeLifecycle = "start" | "restart" | "stop";
+
+export function getAppRuntimeOperationResources(
+  lifecycle: AppRuntimeLifecycle,
+): AppOperationRequest["resources"] {
+  if (lifecycle === "stop") return ["runtime"];
+
+  // Start, restart, and rebuild omit repository and provider admission.
+  // Provider-only writers (including chat's Supabase function reconciliation)
+  // remain admitted; auth target capture yields to newer provider changes.
+  // Repository-only writers (checkpoints, commit/discard, branch operations,
+  // and agent/test writes) may therefore interleave throughout install and
+  // readiness. Preview-generated tracked changes may be checkpointed
+  // nondeterministically, and ensurePnpmAllowBuildsConfigured can replace
+  // pnpm-workspace.yaml from a stale read if another writer changes that exact
+  // file during its lookup (normally a narrow warm-cache/filesystem window,
+  // but up to the 5-second cold-fetch timeout). We accept these races so no
+  // preview lifecycle operation can block chat completion. Operations that
+  // also write runtime-config remain excluded; repository-only GitHub branch
+  // operations do not.
+  return [
+    readAppResource("app-path"),
+    "runtime",
+    readAppResource("runtime-config"),
+  ];
+}
+
+export interface StartAppRuntimeOptions {
+  appId: number;
+  output: AppRuntimeOutput;
+  invocationRef?: AppRunInvocationRef;
+  readyTimeoutMs?: number;
+}
+
+export interface RestartAppRuntimeOptions extends StartAppRuntimeOptions {
+  removeNodeModules?: boolean;
+  recreateSandbox?: boolean;
+}
+
+export interface ExternalAppRuntimeLifecycleOptions {
+  appId: number;
+  output: AppRuntimeOutput;
+  operation: "restart" | "rebuild";
+  abortSignal?: AbortSignal;
+  invocationRef?: AppRunInvocationRef;
+  timeoutMs?: number;
+}
+
+export interface ExternalAppRuntimeClaim {
+  requestId: string;
+  invocationRef: AppRunInvocationRef;
+  appId: number;
+  operation: "restart" | "rebuild";
+  output: AppRuntimeOutput;
+}
+
+const DEFAULT_APP_READY_TIMEOUT_MS = 2 * 60 * 1_000;
+const APP_READY_POLL_MS = 100;
+const MAX_RUNTIME_CANCELLATION_TOMBSTONES = 1_000;
+
+/**
+ * Cohesive, transport-neutral owner of main-process app runtime commands.
+ *
+ * IPC handlers and Local Agent tools are adapters over this seam. Producer
+ * output is captured in the command input and passed unchanged to process,
+ * proxy, and sandbox callbacks, preserving invocation identity at producer
+ * creation.
+ */
+export class AppRuntimeService {
+  private readonly externalClaims = new Map<string, ExternalAppRuntimeClaim>();
+  private readonly externalClaimsByApp = new Map<
+    number,
+    Map<string, ExternalAppRuntimeClaim>
+  >();
+  private readonly cancellationTombstones = new CancellationTombstones(
+    MAX_RUNTIME_CANCELLATION_TOMBSTONES,
+  );
+
+  constructor(private readonly dependencies: AppRuntimeServiceDependencies) {}
+
+  async start(options: StartAppRuntimeOptions): Promise<void> {
+    const { appId, output, invocationRef } = options;
+    return this.dependencies.runSerialized(appId, "start", async () => {
+      const existing = this.dependencies.getRunningApp(appId);
+      if (existing) {
+        logger.debug(`App ${appId} is already running.`);
+        if (existing.proxyUrl && existing.originalUrl) {
+          await registerPreviewOrigin(
+            appId,
+            existing,
+            existing.proxyUrl,
+            undefined,
+            output,
+          );
+          if (
+            this.dependencies.getRunningApp(appId) !== existing ||
+            existing.proxyAbortController?.signal.aborted
+          )
+            return;
+          emitProxyServerStarted({
+            appId,
+            output,
+            proxyUrl: existing.proxyUrl,
+            previewAuth: existing.previewAuth,
+            originalUrl: existing.originalUrl,
+            mode: existing.mode,
+            invocationRef: invocationRef ?? existing.invocationRef,
+          });
+        }
+        return;
+      }
+
+      const app = await this.requireApp(appId);
+      const appPath = this.dependencies.resolveAppPath(app.path);
+      await this.dependencies.assertAppFolderExists(appPath);
+      logger.debug(`Starting app ${appId} in path ${app.path}`);
+      let processStarted = false;
+      try {
+        await this.dependencies.cleanPort(getAppPort(appId));
+        await this.startProcess(app, appPath, options);
+        processStarted = true;
+        await this.dependencies.waitForReady(appId, options.readyTimeoutMs);
+      } catch (error) {
+        logger.error(`Error running app ${appId}:`, error);
+        if (!processStarted) {
+          const latest = this.dependencies.getRunningApp(appId);
+          if (
+            latest &&
+            latest.processId === this.dependencies.getProcessCounter()
+          ) {
+            this.dependencies.deleteRunningApp(appId);
+          }
+        }
+        throw new DyadError(
+          `Failed to run app ${appId}: ${errorMessage(error)}`,
+          DyadErrorKind.External,
+        );
+      }
+    });
+  }
+
+  async restart(options: RestartAppRuntimeOptions): Promise<void> {
+    const {
+      appId,
+      output,
+      invocationRef,
+      removeNodeModules = false,
+      recreateSandbox = false,
+    } = options;
+    logger.log(`Restarting app ${appId}`);
+    return this.dependencies.runSerialized(appId, "restart", async () => {
+      const app = await this.requireApp(appId);
+      const appPath = this.dependencies.resolveAppPath(app.path);
+      const appInfo = this.dependencies.getRunningApp(appId);
+
+      if (
+        appInfo?.mode === "cloud" &&
+        appInfo.cloudSandboxId &&
+        !recreateSandbox
+      ) {
+        await this.dependencies.assertAppFolderExists(appPath);
+        await this.restartCloudSandboxInPlace({
+          isNeon: !!app.neonProjectId,
+          appId,
+          appPath,
+          output,
+          invocationRef,
+          appInfo,
+        });
+        await this.dependencies.waitForReady(appId, options.readyTimeoutMs);
+        return;
+      }
+
+      if (appInfo) {
+        logger.log(
+          `Stopping app ${appId} (processId ${appInfo.processId}) before restart`,
+        );
+        await this.dependencies.stopProcess(appId, appInfo);
+      } else {
+        logger.log(`App ${appId} not running. Proceeding to start.`);
+      }
+
+      // Checked after stopping, so a missing folder doesn't leave the old
+      // process running.
+      await this.dependencies.assertAppFolderExists(appPath);
+      await this.dependencies.cleanPort(getAppPort(appId));
+      if (removeNodeModules) {
+        const runtimeMode = this.dependencies.readRuntimeMode();
+        await this.dependencies.removeNodeModules(appPath);
+        if (runtimeMode === "docker") {
+          try {
+            await this.dependencies.removeDockerVolumes(appId);
+          } catch (error) {
+            logger.warn(
+              `Failed to remove Docker volumes for app ${appId}. Continuing: ${error}`,
+            );
+          }
+        }
+      }
+      await this.startProcess(app, appPath, options);
+      await this.dependencies.waitForReady(appId, options.readyTimeoutMs);
+    });
+  }
+
+  async stop(appId: number): Promise<void> {
+    // Cancellation must reach pending credential/API waits before waiting for
+    // the startup operation to release its runtime claims.
+    const stoppingApp = this.dependencies.getRunningApp(appId);
+    if (stoppingApp) {
+      stoppingApp.stopRequested = true;
+      stoppingApp.proxyAbortController?.abort();
+    }
+    logger.log(
+      `Attempting to stop app ${appId}. Current running apps: ${runningApps.size}`,
+    );
+    return this.dependencies.runSerialized(appId, "stop", async () => {
+      const appInfo = this.dependencies.getRunningApp(appId);
+      if (!appInfo) {
+        logger.log(`App ${appId} is already stopped.`);
+        return;
+      }
+
+      const { process, processId } = appInfo;
+      if (
+        process &&
+        (process.exitCode !== null || process.signalCode !== null)
+      ) {
+        this.dependencies.deleteRunningApp(appId);
+        return;
+      }
+
+      try {
+        await this.dependencies.stopProcess(appId, appInfo);
+        if (process) {
+          this.dependencies.removeCurrentProcess(appId, process);
+        }
+      } catch (error) {
+        logger.error(
+          `Error stopping app ${appId} (processId ${processId}):`,
+          error,
+        );
+        if (process) {
+          this.dependencies.removeCurrentProcess(appId, process);
+        } else if (appInfo.mode !== "cloud") {
+          this.dependencies.deleteRunningApp(appId);
+        }
+        throw new DyadError(
+          `Failed to stop app ${appId}: ${errorMessage(error)}`,
+          DyadErrorKind.External,
+        );
+      } finally {
+        appInfo.stopRequested = false;
+      }
+    });
+  }
+
+  clearRuntimeLogs(appId: number): void {
+    this.dependencies.clearLogs(appId);
+  }
+
+  waitForReady(
+    appId: number,
+    options: { timeoutMs?: number } = {},
+  ): Promise<void> {
+    return this.dependencies.waitForReady(appId, options.timeoutMs);
+  }
+
+  isRunning(appId: number): boolean {
+    return this.dependencies.getRunningApp(appId) !== undefined;
+  }
+
+  createExternalLifecycleRef(appId: number): AppRunInvocationRef {
+    return createInvocationRef(APP_RUN_INVOCATION_KIND, appId, {
+      next: (prefix) => `${prefix}:${this.dependencies.createId()}`,
+    });
+  }
+
+  claimExternalLifecycle(
+    options: ExternalAppRuntimeLifecycleOptions,
+  ): ExternalAppRuntimeClaim | undefined {
+    const invocationRef =
+      options.invocationRef ?? this.createExternalLifecycleRef(options.appId);
+    if (this.cancellationTombstones.has(invocationRef)) {
+      return undefined;
+    }
+    const claim: ExternalAppRuntimeClaim = {
+      requestId: this.dependencies.createId(),
+      invocationRef,
+      appId: options.appId,
+      operation: options.operation,
+      output: options.output,
+    };
+    this.externalClaims.set(invocationRegistryKey(invocationRef), claim);
+    let claims = this.externalClaimsByApp.get(options.appId);
+    if (!claims) {
+      claims = new Map();
+      this.externalClaimsByApp.set(options.appId, claims);
+    }
+    claims.set(invocationRef.operationId, claim);
+    const timestamp = this.dependencies.now();
+    const message =
+      options.operation === "rebuild" ? "Rebuilding app" : "Restarting app";
+    this.dependencies.addLog({
+      type: "server",
+      level: "info",
+      message,
+      sourceName: "Dyad",
+      appId: options.appId,
+      timestamp,
+      runtimeBoundary: options.operation,
+    });
+    options.output.send({
+      type: "agent-lifecycle-started",
+      message,
+      appId: options.appId,
+      invocationRef,
+      timestamp,
+      lifecycleRequestId: claim.requestId,
+      lifecycleOperation: options.operation,
+    });
+    return claim;
+  }
+
+  cancelExternalLifecycle(invocationRef: AppRunInvocationRef): void {
+    this.cancellationTombstones.add(invocationRef);
+    const running = this.dependencies.getRunningApp(
+      Number(invocationRef.entityKey),
+    );
+    if (
+      running?.invocationRef &&
+      sameInvocationRef(running.invocationRef, invocationRef)
+    ) {
+      running.proxyAbortController?.abort();
+    }
+    const claim = this.externalClaims.get(invocationRegistryKey(invocationRef));
+    if (claim) {
+      this.releaseExternalClaim(claim);
+    }
+  }
+
+  async executeExternalLifecycle(
+    options: ExternalAppRuntimeLifecycleOptions,
+  ): Promise<void> {
+    const invocationRef =
+      options.invocationRef ?? this.createExternalLifecycleRef(options.appId);
+    if (options.abortSignal?.aborted) {
+      this.cancelExternalLifecycle(invocationRef);
+      throw new DyadError(
+        "The app lifecycle operation was cancelled before it started",
+        DyadErrorKind.UserCancelled,
+      );
+    }
+    const claim = this.claimExternalLifecycle({
+      ...options,
+      invocationRef,
+    });
+    if (!claim) {
+      throw new DyadError(
+        "The app lifecycle operation was cancelled before it started",
+        DyadErrorKind.UserCancelled,
+      );
+    }
+    try {
+      await this.restart({
+        appId: options.appId,
+        output: options.output,
+        invocationRef,
+        removeNodeModules: options.operation === "rebuild",
+        recreateSandbox: options.operation === "rebuild",
+        readyTimeoutMs: options.timeoutMs,
+      });
+      this.settleExternalClaim(claim);
+    } catch (error) {
+      this.settleExternalClaim(
+        claim,
+        error,
+        this.dependencies.getRunningApp(options.appId) !== undefined,
+      );
+      throw error;
+    }
+  }
+
+  /**
+   * Disposes service-owned claims for a deleted app. Late completions are
+   * recognized by bounded tombstones and cannot settle a replacement claim.
+   */
+  cleanup(appId: number): void {
+    this.dependencies.getRunningApp(appId)?.proxyAbortController?.abort();
+    for (const claim of this.externalClaimsByApp.get(appId)?.values() ?? []) {
+      this.cancellationTombstones.add(claim.invocationRef);
+      this.externalClaims.delete(invocationRegistryKey(claim.invocationRef));
+    }
+    this.externalClaimsByApp.delete(appId);
+  }
+
+  cleanupAll(): void {
+    for (const appId of this.externalClaimsByApp.keys()) {
+      this.cleanup(appId);
+    }
+  }
+
+  private async requireApp(appId: number): Promise<RuntimeAppRecord> {
+    const app = await this.dependencies.findApp(appId);
+    if (!app) {
+      throw new DyadError("App not found", DyadErrorKind.NotFound);
+    }
+    return app;
+  }
+
+  private startProcess(
+    app: RuntimeAppRecord,
+    appPath: string,
+    options: StartAppRuntimeOptions,
+  ): Promise<void> {
+    return this.dependencies.startProcess({
+      appPath,
+      appId: options.appId,
+      output: options.output,
+      isNeon: !!app.neonProjectId,
+      installCommand: app.installCommand,
+      startCommand: app.startCommand,
+      invocationRef: options.invocationRef,
+    });
+  }
+
+  private async restartCloudSandboxInPlace(input: {
+    isNeon: boolean;
+    appId: number;
+    appPath: string;
+    output: AppRuntimeOutput;
+    invocationRef?: AppRunInvocationRef;
+    appInfo: RunningAppInfo;
+  }): Promise<void> {
+    const hostname = readSettings().enableAppPreviewDomains
+      ? getAppPreviewHostname(input.appId)
+      : "localhost";
+    input.appInfo.previewHostname = hostname;
+    if (hostname === "localhost") {
+      input.appInfo.previewAuthRegistration?.controller.abort();
+      await input.appInfo.previewAuthRegistration?.settled;
+      input.appInfo.previewAuth = undefined;
+      input.appInfo.previewAuthTarget = null;
+    }
+    await initializeRunningPreviewAuth(input.appId, input.appInfo, {
+      hostname,
+      isNeon: input.isNeon,
+    });
+    const sandboxId = input.appInfo.cloudSandboxId!;
+    input.appInfo.cloudLogAbortController?.abort();
+    const result = await this.dependencies.restartSandbox(sandboxId);
+    input.appInfo.cloudPreviewUrl = result.previewUrl;
+    input.appInfo.cloudPreviewAuthToken = result.previewAuthToken;
+    input.appInfo.lastViewedAt = this.dependencies.now();
+    input.appInfo.invocationRef = input.invocationRef;
+    input.appInfo.output = input.output;
+    input.appInfo.cloudLogAbortController = new AbortController();
+    if (
+      input.appInfo.proxyUrl &&
+      input.appInfo.originalUrl === result.previewUrl &&
+      input.appInfo.proxyAuthToken === result.previewAuthToken
+    ) {
+      await registerPreviewOrigin(
+        input.appId,
+        input.appInfo,
+        input.appInfo.proxyUrl,
+      );
+    }
+    await this.dependencies.ensureProxy({
+      appId: input.appId,
+      output: input.output,
+      originalUrl: result.previewUrl,
+      mode: "cloud",
+      invocationRef: input.invocationRef,
+    });
+    this.dependencies.startCloudLogs({
+      appId: input.appId,
+      appPath: input.appPath,
+      output: input.output,
+      sandboxId,
+      cloudLogAbortController: input.appInfo.cloudLogAbortController,
+    });
+  }
+
+  private settleExternalClaim(
+    claim: ExternalAppRuntimeClaim,
+    error?: unknown,
+    runtimeMayBeLive = false,
+  ): void {
+    const active = this.externalClaims.get(
+      invocationRegistryKey(claim.invocationRef),
+    );
+    if (
+      active !== claim ||
+      this.cancellationTombstones.has(claim.invocationRef)
+    ) {
+      return;
+    }
+    claim.output.send({
+      type: error ? "agent-lifecycle-failed" : "agent-lifecycle-succeeded",
+      message: error ? errorMessage(error) : `App ${claim.operation} succeeded`,
+      appId: claim.appId,
+      invocationRef: claim.invocationRef,
+      lifecycleRequestId: claim.requestId,
+      lifecycleOperation: claim.operation,
+      ...(error ? { lifecycleRuntimeMayBeLive: runtimeMayBeLive } : {}),
+    });
+    this.releaseExternalClaim(claim);
+  }
+
+  private releaseExternalClaim(claim: ExternalAppRuntimeClaim): void {
+    this.externalClaims.delete(invocationRegistryKey(claim.invocationRef));
+    const claims = this.externalClaimsByApp.get(claim.appId);
+    claims?.delete(claim.invocationRef.operationId);
+    if (claims?.size === 0) {
+      this.externalClaimsByApp.delete(claim.appId);
+    }
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function waitForAppReady(
+  appId: number,
+  timeoutMs = DEFAULT_APP_READY_TIMEOUT_MS,
+): Promise<void> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const appInfo = runningApps.get(appId);
+    if (!appInfo) {
+      throw new DyadError(
+        "The app process exited before the preview became ready",
+        DyadErrorKind.External,
+      );
+    }
+    if (appInfo.proxyStartupError) throw appInfo.proxyStartupError;
+    // Release startup admission for an intentional Stop without presenting it
+    // as a failed Run. Proxy regeneration has its own transient cancellation.
+    if (appInfo.stopRequested) return;
+    if (appInfo.proxyUrl) {
+      return;
+    }
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, APP_READY_POLL_MS);
+    });
+  }
+  // The dev process is still running. Keep its proxy lifetime alive so a late
+  // ready URL can recover after a slow first install/build.
+  throw new DyadError(
+    "Timed out waiting for the app preview to become ready",
+    DyadErrorKind.External,
+  );
+}
+
+export const appRuntimeService = new AppRuntimeService({
+  runSerialized: (appId, lifecycle, operation) =>
+    appOperationCoordinator.run(
+      {
+        appId,
+        operation: `app-runtime:${lifecycle}`,
+        resources: getAppRuntimeOperationResources(lifecycle),
+      },
+      operation,
+    ),
+  findApp: (appId) =>
+    db.query.apps.findFirst({
+      where: eq(apps.id, appId),
+    }),
+  resolveAppPath: getDyadAppPath,
+  assertAppFolderExists,
+  getRunningApp: (appId) => runningApps.get(appId),
+  deleteRunningApp: (appId) => {
+    runningApps.delete(appId);
+  },
+  getProcessCounter: () => processCounter.value,
+  startProcess: executeApp,
+  stopProcess: stopAppByInfo,
+  removeCurrentProcess: removeAppIfCurrentProcess,
+  cleanPort: cleanUpPort,
+  restartSandbox: restartCloudSandbox,
+  ensureProxy: ensureProxyForRunningApp,
+  startCloudLogs: startCloudSandboxLogStream,
+  addLog,
+  clearLogs,
+  readRuntimeMode: () => readSettings().runtimeMode2 ?? "host",
+  removeNodeModules: async (appPath) => {
+    await fs.promises.rm(path.join(appPath, "node_modules"), {
+      recursive: true,
+      force: true,
+    });
+  },
+  removeDockerVolumes: removeDockerVolumesForApp,
+  waitForReady: waitForAppReady,
+  createId: randomUUID,
+  now: Date.now,
+});

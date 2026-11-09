@@ -1,9 +1,10 @@
 /**
  * Page object for GitHub integration testing.
- * Handles connecting, creating/syncing repos, and verifying push events.
+ * Handles the primary user-facing connection and repository setup flows, plus
+ * the fake GitHub server's test API used for deterministic assertions.
  */
 
-import { Page, expect } from "@playwright/test";
+import { expect, Page } from "@playwright/test";
 import { Timeout } from "../../constants";
 
 export class GitHubConnector {
@@ -14,99 +15,81 @@ export class GitHubConnector {
 
   async connect() {
     await this.page.getByRole("button", { name: "Connect to GitHub" }).click();
+    await expect(this.page.getByText("FAKE-CODE")).toBeVisible({
+      timeout: Timeout.MEDIUM,
+    });
+    await expect(
+      this.page.getByText("https://github.com/login/device"),
+    ).toBeVisible();
   }
 
-  getSetupYourGitHubRepoButton() {
-    return this.page.getByText("Set up your GitHub repo");
+  getSetupRepo() {
+    return this.page.getByTestId("github-setup-repo");
   }
 
-  getCreateNewRepoModeButton() {
-    return this.page.getByRole("button", { name: "Create new repo" });
-  }
-
-  getConnectToExistingRepoModeButton() {
-    return this.page.getByRole("button", { name: "Connect to existing repo" });
-  }
-
-  async clickCreateRepoButton() {
+  async createRepo(name: string, branch = "main") {
+    await expect(this.getSetupRepo()).toBeVisible({ timeout: Timeout.MEDIUM });
+    await this.page.getByTestId("github-create-repo-name-input").fill(name);
+    await expect(
+      this.page.getByText("Repository name is available!"),
+    ).toBeVisible({ timeout: Timeout.MEDIUM });
+    if (branch !== "main") {
+      await this.page.getByTestId("github-new-repo-branch-input").fill(branch);
+    }
     await this.page.getByRole("button", { name: "Create Repo" }).click();
     await this.waitForSyncToFinish();
   }
 
-  async fillCreateRepoName(name: string) {
-    await this.page.getByTestId("github-create-repo-name-input").fill(name);
-  }
-
-  async fillNewRepoBranchName(name: string) {
-    await this.page.getByTestId("github-new-repo-branch-input").fill(name);
-  }
-
-  async selectRepo(repo: string) {
+  async connectExistingRepo(repo: string, branch: string) {
+    // Disconnect remounts the setup card collapsed. Clicking the header is a
+    // no-op when already expanded and otherwise lets its transition complete
+    // before Playwright targets the mode button underneath it.
+    await this.page
+      .getByRole("button", { name: "Set up your GitHub repo" })
+      .click();
+    await this.page
+      .getByRole("button", { name: "Connect to existing repo" })
+      .click();
     await this.page.getByTestId("github-repo-select").click();
     await this.page.getByRole("option", { name: repo }).click();
-  }
-
-  async selectBranch(branch: string) {
     await this.page.getByTestId("github-branch-select").click();
     await this.page.getByRole("option", { name: branch }).click();
-  }
-
-  async selectCustomBranch(branch: string) {
-    await this.page.getByTestId("github-branch-select").click();
-    await this.page
-      .getByRole("option", { name: "✏️ Type custom branch name" })
-      .click();
-    await this.page.getByTestId("github-custom-branch-input").click();
-    await this.page.getByTestId("github-custom-branch-input").fill(branch);
-  }
-
-  async clickConnectToRepoButton() {
-    await this.page.getByRole("button", { name: "Connect to repo" }).click();
+    await this.page.getByRole("button", { name: "Connect to Repo" }).click();
     await this.waitForSyncToFinish();
   }
 
-  async snapshotConnectedRepo() {
-    await this.waitForSyncToFinish();
-    await expect(
-      this.page.getByTestId("github-connected-repo"),
-    ).toMatchAriaSnapshot();
-  }
-
-  async snapshotSetupRepo() {
-    await expect(
-      this.page.getByTestId("github-setup-repo"),
-    ).toMatchAriaSnapshot();
-  }
-
-  async snapshotUnconnectedRepo() {
-    await expect(
-      this.page.getByTestId("github-unconnected-repo"),
-    ).toMatchAriaSnapshot();
-  }
-
-  async clickSyncToGithubButton() {
+  async sync() {
     await this.page.getByRole("button", { name: "Sync to GitHub" }).click();
+    // A banner from an earlier sync can still be showing, so make sure this
+    // sync has started before waiting for it to finish. The button reads
+    // "Syncing..." while it runs, so match either label.
+    await expect(
+      this.page.getByRole("button", { name: /Sync to GitHub|Syncing/ }),
+    ).toBeDisabled({ timeout: Timeout.MEDIUM });
     await this.waitForSyncToFinish();
   }
 
-  async waitForSyncToFinish() {
-    await expect(
-      this.page.getByRole("button", { name: "Syncing..." }),
-    ).toBeHidden({ timeout: Timeout.LONG });
-    await expect(
-      this.page.getByRole("button", { name: "Sync to GitHub" }),
-    ).toBeEnabled({ timeout: Timeout.LONG });
-    await expect(
-      this.page
-        .getByTestId("github-connected-repo")
-        .getByText("Successfully pushed to GitHub!"),
-    ).toBeVisible({ timeout: Timeout.LONG });
-  }
-
-  async clickDisconnectRepoButton() {
+  async disconnectRepo() {
     await this.page
       .getByRole("button", { name: "Disconnect from repo" })
       .click();
+    await expect(this.getSetupRepo()).toBeVisible({ timeout: Timeout.MEDIUM });
+  }
+
+  async waitForSyncToFinish() {
+    const connectedRepo = this.page.getByTestId("github-connected-repo");
+    await expect(connectedRepo).toBeVisible({ timeout: Timeout.LONG });
+    // The Sync button is enabled again only once the whole operation has
+    // finished, including the push that follows a connect, so the banner
+    // checked afterwards is the push's own. A sync that finds the remote
+    // already current reports "already up to date" rather than "Successfully
+    // pushed", so wait for the success banner itself rather than a wording.
+    await expect(
+      connectedRepo.getByRole("button", { name: "Sync to GitHub" }),
+    ).toBeEnabled({ timeout: Timeout.LONG });
+    await expect(connectedRepo.getByTestId("github-sync-success")).toBeVisible({
+      timeout: Timeout.LONG,
+    });
   }
 
   async clearPushEvents() {
@@ -124,34 +107,35 @@ export class GitHubConnector {
   }
 
   async getPushEvents(repo?: string) {
-    const url = repo
-      ? `http://localhost:${this.fakeLlmPort}/github/api/test/push-events?repo=${repo}`
-      : `http://localhost:${this.fakeLlmPort}/github/api/test/push-events`;
-    const response = await this.page.request.get(url);
-    return await response.json();
+    const suffix = repo ? `?repo=${encodeURIComponent(repo)}` : "";
+    const response = await this.page.request.get(
+      `http://localhost:${this.fakeLlmPort}/github/api/test/push-events${suffix}`,
+    );
+    return (await response.json()) as Array<{
+      repo: string;
+      branch: string;
+      operation: "push" | "create" | "delete";
+    }>;
   }
 
-  async verifyPushEvent(expectedEvent: {
+  async expectPushEvent(expected: {
     repo: string;
     branch: string;
-    operation?: "push" | "create" | "delete";
+    operation: "push" | "create" | "delete";
   }) {
-    const pushEvents = await this.getPushEvents(expectedEvent.repo);
-    const matchingEvent = pushEvents.find(
-      (event: any) =>
-        event.repo === expectedEvent.repo &&
-        event.branch === expectedEvent.branch &&
-        (!expectedEvent.operation ||
-          event.operation === expectedEvent.operation),
-    );
-
-    if (!matchingEvent) {
-      throw new Error(
-        `Expected push event not found. Expected: ${JSON.stringify(expectedEvent)}. ` +
-          `Actual events: ${JSON.stringify(pushEvents)}`,
-      );
-    }
-
-    return matchingEvent;
+    await expect
+      .poll(
+        async () => {
+          const events = await this.getPushEvents(expected.repo);
+          return events.some(
+            (event) =>
+              event.repo === expected.repo &&
+              event.branch === expected.branch &&
+              event.operation === expected.operation,
+          );
+        },
+        { timeout: Timeout.MEDIUM },
+      )
+      .toBe(true);
   }
 }

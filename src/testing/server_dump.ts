@@ -19,6 +19,7 @@ import fs from "node:fs";
 
 import { prettifyDump } from "../../e2e-tests/helpers/utils/dump-prettifier";
 import {
+  normalizeGitContextHashes,
   normalizeItemReferences,
   normalizeMcpCallIds,
   normalizeToolCallIds,
@@ -244,7 +245,7 @@ function scrubDumpFileContent(raw: string): string {
   return raw
     .replaceAll(/\[\[dyad-dump-path=([^\]]+)\]\]/g, "[[dyad-dump-path=*]]")
     .replaceAll(
-      /\.dyad\/chats\/\d+\/compaction-[^\s"\\]+\.md/g,
+      /\.dyad[\\/]+chats[\\/]+\d+[\\/]+compaction-[^\s"\\]+\.md/g,
       "[[compaction-backup-path]]",
     );
 }
@@ -286,6 +287,7 @@ export function readServerDump(
   maskSystemMessages(parsed);
   normalizeToolCallIds(parsed);
   normalizeMcpCallIds(parsed);
+  normalizeGitContextHashes(parsed);
 
   if (doMaskToolDescriptions) {
     maskToolDescriptions(parsed);

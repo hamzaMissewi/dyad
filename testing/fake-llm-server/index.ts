@@ -4,23 +4,32 @@ import type { AddressInfo } from "net";
 import cors from "cors";
 import crypto from "node:crypto";
 import { createChatCompletionHandler } from "./chatCompletionHandler";
+import { registerFakeCoolify } from "./coolify";
+import { registerFakeGitLab } from "./gitlab";
+import { registerFakeCloudflare } from "./cloudflare";
+import { registerFakeVercel } from "./vercel";
 import { createResponsesHandler } from "./responsesHandler";
 import { createAnthropicMessagesHandler } from "./anthropicMessagesHandler";
 import { fakeLlmLog } from "./log";
 import {
   handleDeviceCode,
+  handleDeviceFlowConfig,
   handleAccessToken,
   handleUser,
   handleUserEmails,
   handleUserRepos,
   handleRepo,
   handleRepoBranches,
+  handleRepoBranch,
   handleOrgRepos,
   handleGitPush,
   handleGetPushEvents,
   handleClearPushEvents,
   handleResetRepos,
   handleRepoCollaborators,
+  handleListDeployKeys,
+  handleCreateDeployKey,
+  handleClearDeployKeys,
 } from "./githubHandler";
 
 // Helper function to create OpenAI-like streaming response chunks
@@ -222,12 +231,45 @@ export function createFakeLlmApp(getPort: () => number) {
   app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
   const cloudSandboxes = new Map<string, FakeCloudSandbox>();
+  let hangingWebCrawlState = {
+    started: false,
+    closed: false,
+    lateResponseAttempted: false,
+  };
+  let hangingWebCrawlResponse: express.Response | null = null;
 
   const getFakeCloudPreviewUrl = (sandboxId: string) =>
     `http://localhost:${getPort()}/cloud-preview/${sandboxId}`;
 
   app.get("/health", (req, res) => {
     res.send("OK");
+  });
+
+  app.post("/test/engine-web-crawl-hang/reset", (_req, res) => {
+    hangingWebCrawlState = {
+      started: false,
+      closed: false,
+      lateResponseAttempted: false,
+    };
+    hangingWebCrawlResponse = null;
+    res.status(204).end();
+  });
+
+  app.get("/test/engine-web-crawl-hang", (_req, res) => {
+    res.json(hangingWebCrawlState);
+  });
+
+  app.post("/test/engine-web-crawl-hang/release", (_req, res) => {
+    hangingWebCrawlState.lateResponseAttempted = true;
+    hangingWebCrawlResponse?.json({
+      pages: [
+        {
+          url: "https://hang.example.com",
+          markdown: "LATE_CANCELLED_TOOL_SUCCESS",
+        },
+      ],
+    });
+    res.status(204).end();
   });
 
   app.get("/api/default-approve-builds.txt", (req, res) => {
@@ -244,6 +286,108 @@ export function createFakeLlmApp(getPort: () => number) {
           "",
         ].join("\n"),
       );
+  });
+
+  // Fake api.dyad.sh user info (Dyad Pro budget). Tests point
+  // DYAD_USER_INFO_URL here so get-user-budget never hits the real API.
+  app.get("/api/user/info", (req, res) => {
+    if (!req.headers.authorization?.startsWith("Bearer ")) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+    res.json({
+      usedCredits: 100,
+      totalCredits: 1000,
+      budgetResetDate: "2099-01-01T00:00:00.000Z",
+      userId: "user_fake1234",
+      isTrial: false,
+    });
+  });
+
+  app.get("/api/mcp-catalog", (req, res) => {
+    // `?featured=slug,slug` marks entries featured for the one test that
+    // needs a suggestable plugin (local_agent_suggest_plugin.spec.ts).
+    // Default responses stay unfeatured so suggest_plugin is absent from
+    // every other local-agent request snapshot.
+    const featured = new Set(
+      String(req.query.featured ?? "")
+        .split(",")
+        .map((slug) => slug.trim())
+        .filter((slug) => slug.length > 0),
+    );
+    // `?mcpPort=N` moves the http entries off their default port so a
+    // spec can run its own fake MCP server without contending with
+    // mcp_catalog.spec.ts in another worker.
+    const mcpPort = parseInt(String(req.query.mcpPort ?? ""), 10);
+    const withFeatured = <T extends { slug?: string; url?: string }>(
+      server: T,
+    ): T => {
+      let next = server;
+      if (server.slug && featured.has(server.slug)) {
+        next = { ...next, featured: true };
+      }
+      if (Number.isInteger(mcpPort) && server.url?.includes(":3002/")) {
+        next = { ...next, url: server.url.replace(":3002/", `:${mcpPort}/`) };
+      }
+      return next;
+    };
+    // The URLs below hardcode the ports that mcp_catalog.spec.ts spawns
+    // its fake MCP servers on (4010 for OAuth, 3002 for http). Keep them
+    // in sync with that spec.
+    res.json({
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      servers: [
+        {
+          slug: "e2e-oauth",
+          name: "E2E OAuth Server",
+          description: "Fake OAuth-protected MCP server",
+          category: "Testing",
+          transport: "http",
+          url: "http://localhost:4010/mcp",
+          oauth: { required: true },
+        },
+        {
+          slug: "e2e-open",
+          name: "E2E Open Server",
+          description: "Fake MCP server without auth",
+          category: "Testing",
+          transport: "http",
+          url: "http://localhost:3002/mcp",
+        },
+        {
+          slug: "e2e-headers",
+          name: "E2E Header Server",
+          description: "Sends a static header",
+          category: "Other Tools",
+          transport: "http",
+          url: "http://localhost:3002/mcp",
+          headers: { "X-Test-Header": "dyad-e2e" },
+        },
+        // Valid stdio entry. The package is scoped under @dyad-sh so it
+        // can never resolve against the real npm registry: the spec only
+        // exercises the add flow, and an actual `npx` spawn in CI must
+        // fail with a 404 instead of executing someone's package.
+        {
+          slug: "e2e-stdio",
+          name: "E2E Stdio Server",
+          description: "Fake local stdio MCP server",
+          category: "Testing",
+          transport: "stdio",
+          command: "npx",
+          args: ["-y", "@dyad-sh/e2e-nonexistent-mcp@1.0.0"],
+        },
+        // The desktop client must drop these: a stdio entry whose command
+        // isn't npx, and a malformed one.
+        {
+          slug: "e2e-stdio-node",
+          name: "E2E Stdio Node Server",
+          transport: "stdio",
+          command: "node",
+          args: ["server.mjs"],
+        },
+        { slug: "e2e-broken" },
+      ].map(withFeatured),
+    });
   });
 
   app.get("/api/language-model-catalog", (req, res) => {
@@ -272,9 +416,25 @@ export function createFakeLlmApp(getPort: () => number) {
       modelsByProvider: {
         openai: [
           {
+            apiName: "gpt-6-luna",
+            displayName: "GPT 6 Luna",
+            description: "Sub-agent Explorer and Implementer model",
+          },
+          {
+            apiName: "gpt-5.6-luna",
+            displayName: "GPT 5.6 Luna",
+            description: "Sub-agent Explorer and Implementer model",
+          },
+          {
+            apiName: "gpt-5.6-sol",
+            displayName: "GPT 5.6 Sol",
+            description: "Sub-agent Reviewer model",
+          },
+          {
             apiName: "gpt-5.2",
             displayName: "GPT 5.2",
             description: "Remote catalog OpenAI model",
+            maxOutputTokens: 32_000,
           },
           {
             apiName: "gpt-5",
@@ -286,6 +446,10 @@ export function createFakeLlmApp(getPort: () => number) {
             apiName: "gpt-5.2-remote-only",
             displayName: "GPT 5.2 Remote Only",
             description: "Remote-only catalog OpenAI model for E2E coverage",
+            effortSettings: {
+              defaultEffortLevel: "minimal",
+              possibleEffortLevels: ["minimal", "xhigh"],
+            },
           },
         ],
         anthropic: [
@@ -485,6 +649,28 @@ export function createFakeLlmApp(getPort: () => number) {
     res.json(lmStudioModels);
   });
 
+  // Google API-key validation lists models instead of generating text.
+  app.get("/google/v1beta/models", (req, res) => {
+    const apiKey = String(req.headers["x-goog-api-key"] ?? "");
+    if (/invalid/i.test(apiKey)) {
+      return res.status(400).json({
+        error: {
+          code: 400,
+          message: "API key not valid. Please pass a valid API key.",
+          status: "INVALID_ARGUMENT",
+        },
+      });
+    }
+    res.json({
+      models: [
+        {
+          name: "models/gemini-flash-latest",
+          displayName: "Gemini Flash Latest",
+        },
+      ],
+    });
+  });
+
   app.post(
     /^\/google\/v1beta\/models\/.+:(streamGenerateContent|generateContent)/,
     (req, res) => {
@@ -562,11 +748,23 @@ export function createFakeLlmApp(getPort: () => number) {
   app.post("/v1/responses", createResponsesHandler("."));
   app.post("/v1/messages", createAnthropicMessagesHandler("."));
 
+  // A Coolify instance. Nothing redirects to it: a test types its URL into
+  // the connection form, the way a user types their own instance's.
+  registerFakeCoolify(app);
+  registerFakeGitLab(app);
+
+  // The Cloudflare API. Test builds send Cloudflare calls here.
+  registerFakeCloudflare(app);
+
+  // The Vercel API. Test builds send SDK and HTTP calls here.
+  registerFakeVercel(app);
+
   // GitHub API Mock Endpoints
   fakeLlmLog("Setting up GitHub mock endpoints");
 
   // GitHub OAuth Device Flow
   app.post("/github/login/device/code", handleDeviceCode);
+  app.post("/github/api/test/device-flow-config", handleDeviceFlowConfig);
   app.post("/github/login/oauth/access_token", handleAccessToken);
 
   // GitHub API endpoints
@@ -576,6 +774,7 @@ export function createFakeLlmApp(getPort: () => number) {
   app.post("/github/api/user/repos", handleUserRepos);
   app.get("/github/api/repos/:owner/:repo", handleRepo);
   app.get("/github/api/repos/:owner/:repo/branches", handleRepoBranches);
+  app.get("/github/api/repos/:owner/:repo/branches/:branch", handleRepoBranch);
   app.get(
     "/github/api/repos/:owner/:repo/collaborators",
     handleRepoCollaborators,
@@ -590,6 +789,11 @@ export function createFakeLlmApp(getPort: () => number) {
   );
   app.post("/github/api/orgs/:org/repos", handleOrgRepos);
 
+  // Deploy keys, which the Coolify pipeline registers before it builds.
+  app.get("/github/api/repos/:owner/:repo/keys", handleListDeployKeys);
+  app.post("/github/api/repos/:owner/:repo/keys", handleCreateDeployKey);
+  app.post("/github/api/test/clear-deploy-keys", handleClearDeployKeys);
+
   // GitHub test endpoints for verifying push operations
   app.get("/github/api/test/push-events", handleGetPushEvents);
   app.post("/github/api/test/clear-push-events", handleClearPushEvents);
@@ -597,6 +801,20 @@ export function createFakeLlmApp(getPort: () => number) {
 
   // GitHub Git endpoints - intercept all paths with /github/git prefix
   app.all("/github/git/*", handleGitPush);
+
+  // Dyad Engine free-model quota endpoint (free_model_quota_handlers).
+  app.get("/engine/v1/free/quota", (req, res) => {
+    if (!req.headers.authorization?.startsWith("Bearer ")) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+    res.json({
+      used: 5,
+      limit: 25,
+      remaining: 20,
+      resetAt: "2099-01-01T00:00:00.000Z",
+    });
+  });
 
   // Dyad Engine code-search endpoint for code_search tool
   app.post("/engine/v1/tools/code-search", (req, res) => {
@@ -656,6 +874,15 @@ export function createFakeLlmApp(getPort: () => number) {
   app.post("/engine/v1/tools/web-crawl", (req, res) => {
     const { url, markdownOnly } = req.body;
     fakeLlmLog(`* web-crawl: url="${url}", markdownOnly=${markdownOnly}`);
+
+    if (url === "https://hang.example.com") {
+      hangingWebCrawlState.started = true;
+      hangingWebCrawlResponse = res;
+      res.once("close", () => {
+        hangingWebCrawlState.closed = true;
+      });
+      return;
+    }
 
     try {
       res.json({

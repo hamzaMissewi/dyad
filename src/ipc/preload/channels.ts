@@ -10,6 +10,7 @@
 import {
   getInvokeChannels,
   getReceiveChannels,
+  getSendChannels,
   getStreamChannels,
 } from "../contracts/core";
 
@@ -18,14 +19,29 @@ import { settingsContracts } from "../types/settings";
 import { appContracts } from "../types/app";
 import { chatContracts, chatStreamContract } from "../types/chat";
 import { agentContracts, agentEvents } from "../types/agent";
-import { githubContracts, gitContracts, githubEvents } from "../types/github";
-import { mcpContracts, mcpEvents } from "../types/mcp";
+import { githubContracts, gitContracts, gitEvents } from "../types/github";
+import { gitlabContracts } from "../types/gitlab";
+import {
+  connectionFlowContracts,
+  connectionFlowEvents,
+} from "../types/connection_flow";
+import { mcpContracts } from "../types/mcp";
 import { vercelContracts } from "../types/vercel";
-import { supabaseContracts } from "../types/supabase";
+import { cloudflareContracts } from "../types/cloudflare";
+import { coolifyContracts, coolifyEvents } from "../types/coolify";
+import {
+  coolifySetupContracts,
+  coolifySetupEvents,
+} from "../types/coolify_setup";
+import { supabaseContracts, supabaseEvents } from "../types/supabase";
 import { neonContracts } from "../types/neon";
 import { migrationContracts } from "../types/migration";
-import { systemContracts, systemEvents } from "../types/system";
-import { versionContracts } from "../types/version";
+import {
+  systemContracts,
+  systemEvents,
+  systemSendContracts,
+} from "../types/system";
+import { versionContracts, versionEvents } from "../types/version";
 import { languageModelContracts } from "../types/language-model";
 import { promptContracts } from "../types/prompts";
 import { templateContracts } from "../types/templates";
@@ -41,16 +57,35 @@ import { miscContracts, miscEvents } from "../types/misc";
 import { freeAgentQuotaContracts } from "../types/free_agent_quota";
 import { freeModelQuotaContracts } from "../types/free_model_quota";
 import { planEvents, planContracts } from "../types/plan";
-import { integrationEvents, integrationContracts } from "../types/integration";
 import { audioContracts } from "../types/audio";
 import { mediaContracts } from "../types/media";
-import { imageGenerationContracts } from "../types/image_generation";
+import {
+  imageGenerationContracts,
+  imageGenerationEvents,
+} from "../types/image_generation";
 import {
   appBlueprintContracts,
   appBlueprintEvents,
 } from "../types/app_blueprint";
 import { appCollectionContracts } from "../types/app_collections";
 import { terminalContracts } from "../types/terminal";
+import { testsContracts, testsEvents } from "../types/tests";
+import { recordingContracts, recordingEvents } from "../types/recording";
+import { userInputContracts, userInputEvents } from "../types/user_input";
+import { firstPromptSendContracts } from "../types/first_prompt";
+import {
+  previewViewContracts,
+  previewViewEvents,
+  previewViewSendContracts,
+} from "../types/preview_view";
+import {
+  windowInfrastructureContracts,
+  windowInfrastructureEvents,
+} from "../types/window_infrastructure";
+import {
+  distributedMachineContracts,
+  distributedMachineEvents,
+} from "../types/distributed_machines";
 
 // =============================================================================
 // Invoke Channels (derived from all contracts)
@@ -64,6 +99,8 @@ const TEST_INVOKE_CHANNELS = [
   "test:simulateQuotaTimeElapsed",
   "test:set-node-mock",
   "test:set-needs-app-blueprint",
+  "test:get-app-process-id",
+  "test:set-neon-auth-fixture",
 ] as const;
 
 /**
@@ -82,10 +119,15 @@ export const VALID_INVOKE_CHANNELS = [
   HELP_STREAM_CHANNELS.invoke,
 
   // Integrations
+  ...getInvokeChannels(connectionFlowContracts),
   ...getInvokeChannels(githubContracts),
   ...getInvokeChannels(gitContracts),
+  ...getInvokeChannels(gitlabContracts),
   ...getInvokeChannels(mcpContracts),
   ...getInvokeChannels(vercelContracts),
+  ...getInvokeChannels(cloudflareContracts),
+  ...getInvokeChannels(coolifyContracts),
+  ...getInvokeChannels(coolifySetupContracts),
   ...getInvokeChannels(supabaseContracts),
   ...getInvokeChannels(neonContracts),
   ...getInvokeChannels(migrationContracts),
@@ -108,16 +150,35 @@ export const VALID_INVOKE_CHANNELS = [
   ...getInvokeChannels(freeAgentQuotaContracts),
   ...getInvokeChannels(freeModelQuotaContracts),
   ...getInvokeChannels(planContracts),
-  ...getInvokeChannels(integrationContracts),
   ...getInvokeChannels(audioContracts),
   ...getInvokeChannels(mediaContracts),
-  ...getInvokeChannels(imageGenerationContracts),
   ...getInvokeChannels(appBlueprintContracts),
   ...getInvokeChannels(appCollectionContracts),
   ...getInvokeChannels(terminalContracts),
+  ...getInvokeChannels(testsContracts),
+  ...getInvokeChannels(recordingContracts),
+  ...getInvokeChannels(userInputContracts),
+  ...getInvokeChannels(windowInfrastructureContracts),
+  ...getInvokeChannels(distributedMachineContracts),
+  ...getInvokeChannels(imageGenerationContracts),
+  ...getInvokeChannels(previewViewContracts),
 
   // Test-only channels
   ...TEST_INVOKE_CHANNELS,
+] as const;
+
+// =============================================================================
+// Send Channels (one-way, renderer -> main, fire-and-forget)
+// =============================================================================
+
+/**
+ * All valid one-way send channels derived from send contracts.
+ * Used by preload.ts to whitelist fire-and-forget IPC channels.
+ */
+export const VALID_SEND_CHANNELS = [
+  ...getSendChannels(firstPromptSendContracts),
+  ...getSendChannels(previewViewSendContracts),
+  ...getSendChannels(systemSendContracts),
 ] as const;
 
 // =============================================================================
@@ -135,13 +196,23 @@ export const VALID_RECEIVE_CHANNELS = [
 
   // Event channels
   ...getReceiveChannels(agentEvents),
-  ...getReceiveChannels(githubEvents),
-  ...getReceiveChannels(mcpEvents),
+  ...getReceiveChannels(gitEvents),
+  ...getReceiveChannels(coolifyEvents),
+  ...getReceiveChannels(coolifySetupEvents),
+  ...getReceiveChannels(connectionFlowEvents),
+  ...getReceiveChannels(supabaseEvents),
   ...getReceiveChannels(systemEvents),
+  ...getReceiveChannels(versionEvents),
   ...getReceiveChannels(miscEvents),
   ...getReceiveChannels(planEvents),
-  ...getReceiveChannels(integrationEvents),
   ...getReceiveChannels(appBlueprintEvents),
+  ...getReceiveChannels(testsEvents),
+  ...getReceiveChannels(userInputEvents),
+  ...getReceiveChannels(imageGenerationEvents),
+  ...getReceiveChannels(windowInfrastructureEvents),
+  ...getReceiveChannels(distributedMachineEvents),
+  ...getReceiveChannels(recordingEvents),
+  ...getReceiveChannels(previewViewEvents),
 ] as const;
 
 // =============================================================================
@@ -149,4 +220,5 @@ export const VALID_RECEIVE_CHANNELS = [
 // =============================================================================
 
 export type ValidInvokeChannel = (typeof VALID_INVOKE_CHANNELS)[number];
+export type ValidSendChannel = (typeof VALID_SEND_CHANNELS)[number];
 export type ValidReceiveChannel = (typeof VALID_RECEIVE_CHANNELS)[number];

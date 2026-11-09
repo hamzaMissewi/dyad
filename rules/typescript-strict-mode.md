@@ -8,7 +8,15 @@ The pre-commit hook runs `tsgo` (via `npm run ts`), which is stricter than `tsc 
 
 If `npm run ts` fails because installed dependency types are missing APIs the repo already uses (for example `@neondatabase/api-client` missing `getNeonAuth` or `BetterAuth`), run `npm install` before editing source. Stale `node_modules` can lag behind the lockfile even when `package.json` is unchanged.
 
+In a fresh worktree, also run `npm --prefix testing/fake-llm-server install` before `npm run ts`. The root install does not populate that package's local type dependencies, so tsgo otherwise reports missing declarations for `express` and `cors`, followed by cascading implicit-`any` errors.
+
 If `npm run ts` crashes with a Go `SIGSEGV`/segmentation fault inside `tsgo` instead of reporting TypeScript diagnostics, remove the stale incremental build cache and retry: `rm -f node_modules/.tmp/tsconfig.app.tsbuildinfo && npm run ts`. This can happen after package/alias changes and is not necessarily a source type error.
+
+The same stale cache can produce repo-wide `TS2875` errors claiming `react/jsx-runtime` cannot be found even when Node resolves that file and it exists under `node_modules/react/`. Clear `node_modules/.tmp/tsconfig.app.tsbuildinfo` and rerun `npm run ts` before reinstalling packages or changing source.
+
+## `import.meta.env` is not typed in renderer source
+
+`import.meta.env?.DEV` in `src/` fails `npm run ts` with `TS2339: Property 'env' does not exist on type 'ImportMeta'` (tsconfig.app.json does not load Vite client types; `renderer.tsx` uses `// @ts-ignore` for its one access). For dev/prod branching use `process.env.NODE_ENV !== "production"` instead — Vite statically replaces it in renderer builds and it works in vitest. Also note `npx tsc --noEmit -p tsconfig.json` can pass while `npm run ts` fails; only `npm run ts` is authoritative.
 
 ## `useRef` requires an explicit initial value
 
@@ -21,6 +29,37 @@ The project's `tsconfig.app.json` targets ES2020 with `lib: ["ES2020"]`. Methods
 ## `response.json()` returns `unknown`
 
 In IPC handlers that use `node-fetch`, `await response.json()` is treated as `unknown` by `tsgo`. If you access fields directly (for example `data.message` or `data.access_token`), add an explicit cast or narrow first (for example `const data = (await response.json()) as { message?: string }`) to avoid `TS18046`.
+
+## A variable only assigned inside a callback narrows to `never`
+
+`let row: Foo | null = null` that is written **only** from inside a callback
+passed to another function keeps its `null` narrowing at every later use, so
+the first property access fails with `TS2339: Property 'neonTestBranchId' does
+not exist on type 'never'`. Control-flow analysis does not track writes that
+happen through a function boundary, and the error names `never` rather than
+the callback, which makes it read like a bad type annotation.
+
+Return the value instead of capturing it — the direct assignment is something
+CFA can see:
+
+```ts
+// Bad: `deletedRow` is still `null` as far as CFA knows.
+let deletedRow: typeof apps.$inferSelect | null = null;
+await run(() =>
+  del(id, {
+    capture: (r) => {
+      deletedRow = r;
+    },
+  }),
+);
+
+// Good: `del` returns the row; assignment is in the main flow.
+const deletedRow = await run(() => del(id));
+```
+
+When the value must escape a callback (a `withLock` body, for example), return
+it from that callback and destructure the result rather than closing over a
+mutable binding.
 
 ## i18next `t()` keys are a literal union, not `string`
 

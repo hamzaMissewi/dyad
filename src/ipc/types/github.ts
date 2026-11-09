@@ -30,6 +30,14 @@ export const GitHubCollaboratorSchema = z.object({
   permissions: z.any().optional(),
 });
 
+// GitHub only lets users with push access list collaborators. canManage is
+// false when the signed-in user lacks that access, so the UI can explain it
+// instead of showing an error.
+export const ListCollaboratorsResultSchema = z.object({
+  canManage: z.boolean(),
+  collaborators: z.array(GitHubCollaboratorSchema),
+});
+
 export const GitBranchAppIdParamsSchema = z.object({
   appId: z.number(),
 });
@@ -59,22 +67,45 @@ export const ListRemoteGitBranchesParamsSchema = z.object({
 export const CommitChangesParamsSchema = z.object({
   appId: z.number(),
   message: z.string(),
+  operationId: z.string().min(1).max(256),
   filesToStage: z.array(z.string()).optional(),
+});
+
+export const CancelCommitParamsSchema = CommitChangesParamsSchema.pick({
+  appId: true,
+  operationId: true,
+});
+
+export const CommitProgressSchema = z.object({
+  appId: z.number(),
+  operationId: z.string().min(1).max(256),
+  phase: z.enum(["staging", "pre-commit", "commit-msg", "committing"]),
 });
 
 export const UncommittedFileSchema = z.object({
   path: z.string(),
   status: z.enum(["added", "modified", "deleted", "renamed"]),
+  // For renamed files, the original path at HEAD (so the "before" side of the
+  // diff / line stats can still be located). Absent for non-renames.
+  oldPath: z.string().optional(),
+  // Number of added / deleted lines relative to HEAD (git diff --numstat
+  // semantics). Line counts are always non-negative integers. Default to 0 so
+  // older producers / mocks remain valid.
+  additions: z.number().int().nonnegative().default(0),
+  deletions: z.number().int().nonnegative().default(0),
 });
 
-export const GithubSyncOptionsSchema = z.object({
-  force: z.boolean().optional(),
-  forceWithLease: z.boolean().optional(),
+export const GetUncommittedFileDiffParamsSchema = z.object({
+  appId: z.number(),
+  filePath: z.string(),
 });
 
-export const GitStateSchema = z.object({
-  mergeInProgress: z.boolean(),
-  rebaseInProgress: z.boolean(),
+export const UncommittedFileDiffSchema = z.object({
+  path: z.string(),
+  // Contents of the file at HEAD ("" when the file is newly added) and in the
+  // current working tree ("" when the file is deleted).
+  oldContent: z.string(),
+  newContent: z.string(),
 });
 
 export const LocalBranchesResultSchema = z.object({
@@ -106,32 +137,27 @@ export const CloneRepoResultSchema = z.union([
   }),
 ]);
 
-// GitHub Device Flow schemas
-export const GitHubDeviceFlowUpdateSchema = z.object({
-  userCode: z.string().optional(),
-  verificationUri: z.string().optional(),
-  message: z.string().optional(),
-});
-
-export const GitHubDeviceFlowSuccessSchema = z.object({
-  message: z.string().optional(),
-});
-
-export const GitHubDeviceFlowErrorSchema = z.object({
-  error: z.string(),
-});
-
 // =============================================================================
 // GitHub Contracts
 // =============================================================================
 
+// Note: the GitHub device flow (start/cancel + state updates) goes through
+// the connection-flow contracts (`connection_flow.ts`) — it is driven by the
+// flowId-correlated state machine shared with Supabase/Neon.
 export const githubContracts = {
-  startFlow: defineContract({
-    channel: "github:start-flow",
-    input: z.object({ appId: z.number().nullable() }),
-    output: z.void(),
+  verifyConnection: defineContract({
+    channel: "github:verify-connection",
+    input: z.object({
+      appId: z.number(),
+      requireSynced: z.boolean().optional(),
+      requirePushable: z.boolean().optional(),
+    }),
+    output: z.object({
+      owner: z.string(),
+      repo: z.string(),
+      branch: z.string(),
+    }),
   }),
-
   listRepos: defineContract({
     channel: "github:list-repos",
     input: z.void(),
@@ -150,74 +176,6 @@ export const githubContracts = {
     output: RepoAvailabilitySchema,
   }),
 
-  createRepo: defineContract({
-    channel: "github:create-repo",
-    input: z.object({
-      org: z.string(),
-      repo: z.string(),
-      appId: z.number(),
-      branch: z.string().optional(),
-    }),
-    output: z.void(),
-  }),
-
-  connectExistingRepo: defineContract({
-    channel: "github:connect-existing-repo",
-    input: z.object({
-      owner: z.string(),
-      repo: z.string(),
-      branch: z.string(),
-      appId: z.number(),
-    }),
-    output: z.void(),
-  }),
-
-  push: defineContract({
-    channel: "github:push",
-    input: z.object({
-      appId: z.number(),
-      force: z.boolean().optional(),
-      forceWithLease: z.boolean().optional(),
-    }),
-    output: z.void(),
-  }),
-
-  fetch: defineContract({
-    channel: "github:fetch",
-    input: GitBranchAppIdParamsSchema,
-    output: z.void(),
-  }),
-
-  pull: defineContract({
-    channel: "github:pull",
-    input: GitBranchAppIdParamsSchema,
-    output: z.void(),
-  }),
-
-  rebase: defineContract({
-    channel: "github:rebase",
-    input: z.object({ appId: z.number() }),
-    output: z.void(),
-  }),
-
-  rebaseAbort: defineContract({
-    channel: "github:rebase-abort",
-    input: z.object({ appId: z.number() }),
-    output: z.void(),
-  }),
-
-  mergeAbort: defineContract({
-    channel: "github:merge-abort",
-    input: GitBranchAppIdParamsSchema,
-    output: z.void(),
-  }),
-
-  rebaseContinue: defineContract({
-    channel: "github:rebase-continue",
-    input: z.object({ appId: z.number() }),
-    output: z.void(),
-  }),
-
   listLocalBranches: defineContract({
     channel: "github:list-local-branches",
     input: GitBranchAppIdParamsSchema,
@@ -230,58 +188,10 @@ export const githubContracts = {
     output: z.array(z.string()),
   }),
 
-  createBranch: defineContract({
-    channel: "github:create-branch",
-    input: CreateGitBranchParamsSchema,
-    output: z.void(),
-  }),
-
-  switchBranch: defineContract({
-    channel: "github:switch-branch",
-    input: GitBranchParamsSchema,
-    output: z.void(),
-  }),
-
-  deleteBranch: defineContract({
-    channel: "github:delete-branch",
-    input: GitBranchParamsSchema,
-    output: z.void(),
-  }),
-
-  renameBranch: defineContract({
-    channel: "github:rename-branch",
-    input: RenameGitBranchParamsSchema,
-    output: z.void(),
-  }),
-
-  mergeBranch: defineContract({
-    channel: "github:merge-branch",
-    input: GitBranchParamsSchema,
-    output: z.void(),
-  }),
-
-  getConflicts: defineContract({
-    channel: "github:get-conflicts",
-    input: z.object({ appId: z.number() }),
-    output: z.array(z.string()),
-  }),
-
-  getGitState: defineContract({
-    channel: "github:get-git-state",
-    input: z.object({ appId: z.number() }),
-    output: GitStateSchema,
-  }),
-
-  disconnect: defineContract({
-    channel: "github:disconnect",
-    input: z.object({ appId: z.number() }),
-    output: z.void(),
-  }),
-
   listCollaborators: defineContract({
     channel: "github:list-collaborators",
     input: z.object({ appId: z.number() }),
-    output: z.array(GitHubCollaboratorSchema),
+    output: ListCollaboratorsResultSchema,
   }),
 
   inviteCollaborator: defineContract({
@@ -311,37 +221,37 @@ export const gitContracts = {
     output: z.array(UncommittedFileSchema),
   }),
 
+  getUncommittedFileDiff: defineContract({
+    channel: "git:get-uncommitted-file-diff",
+    input: GetUncommittedFileDiffParamsSchema,
+    output: UncommittedFileDiffSchema,
+  }),
+
   commitChanges: defineContract({
     channel: "git:commit-changes",
     input: CommitChangesParamsSchema,
     output: z.string(), // Returns commit hash
+    invalidates: (input) => [{ family: "versions", appId: input.appId }],
+  }),
+
+  cancelCommit: defineContract({
+    channel: "git:cancel-commit",
+    input: CancelCommitParamsSchema,
+    output: z.boolean(),
   }),
 
   discardChanges: defineContract({
     channel: "git:discard-changes",
     input: GitBranchAppIdParamsSchema,
     output: z.void(),
+    invalidates: (input) => [{ family: "versions", appId: input.appId }],
   }),
 } as const;
 
-// =============================================================================
-// GitHub Event Contracts
-// =============================================================================
-
-export const githubEvents = {
-  flowUpdate: defineEvent({
-    channel: "github:flow-update",
-    payload: GitHubDeviceFlowUpdateSchema,
-  }),
-
-  flowSuccess: defineEvent({
-    channel: "github:flow-success",
-    payload: GitHubDeviceFlowSuccessSchema,
-  }),
-
-  flowError: defineEvent({
-    channel: "github:flow-error",
-    payload: GitHubDeviceFlowErrorSchema,
+export const gitEvents = {
+  commitProgress: defineEvent({
+    channel: "git:commit-progress",
+    payload: CommitProgressSchema,
   }),
 } as const;
 
@@ -351,12 +261,15 @@ export const githubEvents = {
 
 export const githubClient = createClient(githubContracts);
 export const gitClient = createClient(gitContracts);
-export const githubEventClient = createEventClient(githubEvents);
+export const gitEventClient = createEventClient(gitEvents);
 
 // =============================================================================
 // Type Exports
 // =============================================================================
 
+export type ListCollaboratorsResult = z.infer<
+  typeof ListCollaboratorsResultSchema
+>;
 export type GitBranchAppIdParams = z.infer<typeof GitBranchAppIdParamsSchema>;
 export type GitBranchParams = z.infer<typeof GitBranchParamsSchema>;
 export type CreateGitBranchParams = z.infer<typeof CreateGitBranchParamsSchema>;
@@ -365,8 +278,14 @@ export type ListRemoteGitBranchesParams = z.infer<
   typeof ListRemoteGitBranchesParamsSchema
 >;
 export type CommitChangesParams = z.infer<typeof CommitChangesParamsSchema>;
+export type CancelCommitParams = z.infer<typeof CancelCommitParamsSchema>;
+export type CommitProgress = z.infer<typeof CommitProgressSchema>;
+export type CommitProgressPhase = CommitProgress["phase"];
 export type UncommittedFile = z.infer<typeof UncommittedFileSchema>;
 export type UncommittedFileStatus = UncommittedFile["status"];
-export type GithubSyncOptions = z.infer<typeof GithubSyncOptionsSchema>;
+export type GetUncommittedFileDiffParams = z.infer<
+  typeof GetUncommittedFileDiffParamsSchema
+>;
+export type UncommittedFileDiff = z.infer<typeof UncommittedFileDiffSchema>;
 export type CloneRepoParams = z.infer<typeof CloneRepoParamsSchema>;
 export type CloneRepoResult = z.infer<typeof CloneRepoResultSchema>;

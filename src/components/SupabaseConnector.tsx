@@ -1,4 +1,11 @@
-import { useEffect } from "react";
+import { useEffect, useRef, useState } from "react";
+import {
+  acknowledgeConnectionFlow,
+  cancelConnectionFlow,
+  startConnectionFlow,
+  useConnectionFlow,
+} from "@/hooks/useConnectionFlow";
+import { buildOAuthLoginUrl } from "@/connection_flow/oauth_deep_link";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 
@@ -7,7 +14,12 @@ import { Label } from "@/components/ui/label";
 import { ipc, type SupabaseProject } from "@/ipc/types";
 import { toast } from "sonner";
 import { useSettings } from "@/hooks/useSettings";
-import { useSupabase } from "@/hooks/useSupabase";
+import {
+  useRedeploySupabaseFunctions,
+  useSupabase,
+  isCreatedButUnlinkedError,
+} from "@/hooks/useSupabase";
+import { CreateSupabaseProjectForm } from "@/components/CreateSupabaseProjectForm";
 import {
   Select,
   SelectContent,
@@ -27,7 +39,10 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useLoadApp } from "@/hooks/useLoadApp";
-import { useDeepLink } from "@/contexts/DeepLinkContext";
+import {
+  useLegacySupabaseKey,
+  useSwitchToPublishableKey,
+} from "@/hooks/useLegacySupabaseKey";
 
 // @ts-ignore
 import supabaseLogoLight from "../../assets/supabase/supabase-logo-wordmark--light.svg";
@@ -38,7 +53,14 @@ import connectSupabaseDark from "../../assets/supabase/connect-supabase-dark.svg
 // @ts-ignore
 import connectSupabaseLight from "../../assets/supabase/connect-supabase-light.svg";
 
-import { ExternalLink, Info, Plus, RefreshCw, Trash2 } from "lucide-react";
+import {
+  ExternalLink,
+  Info,
+  Loader2,
+  Plus,
+  RefreshCw,
+  Trash2,
+} from "lucide-react";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { getErrorMessage } from "@/lib/errors";
 import {
@@ -47,17 +69,54 @@ import {
   TooltipContent,
 } from "@/components/ui/tooltip";
 import { useTheme } from "@/contexts/ThemeContext";
-import { isSupabaseConnected } from "@/lib/schemas";
+import {
+  hasSupabaseCredentialsForOrganization,
+  isSupabaseConnected,
+} from "@/lib/schemas";
+import { showError } from "@/lib/toast";
+
+/** A failed create, and whether it left a real project behind. */
+interface CreateError {
+  message: string;
+  isOrphan: boolean;
+}
+
+function findLinkedSupabaseProject(
+  projects: SupabaseProject[],
+  projectId: string,
+  parentProjectId?: string | null,
+) {
+  const organizationLookupProjectId = parentProjectId ?? projectId;
+  return projects.find((project) => project.id === organizationLookupProjectId);
+}
 
 export function SupabaseConnector({ appId }: { appId: number }) {
   const { t } = useTranslation(["home", "common"]);
-  const { settings, refreshSettings } = useSettings();
-  const { app, refreshApp } = useLoadApp(appId);
-  const { lastDeepLink, clearLastDeepLink } = useDeepLink();
+  const { settings, refreshSettings, loading: settingsLoading } = useSettings();
+  const { app, loading: appLoading, refreshApp } = useLoadApp(appId);
   const { isDarkMode } = useTheme();
 
-  // Check if there are any connected organizations
-  const isConnected = isSupabaseConnected(settings);
+  // A linked app must be authenticated to its own organization. Before a
+  // project is selected, any connected organization can populate the picker.
+  const isConnected = app?.supabaseProjectId
+    ? hasSupabaseCredentialsForOrganization(
+        settings,
+        app.supabaseOrganizationSlug,
+      )
+    : isSupabaseConnected(settings);
+
+  // Gates the update offer: true only when the app's generated client is
+  // holding this project's legacy key and a publishable key exists to replace
+  // it.
+  const legacyKeyQuery = useLegacySupabaseKey({
+    appId,
+    projectId: app?.supabaseProjectId ?? null,
+    enabled: isConnected && !!app?.supabaseProjectId,
+  });
+  const hasLegacyKey = legacyKeyQuery.data?.hasLegacyKey ?? false;
+  const switchKey = useSwitchToPublishableKey();
+  const { redeployAllFunctions, redeployProgress, isRedeployingFunctions } =
+    useRedeploySupabaseFunctions(appId);
 
   const branchesProjectId =
     app?.supabaseParentProjectId || app?.supabaseProjectId;
@@ -68,32 +127,122 @@ export function SupabaseConnector({ appId }: { appId: number }) {
     branches,
     isLoadingProjects,
     isFetchingProjects,
+    isLoadingOrganizations,
+    isFetchingOrganizations,
+    organizationsError,
     projectsError,
     isLoadingBranches,
     branchesError,
     isSettingAppProject,
+    isCreatingProjectForApp,
     refetchOrganizations,
     refetchProjects,
+    createProject,
     deleteOrganization,
     setAppProject,
+    recoverAppProject,
     unsetAppProject,
   } = useSupabase({
     branchesProjectId,
     branchesOrganizationSlug: app?.supabaseOrganizationSlug,
   });
 
-  useEffect(() => {
-    const handleDeepLink = async () => {
-      if (lastDeepLink?.type === "supabase-oauth-return") {
-        await refreshSettings();
-        await refetchOrganizations();
-        await refetchProjects();
-        await refreshApp();
-        clearLastDeepLink();
-      }
+  // Which app the form is open for, not a bare "is it open". Some navigations
+  // (Copy App) swap `appId` without remounting, so a boolean would leave the
+  // previous app's half-typed form standing over the new one.
+  const [createFormAppId, setCreateFormAppId] = useState<number | null>(null);
+  const isCreateFormOpen = createFormAppId === appId;
+  // Keyed by app rather than a single slot: creates for two apps can be in
+  // flight at once, so one app's failure must not overwrite another's.
+  // `isOrphan` marks a failure that left a real project behind. Carried on the
+  // record rather than tracked alongside it, so the two cannot drift: only an
+  // orphan's message is worth surviving a cancel, since it holds the stranded
+  // project's id and nothing else in the UI does. An ordinary failure kept that
+  // long would just be a banner the user cannot get rid of.
+  const [createErrors, setCreateErrors] = useState<Record<number, CreateError>>(
+    {},
+  );
+
+  const dropKey =
+    (forAppId: number) => (current: Record<number, CreateError>) => {
+      // Returning the same object when there is nothing to drop keeps React's
+      // bailout: this runs on every keystroke, and a fresh one would re-render
+      // the connector for each character typed into the form.
+      if (!(forAppId in current)) return current;
+      const { [forAppId]: _cleared, ...rest } = current;
+      return rest;
     };
-    handleDeepLink();
-  }, [lastDeepLink?.timestamp]);
+  const clearCreateError = () => setCreateErrors(dropKey(appId));
+
+  const linkedProjectId = app?.supabaseProjectId;
+
+  // The connection flow lives in the main process; this component only
+  // projects it. Timeouts (Supabase historically had none — a closed
+  // browser left it silently stuck), double-start protection and
+  // OAuth-return correlation are handled by the typed-ref-keyed state machine.
+  const { flowState, isFlowActive } = useConnectionFlow("supabase");
+
+  const refreshAfterConnectRef = useRef<() => Promise<void>>(async () => {});
+  refreshAfterConnectRef.current = async () => {
+    const refreshedSettings = await refreshSettings();
+    await refetchOrganizations();
+    const refreshedProjects = await refetchProjects();
+    if (app?.supabaseProjectId && !refreshedProjects.isError) {
+      const linkedProject = findLinkedSupabaseProject(
+        refreshedProjects.data ?? [],
+        app.supabaseProjectId,
+        app.supabaseParentProjectId,
+      );
+      if (
+        linkedProject &&
+        linkedProject.organizationSlug !== app.supabaseOrganizationSlug &&
+        hasSupabaseCredentialsForOrganization(
+          refreshedSettings,
+          linkedProject.organizationSlug,
+        )
+      ) {
+        try {
+          await recoverAppProject({
+            appId,
+            projectId: app.supabaseProjectId,
+            parentProjectId: app.supabaseParentProjectId,
+            organizationSlug: linkedProject.organizationSlug,
+          });
+          toast.success(t("integrations.supabase.projectConnected"));
+        } catch (error) {
+          console.error("Failed to recover legacy Supabase link:", error);
+          toast.error(
+            t("integrations.supabase.failedConnectProject", {
+              error: String(error),
+            }),
+          );
+        }
+      }
+    }
+    await refreshApp();
+  };
+
+  useEffect(() => {
+    const flow = flowState;
+    if (flow.status === "connected") {
+      void (async () => {
+        try {
+          await refreshAfterConnectRef.current();
+        } finally {
+          await acknowledgeConnectionFlow("supabase", flow.invocationRef);
+        }
+      })();
+    } else if (flow.status === "failed") {
+      if (flow.reason === "timeout") {
+        toast.warning(t("integrations.supabase.signInTimedOut"));
+      } else if (flow.reason !== "user_cancelled") {
+        toast.error(flow.message ?? t("integrations.supabase.connectFailed"));
+      }
+      void acknowledgeConnectionFlow("supabase", flow.invocationRef);
+    } else if (flow.status === "cancelled") {
+      void acknowledgeConnectionFlow("supabase", flow.invocationRef);
+    }
+  }, [flowState, t]);
 
   const handleProjectSelect = async (projectValue: string) => {
     try {
@@ -121,6 +270,51 @@ export function SupabaseConnector({ appId }: { appId: number }) {
     }
   };
 
+  // No setAppProject or refetch here: the handler links the app itself, and the
+  // mutation's onSuccess already invalidates. A create can settle after the
+  // panel has moved to another app, so the functional updater closes only the
+  // form it belongs to, and the toast names the project rather than "this app".
+  const handleProjectCreated = (
+    createdForAppId: number,
+    project: SupabaseProject,
+  ) => {
+    setCreateFormAppId((open) => (open === createdForAppId ? null : open));
+    toast.success(
+      t("integrations.supabase.projectCreated", { name: project.name }),
+    );
+  };
+
+  // The failure is held here rather than inside the form so it outlives it:
+  // the form unmounts on an app switch, and for a created-but-unlinked project
+  // we close it deliberately so a second Create cannot mint another project.
+  const handleProjectCreateFailed = (
+    createdForAppId: number,
+    error: unknown,
+  ) => {
+    const isOrphan = isCreatedButUnlinkedError(error);
+    setCreateErrors((current) => ({
+      ...current,
+      [createdForAppId]: { message: getErrorMessage(error), isOrphan },
+    }));
+    if (isOrphan) {
+      setCreateFormAppId((open) => (open === createdForAppId ? null : open));
+    }
+  };
+
+  // Once the app has a project, a failed create for it says nothing useful: a
+  // double-submit settles as one success and one "already connected" failure,
+  // and the failure lands second. Keyed off the app rather than cleared by each
+  // success path, so it covers a link made from anywhere — this panel, the
+  // selector, or another window. Cannot touch a project created but not
+  // linked, which leaves the app unlinked and so never reaches this.
+  useEffect(() => {
+    if (linkedProjectId) {
+      setCreateErrors(dropKey(appId));
+    }
+  }, [linkedProjectId, appId]);
+
+  const createErrorForThisApp = createErrors[appId]?.message ?? null;
+
   // Group projects by organization for display
   const groupedProjects = projects.reduce(
     (acc, project) => {
@@ -144,14 +338,50 @@ export function SupabaseConnector({ appId }: { appId: number }) {
   );
 
   const handleAddAccount = async () => {
-    if (settings?.isTestMode) {
-      await ipc.supabase.fakeConnectAndSetProject({
-        appId,
-        fakeProjectId: "fake-project-id",
-      });
-    } else {
-      await ipc.system.openExternalUrl(
-        "https://supabase-oauth.dyad.sh/api/connect-supabase/login",
+    try {
+      // Starting is a no-op while a flow is already active (double-click).
+      const { started, invocationRef } = await startConnectionFlow("supabase");
+      if (!started) {
+        return;
+      }
+      try {
+        if (settings?.isTestMode) {
+          await ipc.supabase.fakeConnectAndSetProject({
+            appId,
+            fakeProjectId: "fake-project-id",
+          });
+        } else {
+          await ipc.system.openExternalUrl(
+            buildOAuthLoginUrl("supabase", invocationRef),
+          );
+        }
+      } catch (error) {
+        await cancelConnectionFlow("supabase", invocationRef);
+        throw error;
+      }
+    } catch (error) {
+      toast.error(getErrorMessage(error));
+    }
+  };
+
+  const handleUpdateApiKey = async () => {
+    try {
+      const { outcome } = await switchKey.mutateAsync({ appId });
+      if (outcome === "switched") {
+        toast.success(t("integrations.supabase.apiKeyUpdated"));
+      } else if (outcome === "already-current") {
+        toast.success(t("integrations.supabase.apiKeyAlreadyCurrent"));
+      } else {
+        // The key is still legacy and Dyad couldn't act on it. Reporting
+        // success here would leave the user believing a broken app was fixed.
+        toast.info(t("integrations.supabase.apiKeyNotUpdated"));
+      }
+    } catch (error) {
+      console.error("Failed to update the app's Supabase key:", error);
+      toast.error(
+        t("integrations.supabase.failedUpdateApiKey", {
+          error: String(error),
+        }),
       );
     }
   };
@@ -160,10 +390,58 @@ export function SupabaseConnector({ appId }: { appId: number }) {
     try {
       await unsetAppProject(appId);
       toast.success(t("integrations.supabase.disconnectProject"));
+      // Covers the ordering the effect above cannot: a failure recorded while
+      // the app was already linked, which the effect has no change left to fire
+      // on. Disconnecting is what brings the selector card back, so it is the
+      // last point before such a message could be seen.
+      clearCreateError();
       await refreshApp();
     } catch (error) {
       console.error("Failed to disconnect project:", error);
       toast.error(t("integrations.supabase.failedDisconnectProject"));
+    }
+  };
+
+  const handleRedeployAllFunctions = async () => {
+    try {
+      const result = await redeployAllFunctions();
+      if (result.errors.length > 0) {
+        showError(
+          t("integrations.supabase.redeployFailed", {
+            error: result.errors.join("\n"),
+          }),
+        );
+      } else if (
+        result.functionCount === 0 &&
+        result.prunedFunctionNames.length > 0
+      ) {
+        toast.success(
+          t("integrations.supabase.redeployPrunedOnly", {
+            functions: result.prunedFunctionNames.join(", "),
+          }),
+        );
+      } else if (result.functionCount === 0) {
+        toast.info(t("integrations.supabase.noFunctionsToRedeploy"));
+      } else if (result.prunedFunctionNames.length > 0) {
+        toast.success(
+          t("integrations.supabase.redeploySucceededWithPruning", {
+            count: result.functionCount,
+            functions: result.prunedFunctionNames.join(", "),
+          }),
+        );
+      } else {
+        toast.success(
+          t("integrations.supabase.redeploySucceeded", {
+            count: result.functionCount,
+          }),
+        );
+      }
+    } catch (error) {
+      showError(
+        t("integrations.supabase.redeployFailed", {
+          error: getErrorMessage(error),
+        }),
+      );
     }
   };
 
@@ -176,10 +454,146 @@ export function SupabaseConnector({ appId }: { appId: number }) {
     }
   };
 
-  // Connected and has project set
+  const linkedProjectCandidate = app?.supabaseProjectId
+    ? findLinkedSupabaseProject(
+        projects,
+        app.supabaseProjectId,
+        app.supabaseParentProjectId,
+      )
+    : undefined;
+  const linkedProjectForRelink =
+    linkedProjectCandidate &&
+    hasSupabaseCredentialsForOrganization(
+      settings,
+      linkedProjectCandidate.organizationSlug,
+    )
+      ? linkedProjectCandidate
+      : undefined;
+  const isLoadingRelinkCandidate = isLoadingOrganizations || isLoadingProjects;
+  const handleRelinkProject = async () => {
+    if (!app?.supabaseProjectId || !linkedProjectForRelink) return;
+    try {
+      await recoverAppProject({
+        appId,
+        projectId: app.supabaseProjectId,
+        parentProjectId: app.supabaseParentProjectId,
+        organizationSlug: linkedProjectForRelink.organizationSlug,
+      });
+      toast.success(t("integrations.supabase.projectConnected"));
+      await refreshApp();
+    } catch (error) {
+      toast.error(
+        t("integrations.supabase.failedConnectProject", {
+          error: String(error),
+        }),
+      );
+    }
+  };
+
+  if (settingsLoading || appLoading) {
+    return (
+      <Skeleton
+        className="h-24 w-full"
+        data-testid="supabase-settings-loading"
+      />
+    );
+  }
+
+  // Keep recovery controls available when the app still points at a project
+  // whose organization token has been removed. Hiding the association here
+  // would strand the user on a generic account-connect screen.
+  if (app?.supabaseProjectId && !isConnected) {
+    return (
+      <Card
+        key="supabase-reconnect"
+        className="mt-1"
+        data-testid="supabase-reconnect-card"
+      >
+        <CardHeader>
+          <CardTitle>{t("integrations.supabase.project")}</CardTitle>
+          <div className="flex flex-col gap-1.5 text-sm text-muted-foreground">
+            {t("integrations.supabase.connectedToProject")}
+            <Badge variant="secondary" className="w-fit text-base font-bold">
+              {app.supabaseProjectName || app.supabaseProjectId}
+            </Badge>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <Alert>
+            <Info className="h-4 w-4" />
+            <AlertDescription>
+              {t("integrations.supabase.organizationCredentialsMissing")}
+            </AlertDescription>
+          </Alert>
+          {(organizationsError || projectsError) && (
+            <div className="text-red-500">
+              {t("integrations.supabase.errorLoadingProjects", {
+                message: (organizationsError || projectsError)?.message,
+              })}
+              <Button
+                variant="outline"
+                className="mt-2"
+                onClick={async () => {
+                  await refetchOrganizations();
+                  await refetchProjects();
+                }}
+              >
+                {t("common:retry")}
+              </Button>
+            </div>
+          )}
+          <div className="flex flex-wrap gap-2">
+            {isLoadingRelinkCandidate ? (
+              <Button variant="outline" disabled>
+                <Loader2 className="h-4 w-4 animate-spin" />
+                {t("integrations.supabase.relinkProject")}
+              </Button>
+            ) : linkedProjectForRelink ? (
+              <Button
+                variant="outline"
+                onClick={handleRelinkProject}
+                disabled={isSettingAppProject}
+                data-testid="relink-supabase-project-button"
+              >
+                {t("integrations.supabase.relinkProject")}
+              </Button>
+            ) : null}
+            <Button
+              variant="outline"
+              onClick={handleAddAccount}
+              disabled={isFlowActive}
+              data-testid="reconnect-supabase-button"
+            >
+              {t("integrations.supabase.addOrganization")}
+            </Button>
+            <Button variant="destructive" onClick={handleUnsetProject}>
+              {t("integrations.supabase.disconnectProject")}
+            </Button>
+            {isFlowActive && "invocationRef" in flowState && (
+              <Button
+                variant="ghost"
+                onClick={() =>
+                  void cancelConnectionFlow("supabase", flowState.invocationRef)
+                }
+                data-testid="cancel-supabase-flow-button"
+              >
+                {t("integrations.supabase.cancelSignIn")}
+              </Button>
+            )}
+          </div>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  // Connected and has project set.
+  //
+  // Each variant below carries a key. They are all a bare <Card> returned from
+  // the same position, so without one React reconciles a card for the previous
+  // app into the next and the Base UI selects keep its displayed value.
   if (isConnected && app?.supabaseProjectName) {
     return (
-      <Card className="mt-1">
+      <Card key="supabase-connected" className="mt-1">
         <CardHeader>
           <CardTitle className="flex items-center justify-between">
             {t("integrations.supabase.project")}{" "}
@@ -212,6 +626,14 @@ export function SupabaseConnector({ appId }: { appId: number }) {
         </CardHeader>
         <CardContent>
           <div className="space-y-4">
+            <p
+              className="text-sm text-muted-foreground"
+              data-testid="supabase-preview-redirect-notice"
+            >
+              {t("integrations.supabase.previewRedirectNotice", {
+                project: app.supabaseProjectName,
+              })}
+            </p>
             <div className="space-y-2">
               <Label htmlFor="supabase-branch-select">
                 {t("integrations.supabase.databaseBranch")}
@@ -278,6 +700,56 @@ export function SupabaseConnector({ appId }: { appId: number }) {
               )}
             </div>
 
+            {/* Shown only once the app's client is confirmed to hold this
+            project's legacy key — an app already on a publishable key has
+            nothing to update. Detection has to find the key for this to appear
+            at all (see detectLegacyAppKey). */}
+            {hasLegacyKey && (
+              <div className="space-y-2" data-testid="supabase-legacy-key">
+                <Alert>
+                  <Info className="h-4 w-4" />
+                  <AlertDescription>
+                    {t("integrations.supabase.legacyApiKeyWarning")}
+                  </AlertDescription>
+                </Alert>
+                <Button
+                  variant="outline"
+                  onClick={handleUpdateApiKey}
+                  disabled={switchKey.isPending}
+                  data-testid="supabase-update-api-key-button"
+                >
+                  {t("integrations.supabase.updateApiKey")}
+                </Button>
+                <p className="text-xs text-muted-foreground">
+                  {t("integrations.supabase.updateApiKeyDescription")}
+                </p>
+              </div>
+            )}
+
+            <div className="space-y-2">
+              <Button
+                variant="outline"
+                onClick={handleRedeployAllFunctions}
+                disabled={isRedeployingFunctions}
+                data-testid="supabase-redeploy-functions-button"
+              >
+                {isRedeployingFunctions && (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                )}
+                {isRedeployingFunctions
+                  ? redeployProgress
+                    ? t("integrations.supabase.redeployProgress", {
+                        completed: redeployProgress.completed,
+                        total: redeployProgress.total,
+                      })
+                    : t("integrations.supabase.preparingRedeploy")
+                  : t("integrations.supabase.redeployFunctions")}
+              </Button>
+              <p className="text-xs text-muted-foreground">
+                {t("integrations.supabase.redeployFunctionsDescription")}
+              </p>
+            </div>
+
             <Button variant="destructive" onClick={handleUnsetProject}>
               {t("integrations.supabase.disconnectProject")}
             </Button>
@@ -296,7 +768,7 @@ export function SupabaseConnector({ appId }: { appId: number }) {
         : "";
 
     return (
-      <Card className="mt-1">
+      <Card key="supabase-selector" className="mt-1">
         <CardHeader>
           <CardTitle className="flex items-center justify-between">
             {t("integrations.supabase.projects")}
@@ -324,11 +796,29 @@ export function SupabaseConnector({ appId }: { appId: number }) {
                 variant="outline"
                 size="sm"
                 onClick={handleAddAccount}
+                disabled={isFlowActive}
                 className="gap-1"
               >
                 <Plus className="h-4 w-4" />
                 {t("integrations.supabase.addOrganization")}
               </Button>
+              {isFlowActive && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    if ("invocationRef" in flowState) {
+                      void cancelConnectionFlow(
+                        "supabase",
+                        flowState.invocationRef,
+                      );
+                    }
+                  }}
+                  data-testid="cancel-supabase-flow-button"
+                >
+                  {t("integrations.supabase.cancelSignIn")}
+                </Button>
+              )}
             </div>
           </CardTitle>
           <CardDescription>
@@ -336,7 +826,60 @@ export function SupabaseConnector({ appId }: { appId: number }) {
           </CardDescription>
         </CardHeader>
         <CardContent>
-          {isLoadingProjects || isFetchingProjects ? (
+          {/* Above the loading and error branches below, not inside one of
+          them: a created-but-unlinked failure refetches the project list, so an
+          alert further down would be replaced by that refetch's skeleton, or
+          lost entirely if the refetch then errored. The form renders its own
+          copy, so this is only for when the form is shut. */}
+          {!isCreateFormOpen && createErrorForThisApp && (
+            <Alert
+              variant="destructive"
+              className="mb-4"
+              data-testid="supabase-create-project-error"
+            >
+              <Info className="h-4 w-4" />
+              {/* No `role` here: `Alert` already puts one on its wrapper, and
+              nesting a second live region inside it makes a role query match
+              twice. */}
+              <AlertDescription>{createErrorForThisApp}</AlertDescription>
+            </Alert>
+          )}
+
+          {/* The create form is checked before the loading and error branches:
+          a background refetch of the project list (window focus past the 60s
+          staleTime is enough) would otherwise unmount the form mid-edit and
+          discard what the user had typed. */}
+          {isCreateFormOpen ? (
+            <CreateSupabaseProjectForm
+              appId={appId}
+              organizations={organizations}
+              // Seeding the name from the app is what makes this a one-click
+              // path for the common case of one database per app.
+              defaultName={app?.name ?? ""}
+              createProject={createProject}
+              // Scoped to this app: a create still running for the app the
+              // user just navigated away from must not disable this app's form.
+              isCreatingProject={isCreatingProjectForApp(appId)}
+              error={createErrorForThisApp}
+              onClearError={clearCreateError}
+              onCreated={handleProjectCreated}
+              onFailed={handleProjectCreateFailed}
+              // Keeps a stranded project's message, for the same reason opening
+              // the form does: it is the only place that project's id appears,
+              // and backing out settles nothing about it. Every other failure
+              // goes, or cancelling would leave a banner with no way to
+              // dismiss it.
+              onCancel={() => {
+                setCreateFormAppId(null);
+                if (!createErrors[appId]?.isOrphan) {
+                  clearCreateError();
+                }
+              }}
+            />
+          ) : isLoadingProjects ||
+            isFetchingProjects ||
+            isLoadingOrganizations ||
+            isFetchingOrganizations ? (
             <div className="space-y-2">
               <Skeleton className="h-4 w-full" />
               <Skeleton className="h-10 w-full" />
@@ -439,6 +982,29 @@ export function SupabaseConnector({ appId }: { appId: number }) {
                   </Select>
                 </div>
               )}
+
+              {/* Not offered at all without an organization to create in,
+              rather than offered and dead. Connecting can land here — if
+              listing organizations fails, the return handler stores the token
+              in the legacy fields with no organization — and the way out is the
+              Add Organization action above, not this button. */}
+              {organizations.length > 0 && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="gap-1"
+                  // Deliberately does not clear the last failure: for a project
+                  // created but not linked, that message is the only place its
+                  // id appears, and this button is the natural thing to click
+                  // after reading it. The form shows it and the first keystroke
+                  // drops it.
+                  onClick={() => setCreateFormAppId(appId)}
+                  data-testid="supabase-create-project-button"
+                >
+                  <Plus className="h-4 w-4" />
+                  {t("integrations.supabase.createProject")}
+                </Button>
+              )}
             </div>
           )}
         </CardContent>
@@ -452,13 +1018,32 @@ export function SupabaseConnector({ appId }: { appId: number }) {
       <div className="flex flex-col md:flex-row items-center justify-between">
         <h2 className="text-lg font-medium">Integrations</h2>
         <img
-          onClick={handleAddAccount}
+          onClick={isFlowActive ? undefined : handleAddAccount}
           src={isDarkMode ? connectSupabaseDark : connectSupabaseLight}
           alt="Connect to Supabase"
-          className="w-full h-10 min-h-8 min-w-20 cursor-pointer"
+          aria-busy={isFlowActive}
+          className={`w-full h-10 min-h-8 min-w-20 ${
+            isFlowActive ? "cursor-wait opacity-60" : "cursor-pointer"
+          }`}
           data-testid="connect-supabase-button"
         />
       </div>
+      {isFlowActive && (
+        <div className="flex justify-end">
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => {
+              if ("invocationRef" in flowState) {
+                void cancelConnectionFlow("supabase", flowState.invocationRef);
+              }
+            }}
+            data-testid="cancel-supabase-flow-button"
+          >
+            {t("integrations.supabase.cancelSignIn")}
+          </Button>
+        </div>
+      )}
     </div>
   );
 }

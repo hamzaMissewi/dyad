@@ -1,5 +1,7 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { z } from "zod";
 import { withLock } from "../ipc/utils/lock_utils";
 import { readSettings, writeSettings } from "../main/settings";
 import {
@@ -8,22 +10,130 @@ import {
 } from "@dyad-sh/supabase-management-js";
 import log from "electron-log";
 import { IS_TEST_BUILD } from "../ipc/utils/test_utils";
+import { SUPABASE_PROJECT_CREATED_BUT_UNLINKED } from "../ipc/types/supabase";
 import type { SupabaseOrganizationCredentials } from "../lib/schemas";
 import {
   fetchWithRetry,
   RateLimitError,
   retryWithRateLimit,
 } from "../ipc/utils/retryWithRateLimit";
-import { DyadError, DyadErrorKind } from "@/errors/dyad_error";
+import { DyadError, DyadErrorKind, isDyadError } from "@/errors/dyad_error";
 import { enqueueSupabaseDeploy } from "./supabase_deploy_queue";
+import { SupabaseTokenRefreshError } from "./supabase_errors";
+import { abortable } from "../ipc/utils/abortable";
+import {
+  appOperationCoordinator,
+  readAppResource,
+  type AppOperationContext,
+} from "@/ipc/services/app_operation_coordinator";
+import { getDyadAppPath } from "@/paths/paths";
+import {
+  deferSupabaseFunctionSyncForRecording,
+  SupabaseFunctionSyncDeferredError,
+  type DeferredSupabaseFunctionSync,
+} from "./supabase_recording_deferred_sync";
 
 const fsPromises = fs.promises;
 
 const logger = log.scope("supabase_management_client");
 
+// Supabase can briefly reject a newly issued OAuth token while it propagates
+// to the Management API. Keep this retry window short and limited to 401s.
+const ORGANIZATION_AUTH_RETRY_DELAYS_MS = [250, 500, 1_000, 2_000] as const;
+
 // ─────────────────────────────────────────────────────────────────────
 // Interfaces for file collection and caching
 // ─────────────────────────────────────────────────────────────────────
+
+export interface SupabaseUploadFile {
+  readonly relativePath: string;
+  readonly content: Blob;
+}
+
+export interface SupabaseFunctionSnapshot {
+  readonly files: readonly SupabaseUploadFile[];
+  readonly entrypointPath: string;
+  readonly importMapRelPath: string;
+}
+
+export const SUPABASE_DEPLOY_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
+
+/** Caller cancellation plus a deadline for one request attempt. */
+function deploymentSignal(signal?: AbortSignal): AbortSignal {
+  const timeout = AbortSignal.timeout(SUPABASE_DEPLOY_REQUEST_TIMEOUT_MS);
+  return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
+
+/** Retain deployment ownership after callers release their snapshot preparation claims. */
+export async function withSupabaseFunctionDeployment<T>(
+  target: {
+    appId: number;
+    supabaseProjectId: string;
+    signal?: AbortSignal;
+    operation?: string;
+    /**
+     * What this deployment syncs. While a recording holds the app's
+     * `supabase-functions` claim, it is registered to run after the recording
+     * ends and `SupabaseFunctionSyncDeferredError` is thrown instead.
+     */
+    sync: Omit<DeferredSupabaseFunctionSync, "supabaseProjectId">;
+  },
+  operation: (context: AppOperationContext, appPath: string) => Promise<T>,
+): Promise<T> {
+  // Same synchronous step as admission below, so a recording cannot start
+  // between this check and the coordinator's own recording refusal.
+  if (
+    deferSupabaseFunctionSyncForRecording(target.appId, {
+      ...target.sync,
+      supabaseProjectId: target.supabaseProjectId,
+    })
+  ) {
+    throw new SupabaseFunctionSyncDeferredError();
+  }
+  return appOperationCoordinator
+    .run(
+      {
+        appId: target.appId,
+        operation: target.operation ?? "deploy app Supabase functions",
+        resources: [
+          readAppResource("app-path"),
+          readAppResource("provider"),
+          readAppResource("repository"),
+          "supabase-functions",
+        ],
+        signal: target.signal,
+        allowCompatibleQueueBypass: true,
+        refuseWhenRecording: "deploy Supabase functions",
+      },
+      async (context) => {
+        const { db } = await import("@/db");
+        const { apps } = await import("@/db/schema");
+        const { eq } = await import("drizzle-orm");
+        const app = await db.query.apps.findFirst({
+          where: eq(apps.id, target.appId),
+        });
+        if (!app || app.supabaseProjectId !== target.supabaseProjectId) {
+          throw new DyadError(
+            "This app's Supabase project changed before deployment. Run the request again against the current project.",
+            DyadErrorKind.Precondition,
+          );
+        }
+        return operation(context, getDyadAppPath(app.path));
+      },
+    )
+    .catch((error: unknown) => {
+      // Aborted fetches, backoffs and throwIfAborted() raise DOMExceptions;
+      // report a user cancel as one rather than as a product exception.
+      if (target.signal?.aborted && !isDyadError(error)) {
+        throw new DyadError(
+          "Supabase function deployment was cancelled.",
+          DyadErrorKind.UserCancelled,
+          { cause: error },
+        );
+      }
+      throw error;
+    });
+}
 
 interface ZipFileEntry {
   relativePath: string;
@@ -68,12 +178,53 @@ export interface DeployedFunctionResponse {
 export interface SupabaseProjectLog {
   timestamp: number;
   event_message: string;
-  metadata: any;
+  level: "info" | "warn" | "error";
 }
 
 export interface SupabaseProjectLogsResponse {
   result: SupabaseProjectLog[];
-  error?: any;
+  error?: unknown;
+}
+
+const SupabaseProjectLogApiSchema = z.object({
+  timestamp: z.union([z.string(), z.number()]),
+  event_message: z.string(),
+  severity_text: z.string().nullish(),
+});
+
+const SupabaseProjectLogsApiResponseSchema = z.object({
+  result: z.array(SupabaseProjectLogApiSchema).optional(),
+  error: z.unknown().optional(),
+});
+
+function parseSupabaseLogTimestamp(timestamp: string | number): number {
+  if (typeof timestamp === "number") {
+    return timestamp;
+  }
+
+  // ClickHouse returns UTC DateTime64 values without always including a zone.
+  // Date.parse treats a zone-less timestamp as local time, so make UTC explicit.
+  const hasTimeZone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(timestamp);
+  return Date.parse(hasTimeZone ? timestamp : `${timestamp}Z`);
+}
+
+function normalizeSupabaseLogLevel(
+  severityText: string | null | undefined,
+): SupabaseProjectLog["level"] {
+  switch (severityText?.toLowerCase()) {
+    case "warn":
+    case "warning":
+      return "warn";
+    case "alert":
+    case "critical":
+    case "emergency":
+    case "error":
+    case "fatal":
+    case "panic":
+      return "error";
+    default:
+      return "info";
+  }
 }
 
 export interface SupabaseProjectBranch {
@@ -107,7 +258,9 @@ function isTokenExpired(expiresIn?: number): boolean {
  * Refreshes the Supabase access token using the refresh token
  * Updates settings with new tokens and expiration time
  */
-export async function refreshSupabaseToken(): Promise<void> {
+let refreshSupabaseTokenPromise: Promise<void> | null = null;
+
+async function refreshSupabaseTokenOnce(): Promise<void> {
   const settings = readSettings();
   const refreshToken = settings.supabase?.refreshToken?.value;
 
@@ -136,10 +289,7 @@ export async function refreshSupabaseToken(): Promise<void> {
     );
 
     if (!response.ok) {
-      throw new DyadError(
-        `Supabase token refresh failed. Try going to Settings to disconnect Supabase and then reconnect to Supabase. Error status: ${response.statusText}`,
-        DyadErrorKind.External,
-      );
+      throw new SupabaseTokenRefreshError(response.status);
     }
 
     const {
@@ -168,6 +318,15 @@ export async function refreshSupabaseToken(): Promise<void> {
     logger.error("Error refreshing Supabase token:", error);
     throw error;
   }
+}
+
+export function refreshSupabaseToken(): Promise<void> {
+  if (!refreshSupabaseTokenPromise) {
+    refreshSupabaseTokenPromise = refreshSupabaseTokenOnce().finally(() => {
+      refreshSupabaseTokenPromise = null;
+    });
+  }
+  return refreshSupabaseTokenPromise;
 }
 
 // Function to get the Supabase Management API client
@@ -275,10 +434,7 @@ async function refreshSupabaseTokenForOrganization(
     );
 
     if (!response.ok) {
-      throw new DyadError(
-        `Supabase token refresh failed. Try going to Settings to disconnect Supabase and then reconnect. Error status: ${response.statusText}`,
-        DyadErrorKind.External,
-      );
+      throw new SupabaseTokenRefreshError(response.status);
     }
 
     const {
@@ -378,19 +534,34 @@ export async function getSupabaseClientForOrganization(
 export async function listSupabaseOrganizations(
   accessToken: string,
 ): Promise<SupabaseOrganizationDetails[]> {
-  const response = await fetchWithRetry(
-    "https://api.supabase.com/v1/organizations",
-    {
-      method: "GET",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
+  for (let attempt = 0; ; attempt++) {
+    const response = await fetchWithRetry(
+      "https://api.supabase.com/v1/organizations",
+      {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+        },
       },
-    },
-    "List Supabase organizations",
-  );
+      "List Supabase organizations",
+    );
 
-  if (response.status !== 200) {
+    if (response.status === 200) {
+      const organizations: SupabaseOrganizationDetails[] =
+        await response.json();
+      return organizations;
+    }
+
     const errorText = await response.text();
+    const retryDelay = ORGANIZATION_AUTH_RETRY_DELAYS_MS[attempt];
+    if (response.status === 401 && retryDelay !== undefined) {
+      logger.warn(
+        `Supabase organizations request was unauthorized; retrying in ${retryDelay}ms (attempt ${attempt + 2}/${ORGANIZATION_AUTH_RETRY_DELAYS_MS.length + 1})`,
+      );
+      await new Promise((resolve) => setTimeout(resolve, retryDelay));
+      continue;
+    }
+
     logger.error(
       `Failed to fetch organizations (${response.status}): ${errorText}`,
     );
@@ -399,9 +570,6 @@ export async function listSupabaseOrganizations(
       response,
     );
   }
-
-  const organizations: SupabaseOrganizationDetails[] = await response.json();
-  return organizations;
 }
 
 export interface SupabaseOrganizationMember {
@@ -540,6 +708,193 @@ export async function getSupabaseProjectName(
   return project?.name || `<project not found for: ${projectId}>`;
 }
 
+/**
+ * A project API key as returned by the Management API. A project can carry both
+ * the new-format keys (`publishable` / `secret`) and the legacy JWT pair
+ * (`anon` / `service_role`, typed `legacy`) — and Supabase keeps listing the
+ * legacy pair after it's been disabled in the dashboard, so presence here says
+ * nothing about whether a key still works.
+ */
+export interface SupabaseApiKey {
+  name: string;
+  /**
+   * Absent or null for a secret key fetched without `reveal` — Supabase lists
+   * the entry but withholds its value. Every consumer has to guard before using
+   * it; a redacted entry is a key that exists, not a key you can authenticate
+   * with.
+   */
+  api_key?: string | null;
+  type?: "publishable" | "secret" | "legacy" | null;
+}
+
+/**
+ * Validated at the boundary rather than asserted, because this response decides
+ * which key the app authenticates with and which key admin calls use. A 200
+ * carrying something other than an array (an error envelope, a paginated
+ * wrapper) would otherwise surface as an unclassified `TypeError` from
+ * `keys.find` — and inside `detectLegacyAppKey`, which swallows failures, it
+ * would silently suppress the very warning this exists to raise.
+ *
+ * Loose on purpose: only `name` is required, unknown `type` values pass through
+ * as-is (Supabase may add more), and `api_key` may be absent or null — that is
+ * exactly what a secret key looks like on the common no-reveal path, and
+ * rejecting it would fail key loading for a response that is perfectly valid.
+ * Consumers already guard the value before use.
+ */
+const SupabaseApiKeySchema = z.object({
+  name: z.string(),
+  api_key: z.string().nullish(),
+  type: z.string().nullish(),
+});
+const SupabaseApiKeysSchema = z.array(SupabaseApiKeySchema);
+
+/**
+ * Fetch a project's API keys.
+ *
+ * Deliberately not `SupabaseManagementAPI.getProjectApiKeys()`: that helper
+ * can't send `reveal`, and without it Supabase redacts the VALUE of every
+ * `secret` key while returning the legacy `service_role` JWT in full — so the
+ * new-format admin key comes back unusable.
+ *
+ * `reveal` is opt-in: revealing exposes every secret key on the project and is
+ * recorded in the organization's audit log, so only pass it where an admin key
+ * is genuinely needed.
+ */
+export async function getProjectApiKeys({
+  projectId,
+  organizationSlug,
+  reveal = false,
+}: {
+  projectId: string;
+  organizationSlug: string | null;
+  reveal?: boolean;
+}): Promise<SupabaseApiKey[]> {
+  const supabase = await getSupabaseClient({ organizationSlug });
+
+  const response = await fetchWithRetry(
+    `https://api.supabase.com/v1/projects/${encodeURIComponent(
+      projectId,
+    )}/api-keys${reveal ? "?reveal=true" : ""}`,
+    {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${(supabase as any).options.accessToken}`,
+      },
+    },
+    `Get API keys for ${projectId}`,
+  );
+
+  if (response.status !== 200) {
+    throw await createResponseError(response, "get project api keys");
+  }
+
+  const parsed = SupabaseApiKeysSchema.safeParse(await response.json());
+  if (!parsed.success) {
+    throw new DyadError(
+      `Supabase returned an unexpected API-keys response for project ${projectId}: ${parsed.error.message}`,
+      DyadErrorKind.External,
+    );
+  }
+  return parsed.data as SupabaseApiKey[];
+}
+
+export const SUPABASE_PREVIEW_REGISTRATION_TIMEOUT_MS = 10_000;
+
+/** Append preview callbacks without changing Site URL or other Auth settings. */
+export async function ensureSupabaseAuthRedirectUrls({
+  projectId,
+  organizationSlug,
+  redirectUrls,
+  signal: callerSignal,
+}: {
+  projectId: string;
+  organizationSlug: string | null;
+  redirectUrls: string[];
+  signal: AbortSignal;
+}): Promise<void> {
+  callerSignal.throwIfAborted();
+  if (IS_TEST_BUILD) return;
+
+  // Different apps can share one project, even through different credentials.
+  // Serialize the whole read/merge/write by project, not by app or organization.
+  await abortable(
+    withLock(`supabase-auth-redirects:${projectId}`, async () => {
+      callerSignal.throwIfAborted();
+      // Waiting for another app's project update does not consume this budget.
+      const signal = AbortSignal.any([
+        callerSignal,
+        AbortSignal.timeout(SUPABASE_PREVIEW_REGISTRATION_TIMEOUT_MS),
+      ]);
+      signal.throwIfAborted();
+      const supabase = await abortable(
+        getSupabaseClient({ organizationSlug }),
+        signal,
+      );
+      signal.throwIfAborted();
+      const url = `https://api.supabase.com/v1/projects/${encodeURIComponent(projectId)}/config/auth`;
+      const headers = {
+        Authorization: `Bearer ${(supabase as any).options.accessToken}`,
+        "Content-Type": "application/json",
+      };
+      const response = await abortable(
+        fetchWithRetry(url, { headers, signal }, "read Auth redirect URLs"),
+        signal,
+      );
+      if (!response.ok) {
+        throw classifyManagementApiError(
+          await abortable(
+            createResponseError(response, "read Auth redirect URLs"),
+            signal,
+          ),
+          "read Auth redirect URLs",
+        );
+      }
+      const config = z
+        .object({ uri_allow_list: z.string().nullable() })
+        .safeParse(await abortable(response.json(), signal));
+      // Never treat a malformed/partial response as an empty list: that would
+      // erase callbacks belonging to production or another linked app.
+      if (!config.success) {
+        throw new DyadError(
+          "Supabase returned an unexpected Auth configuration.",
+          DyadErrorKind.External,
+        );
+      }
+      const existing = (config.data.uri_allow_list ?? "")
+        .split(",")
+        .map((entry) => entry.trim())
+        .filter(Boolean);
+      const merged = [...new Set([...existing, ...redirectUrls])];
+      if (redirectUrls.every((entry) => existing.includes(entry))) return;
+
+      signal.throwIfAborted();
+      const updated = await abortable(
+        fetchWithRetry(
+          url,
+          {
+            method: "PATCH",
+            headers,
+            signal,
+            body: JSON.stringify({ uri_allow_list: merged.join(",") }),
+          },
+          "register Auth redirect URLs",
+        ),
+        signal,
+      );
+      if (!updated.ok) {
+        throw classifyManagementApiError(
+          await abortable(
+            createResponseError(updated, "register Auth redirect URLs"),
+            signal,
+          ),
+          "register Auth redirect URLs",
+        );
+      }
+    }),
+    callerSignal,
+  );
+}
+
 export async function getSupabaseProjectLogs(
   projectId: string,
   timestampStart?: number,
@@ -547,20 +902,17 @@ export async function getSupabaseProjectLogs(
 ): Promise<SupabaseProjectLogsResponse> {
   const supabase = await getSupabaseClient({ organizationSlug });
 
-  // Build SQL query with optional timestamp filter
-  let sqlQuery = `
+  // The unified endpoint is ClickHouse-backed. The time range is applied by
+  // the API parameters below, while the SQL scopes the unified stream to Edge
+  // Function runtime logs.
+  const sqlQuery = `
 SELECT 
   timestamp,
   event_message,
-  metadata
-FROM function_logs`;
-
-  if (timestampStart) {
-    // Convert milliseconds to microseconds and wrap in TIMESTAMP_MICROS for BigQuery
-    sqlQuery += `\nWHERE timestamp > TIMESTAMP_MICROS(${timestampStart * 1000})`;
-  }
-
-  sqlQuery += `\nORDER BY timestamp ASC
+  severity_text
+FROM logs
+WHERE source = 'function_logs'
+ORDER BY timestamp ASC
 LIMIT 1000`;
 
   // Calculate time range for API parameters
@@ -574,7 +926,7 @@ LIMIT 1000`;
   // Encode SQL query for URL
   const encodedSql = encodeURIComponent(sqlQuery);
 
-  const url = `https://api.supabase.com/v1/projects/${projectId}/analytics/endpoints/logs.all?sql=${encodedSql}&iso_timestamp_start=${isoTimestampStart}&iso_timestamp_end=${isoTimestampEnd}`;
+  const url = `https://api.supabase.com/v1/projects/${projectId}/analytics/endpoints/logs?sql=${encodedSql}&iso_timestamp_start=${isoTimestampStart}&iso_timestamp_end=${isoTimestampEnd}`;
 
   logger.info(`Fetching logs from: ${url}`);
 
@@ -598,20 +950,47 @@ LIMIT 1000`;
     );
   }
 
-  const jsonResponse: SupabaseProjectLogsResponse = await response.json();
-  logger.info(`Received ${jsonResponse.result?.length || 0} logs`);
+  const parsed = SupabaseProjectLogsApiResponseSchema.safeParse(
+    await response.json(),
+  );
+  if (!parsed.success) {
+    throw new DyadError(
+      `Supabase returned an unexpected logs response for project ${projectId}: ${parsed.error.message}`,
+      DyadErrorKind.External,
+    );
+  }
 
-  return jsonResponse;
+  const result = (parsed.data.result ?? []).map((logEntry) => {
+    const timestamp = parseSupabaseLogTimestamp(logEntry.timestamp);
+    if (!Number.isFinite(timestamp)) {
+      throw new DyadError(
+        `Supabase returned an invalid log timestamp for project ${projectId}`,
+        DyadErrorKind.External,
+      );
+    }
+
+    return {
+      timestamp,
+      event_message: logEntry.event_message,
+      level: normalizeSupabaseLogLevel(logEntry.severity_text),
+    };
+  });
+
+  logger.info(`Received ${result.length} logs`);
+
+  return { result, error: parsed.data.error };
 }
 
 export async function executeSupabaseSql({
   supabaseProjectId,
   query,
   organizationSlug,
+  signal,
 }: {
   supabaseProjectId: string;
   query: string;
   organizationSlug: string | null;
+  signal?: AbortSignal;
 }): Promise<string> {
   if (IS_TEST_BUILD) {
     return "{}";
@@ -619,29 +998,80 @@ export async function executeSupabaseSql({
 
   const supabase = await getSupabaseClient({ organizationSlug });
   const result = await retryWithRateLimit(
-    () => supabase.runQuery(supabaseProjectId, query),
+    async () => {
+      const { data, response } = await supabase.client.post(
+        "/v1/projects/{ref}/database/query",
+        {
+          params: { path: { ref: supabaseProjectId } },
+          body: { query },
+          signal,
+        },
+      );
+      if (response.status !== 200 && response.status !== 201)
+        throw await createResponseError(response, "run query");
+      return data;
+    },
     `Execute SQL on ${supabaseProjectId}`,
+    { signal },
   );
   return JSON.stringify(result);
 }
 
 export async function deleteSupabaseFunction({
+  appId,
   supabaseProjectId,
   functionName,
   organizationSlug,
+  signal: callerSignal,
 }: {
+  appId?: number;
   supabaseProjectId: string;
   functionName: string;
   organizationSlug: string | null;
+  signal?: AbortSignal;
 }): Promise<void> {
+  if (appId !== undefined) {
+    return withSupabaseFunctionDeployment(
+      {
+        appId,
+        supabaseProjectId,
+        signal: callerSignal,
+        sync: { organizationSlug, functionNames: [functionName] },
+      },
+      async (context) => {
+        context.releaseResources(["repository", "provider"]);
+        return deleteSupabaseFunction({
+          supabaseProjectId,
+          functionName,
+          organizationSlug,
+          signal: callerSignal,
+        });
+      },
+    );
+  }
   logger.info(
     `Deleting Supabase function: ${functionName} from project: ${supabaseProjectId}`,
   );
-  const supabase = await getSupabaseClient({ organizationSlug });
-  await retryWithRateLimit(
-    () => supabase.deleteFunction(supabaseProjectId, functionName),
-    `Delete function ${functionName}`,
+  callerSignal?.throwIfAborted();
+  const supabase = await abortable(
+    getSupabaseClient({ organizationSlug }),
+    deploymentSignal(callerSignal),
   );
+  callerSignal?.throwIfAborted();
+  const response = await fetchWithRetry(
+    `https://api.supabase.com/v1/projects/${encodeURIComponent(supabaseProjectId)}/functions/${encodeURIComponent(functionName)}`,
+    {
+      method: "DELETE",
+      headers: {
+        Authorization: `Bearer ${(supabase as any).options.accessToken}`,
+      },
+      signal: callerSignal,
+    },
+    `Delete function ${functionName}`,
+    { attemptTimeoutMs: SUPABASE_DEPLOY_REQUEST_TIMEOUT_MS },
+  );
+  if (!response.ok)
+    throw await createResponseError(response, "delete function");
   logger.info(
     `Deleted Supabase function: ${functionName} from project: ${supabaseProjectId}`,
   );
@@ -650,26 +1080,35 @@ export async function deleteSupabaseFunction({
 export async function listSupabaseFunctions({
   supabaseProjectId,
   organizationSlug,
+  signal: callerSignal,
 }: {
   supabaseProjectId: string;
   organizationSlug: string | null;
+  signal?: AbortSignal;
 }): Promise<DeployedFunctionResponse[]> {
   if (IS_TEST_BUILD) {
     return [];
   }
 
   logger.info(`Listing Supabase functions for project: ${supabaseProjectId}`);
-  const supabase = await getSupabaseClient({ organizationSlug });
+  callerSignal?.throwIfAborted();
+  const supabase = await abortable(
+    getSupabaseClient({ organizationSlug }),
+    deploymentSignal(callerSignal),
+  );
+  callerSignal?.throwIfAborted();
 
   const response = await fetchWithRetry(
     `https://api.supabase.com/v1/projects/${supabaseProjectId}/functions`,
     {
       method: "GET",
+      signal: callerSignal,
       headers: {
         Authorization: `Bearer ${(supabase as any).options.accessToken}`,
       },
     },
     `List Supabase functions for ${supabaseProjectId}`,
+    { attemptTimeoutMs: SUPABASE_DEPLOY_REQUEST_TIMEOUT_MS },
   );
 
   if (response.status !== 200) {
@@ -681,6 +1120,120 @@ export async function listSupabaseFunctions({
     `Found ${functions.length} functions for project: ${supabaseProjectId}`,
   );
   return functions;
+}
+
+export interface CreatedSupabaseProjectResponse {
+  id: string;
+  name: string;
+  region: string;
+  organizationSlug: string;
+  status: string | null;
+}
+
+/**
+ * Generated and deliberately never surfaced or stored: Dyad reaches projects
+ * through the Management API and their API keys, so nothing needs it, and
+ * holding a Postgres superuser password would be a liability. Users reset it
+ * from the Supabase dashboard for direct access.
+ */
+function generateDatabasePassword(): string {
+  // Base64url of 24 random bytes: 32 chars, no characters Supabase's connection
+  // strings would need escaped.
+  return crypto.randomBytes(24).toString("base64url");
+}
+
+/**
+ * Creates a project in a connected organization. It comes back `COMING_UP` and
+ * its database refuses connections for a minute or two, so the returned status
+ * is worth logging even though nothing gates on it yet.
+ */
+export async function createSupabaseProject({
+  name,
+  organizationSlug,
+  region,
+}: {
+  name: string;
+  organizationSlug: string;
+  region: string;
+}): Promise<CreatedSupabaseProjectResponse> {
+  // Every outbound call in this module is guarded the same way: a test build
+  // installs real-looking credentials, so without this the create form would
+  // POST to the live API from CI. No E2E drives it yet, which is why the fake
+  // id is distinct from the one the project list and connect flow return.
+  if (IS_TEST_BUILD) {
+    return {
+      id: "fake-created-project-id",
+      name,
+      region,
+      organizationSlug,
+      status: "ACTIVE_HEALTHY",
+    };
+  }
+
+  logger.info(
+    `Creating Supabase project "${name}" in organization ${organizationSlug} (${region})`,
+  );
+  const supabase = await getSupabaseClientForOrganization(organizationSlug);
+
+  const response = await fetchWithRetry(
+    "https://api.supabase.com/v1/projects",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${(supabase as any).options.accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        name,
+        organization_id: organizationSlug,
+        region,
+        db_pass: generateDatabasePassword(),
+      }),
+    },
+    `Create Supabase project ${name}`,
+  );
+
+  // Not `SupabaseManagementAPI.createProject()`: it discards the response body
+  // on failure, and the body is where Supabase explains the failures users
+  // actually hit — project limit reached, quota exhausted, name rejected.
+  if (response.status !== 201 && response.status !== 200) {
+    throw await createResponseError(response, "create project");
+  }
+
+  // A 2xx says Supabase accepted the create, so a real project probably exists
+  // whether the body is unreadable or merely missing the ref. Both are marked
+  // like the link failure, so callers warn the user rather than inviting them
+  // to create another.
+  let project:
+    | { id?: string; name?: string; region?: string; status?: string }
+    | undefined;
+  try {
+    project = await response.json();
+  } catch (error) {
+    project = undefined;
+    logger.error("Supabase returned an unreadable create response", error);
+  }
+  if (!project?.id) {
+    const unnamed = new DyadError(
+      `Supabase created a project but returned no project ref: ${JSON.stringify(project)}`,
+      DyadErrorKind.External,
+    );
+    (unnamed as DyadError & { code: string }).code =
+      SUPABASE_PROJECT_CREATED_BUT_UNLINKED;
+    throw unnamed;
+  }
+
+  logger.info(`Created Supabase project ${project.id} ("${project.name}")`);
+  return {
+    id: project.id,
+    name: project.name ?? name,
+    region: project.region ?? region,
+    // The slug we sent, not the one echoed back under `organization_id`.
+    // Credentials are keyed by slug, so storing a canonical id would make every
+    // later call fail with "organization not found" at an authenticated user.
+    organizationSlug,
+    status: project.status ?? null,
+  };
 }
 
 export async function listSupabaseBranches({
@@ -749,26 +1302,66 @@ export async function listSupabaseBranches({
 // ─────────────────────────────────────────────────────────────────────
 
 export async function deploySupabaseFunction({
+  appId,
   supabaseProjectId,
   functionName,
   appPath,
   bundleOnly = false,
   organizationSlug,
+  snapshot,
+  signal,
 }: {
+  appId?: number;
   supabaseProjectId: string;
   functionName: string;
   appPath: string;
   bundleOnly?: boolean;
   organizationSlug: string | null;
+  snapshot?: SupabaseFunctionSnapshot;
+  signal?: AbortSignal;
 }): Promise<DeployedFunctionResponse> {
-  return enqueueSupabaseDeploy(supabaseProjectId, bundleOnly, () =>
-    deploySupabaseFunctionUnqueued({
-      supabaseProjectId,
-      functionName,
-      appPath,
-      bundleOnly,
-      organizationSlug,
-    }),
+  if (appId !== undefined) {
+    return withSupabaseFunctionDeployment(
+      {
+        appId,
+        supabaseProjectId,
+        signal,
+        sync: { organizationSlug, functionNames: [functionName] },
+      },
+      async (context, currentAppPath) => {
+        const captured =
+          snapshot ??
+          (await captureSupabaseFunction({
+            appPath: currentAppPath,
+            functionName,
+          }));
+        context.releaseResources(["repository", "provider"]);
+        return deploySupabaseFunction({
+          supabaseProjectId,
+          functionName,
+          appPath: currentAppPath,
+          organizationSlug,
+          bundleOnly,
+          snapshot: captured,
+          signal,
+        });
+      },
+    );
+  }
+  return enqueueSupabaseDeploy(
+    supabaseProjectId,
+    bundleOnly,
+    () =>
+      deploySupabaseFunctionUnqueued({
+        supabaseProjectId,
+        functionName,
+        appPath,
+        bundleOnly,
+        organizationSlug,
+        snapshot,
+        signal,
+      }),
+    signal,
   );
 }
 
@@ -778,51 +1371,26 @@ async function deploySupabaseFunctionUnqueued({
   appPath,
   bundleOnly = false,
   organizationSlug,
+  snapshot,
+  signal,
 }: {
   supabaseProjectId: string;
   functionName: string;
   appPath: string;
   bundleOnly?: boolean;
   organizationSlug: string | null;
+  snapshot?: SupabaseFunctionSnapshot;
+  signal?: AbortSignal;
 }): Promise<DeployedFunctionResponse> {
   logger.info(
     `Deploying Supabase function: ${functionName} to project: ${supabaseProjectId}`,
   );
 
-  const functionPath = path.join(
-    appPath,
-    "supabase",
-    "functions",
-    functionName,
-  );
-
-  // 1) Collect function files
-  const functionFiles = await collectFunctionFiles({
-    functionPath,
-    functionName,
-  });
-
-  // 2) Collect shared files (from supabase/functions/_shared/)
-  const sharedFiles = await getSharedFiles(appPath);
-
-  // 3) Combine all files
-  const filesToUpload = [...functionFiles.files, ...sharedFiles.files];
-
-  // 4) Create an import map next to the function entrypoint
-  const entrypointPath = functionFiles.entrypointPath;
-  const entryDir = path.posix.dirname(entrypointPath);
-  const importMapRelPath = path.posix.join(entryDir, "import_map.json");
-
-  const importMapObject = {
-    imports: {},
-  };
-
-  // Add the import map file into the upload list
-  filesToUpload.push({
-    relativePath: importMapRelPath,
-    content: Buffer.from(JSON.stringify(importMapObject, null, 2)),
-    date: new Date(),
-  });
+  signal?.throwIfAborted();
+  const captured =
+    snapshot ?? (await captureSupabaseFunction({ appPath, functionName }));
+  signal?.throwIfAborted();
+  const { files: filesToUpload, entrypointPath, importMapRelPath } = captured;
 
   if (IS_TEST_BUILD) {
     await new Promise((resolve) => setTimeout(resolve, 100));
@@ -838,7 +1406,10 @@ async function deploySupabaseFunctionUnqueued({
   }
 
   // 5) Prepare multipart form-data
-  const supabase = await getSupabaseClient({ organizationSlug });
+  const supabase = await abortable(
+    getSupabaseClient({ organizationSlug }),
+    deploymentSignal(signal),
+  );
   function buildFormData() {
     const formData = new FormData();
 
@@ -852,10 +1423,7 @@ async function deploySupabaseFunctionUnqueued({
     formData.append("metadata", JSON.stringify(metadata));
 
     for (const f of filesToUpload) {
-      const buf: Buffer = f.content;
-      const mime = guessMimeType(f.relativePath);
-      const blob = new Blob([new Uint8Array(buf)], { type: mime });
-      formData.append("file", blob, f.relativePath);
+      formData.append("file", f.content, f.relativePath);
     }
 
     return formData;
@@ -866,20 +1434,25 @@ async function deploySupabaseFunctionUnqueued({
     supabaseProjectId,
   )}/functions/deploy?slug=${encodeURIComponent(functionName)}${bundleOnly ? "&bundleOnly=true" : ""}`;
 
-  const response = await retryWithRateLimit(async () => {
-    const res = await fetch(deployUrl, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${(supabase as any).options.accessToken}`,
-      },
-      // Safer to rebuild form data each time.
-      body: buildFormData(),
-    });
-    if (res.status === 429) {
-      throw new RateLimitError(`Rate limited (429): ${res.statusText}`, res);
-    }
-    return res;
-  }, `Deploy Supabase function ${functionName}`);
+  const response = await retryWithRateLimit(
+    async () => {
+      const res = await fetch(deployUrl, {
+        method: "POST",
+        signal: deploymentSignal(signal),
+        headers: {
+          Authorization: `Bearer ${(supabase as any).options.accessToken}`,
+        },
+        // Safer to rebuild form data each time.
+        body: buildFormData(),
+      });
+      if (res.status === 429) {
+        throw new RateLimitError(`Rate limited (429): ${res.statusText}`, res);
+      }
+      return res;
+    },
+    `Deploy Supabase function ${functionName}`,
+    { signal },
+  );
 
   if (response.status !== 201) {
     throw await createResponseError(response, "create function");
@@ -898,17 +1471,24 @@ export async function bulkUpdateFunctions({
   supabaseProjectId,
   functions,
   organizationSlug,
+  signal,
 }: {
   supabaseProjectId: string;
   functions: DeployedFunctionResponse[];
   organizationSlug: string | null;
+  signal?: AbortSignal;
 }): Promise<void> {
-  return enqueueSupabaseDeploy(supabaseProjectId, false, () =>
-    bulkUpdateFunctionsUnqueued({
-      supabaseProjectId,
-      functions,
-      organizationSlug,
-    }),
+  return enqueueSupabaseDeploy(
+    supabaseProjectId,
+    false,
+    () =>
+      bulkUpdateFunctionsUnqueued({
+        supabaseProjectId,
+        functions,
+        organizationSlug,
+        signal,
+      }),
+    signal,
   );
 }
 
@@ -916,10 +1496,12 @@ async function bulkUpdateFunctionsUnqueued({
   supabaseProjectId,
   functions,
   organizationSlug,
+  signal,
 }: {
   supabaseProjectId: string;
   functions: DeployedFunctionResponse[];
   organizationSlug: string | null;
+  signal?: AbortSignal;
 }): Promise<void> {
   logger.info(
     `Bulk updating ${functions.length} functions for project: ${supabaseProjectId}`,
@@ -932,12 +1514,18 @@ async function bulkUpdateFunctionsUnqueued({
     return;
   }
 
-  const supabase = await getSupabaseClient({ organizationSlug });
+  signal?.throwIfAborted();
+  const supabase = await abortable(
+    getSupabaseClient({ organizationSlug }),
+    deploymentSignal(signal),
+  );
+  signal?.throwIfAborted();
 
   const response = await fetchWithRetry(
     `https://api.supabase.com/v1/projects/${encodeURIComponent(supabaseProjectId)}/functions`,
     {
       method: "PUT",
+      signal,
       headers: {
         Authorization: `Bearer ${(supabase as any).options.accessToken}`,
         "Content-Type": "application/json",
@@ -945,6 +1533,7 @@ async function bulkUpdateFunctionsUnqueued({
       body: JSON.stringify(functions),
     },
     `Bulk update functions for ${supabaseProjectId}`,
+    { attemptTimeoutMs: SUPABASE_DEPLOY_REQUEST_TIMEOUT_MS },
   );
 
   if (response.status !== 200) {
@@ -959,6 +1548,61 @@ async function bulkUpdateFunctionsUnqueued({
 // ─────────────────────────────────────────────────────────────────────
 // File collection helpers
 // ─────────────────────────────────────────────────────────────────────
+
+/** Capture shared bytes once per batch; Blob contents cannot be mutated. */
+export async function captureSupabaseSharedFiles(
+  appPath: string,
+): Promise<readonly SupabaseUploadFile[]> {
+  const shared = await getSharedFiles(appPath);
+  return Object.freeze(shared.files.map(toUploadFile));
+}
+
+function toUploadFile(file: ZipFileEntry): SupabaseUploadFile {
+  return Object.freeze({
+    relativePath: file.relativePath,
+    // Blob copies the bytes; fs.readFile buffers are never SharedArrayBuffer
+    // backed, so skip the intermediate Uint8Array copy.
+    content: new Blob([file.content as Uint8Array<ArrayBuffer>], {
+      type: guessMimeType(file.relativePath),
+    }),
+  });
+}
+
+/** No upload/retry may read the live filesystem after this returns. */
+export async function captureSupabaseFunction({
+  appPath,
+  functionName,
+  sharedFiles,
+}: {
+  appPath: string;
+  functionName: string;
+  sharedFiles?: readonly SupabaseUploadFile[];
+}): Promise<SupabaseFunctionSnapshot> {
+  const functionFiles = await collectFunctionFiles({
+    functionPath: path.join(appPath, "supabase", "functions", functionName),
+    functionName,
+  });
+  const shared = sharedFiles ?? (await captureSupabaseSharedFiles(appPath));
+  const entrypointPath = functionFiles.entrypointPath;
+  const importMapRelPath = path.posix.join(
+    path.posix.dirname(entrypointPath),
+    "import_map.json",
+  );
+  return Object.freeze({
+    entrypointPath,
+    importMapRelPath,
+    files: Object.freeze([
+      ...functionFiles.files.map(toUploadFile),
+      ...shared,
+      Object.freeze({
+        relativePath: importMapRelPath,
+        content: new Blob([JSON.stringify({ imports: {} }, null, 2)], {
+          type: "application/json",
+        }),
+      }),
+    ]),
+  });
+}
 
 async function collectFunctionFiles({
   functionPath,
@@ -1158,6 +1802,35 @@ function guessMimeType(filePath: string): string {
 // ─────────────────────────────────────────────────────────────────────
 // Error handling helpers
 // ─────────────────────────────────────────────────────────────────────
+
+/**
+ * Classify a Management API failure before it crosses the IPC boundary.
+ *
+ * Existing `DyadError`s pass through with their kind intact. A 401/403 means the
+ * organization's token was revoked or no longer has access to the project — an
+ * auth/setup problem the user fixes by reconnecting, so it must reach the
+ * renderer as `Auth` rather than as an unclassified product exception (see
+ * `rules/dyad-errors.md`).
+ */
+export function classifyManagementApiError(
+  error: unknown,
+  action: string,
+): unknown {
+  if (isDyadError(error)) {
+    return error;
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  if (
+    error instanceof SupabaseManagementAPIError &&
+    (error.response.status === 401 || error.response.status === 403)
+  ) {
+    return new DyadError(
+      `Supabase would not authorize Dyad to ${action}. Reconnect your Supabase account in Settings, or check that this organization still has access to the project. Original error: ${message}`,
+      DyadErrorKind.Auth,
+    );
+  }
+  return error;
+}
 
 async function createResponseError(response: Response, action: string) {
   const errorBody = await safeParseErrorResponseBody(response);

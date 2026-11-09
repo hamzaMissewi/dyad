@@ -1,10 +1,5 @@
 import { ipc } from "@/ipc/types";
 import type { Message } from "@/ipc/types";
-import type { getDefaultStore } from "jotai";
-import {
-  isStreamingByIdAtom,
-  chatStreamCountByIdAtom,
-} from "@/atoms/chatAtoms";
 
 const pendingResyncChatIds = new Set<number>();
 
@@ -46,20 +41,20 @@ type SetMessagesById = (
  * Fetches the latest DB snapshot for a chat and writes it into the atom.
  * Used in onEnd and onError handlers as an authoritative final sync.
  * Skips the write if a new stream has become active while the fetch was
- * in-flight (checked via store.get to read the live atom state).
+ * in-flight (checked through the injected machine-status reader).
  */
 export function syncChatFromDb(
   chatId: number,
   setMessagesById: SetMessagesById,
   label: string,
-  store: ReturnType<typeof getDefaultStore>,
+  getIsStreaming: (chatId: number) => boolean,
 ): void {
   ipc.chat
     .getChat(chatId)
     .then((chat) => {
       // A new stream may have started while getChat was in flight; bail out to
       // avoid overwriting its in-progress or placeholder messages.
-      if (store.get(isStreamingByIdAtom).get(chatId) === true) return;
+      if (getIsStreaming(chatId)) return;
       setMessagesById((prev) => {
         const currentMessages = prev.get(chatId);
         if (!currentMessages) {
@@ -91,14 +86,10 @@ export function syncChatFromDb(
 export function triggerResync(
   chatId: number,
   setMessagesById: SetMessagesById,
-  store: ReturnType<typeof getDefaultStore>,
+  isStale: () => boolean,
 ): void {
   if (pendingResyncChatIds.has(chatId)) return;
   pendingResyncChatIds.add(chatId);
-
-  // Snapshot the stream generation so we can detect if a new stream starts
-  // before the fetch resolves and skip the stale write.
-  const streamGenAtStart = store.get(chatStreamCountByIdAtom).get(chatId) ?? 0;
 
   let timeoutId: ReturnType<typeof setTimeout>;
   const fetchWithTimeout = Promise.race([
@@ -114,12 +105,8 @@ export function triggerResync(
 
   fetchWithTimeout
     .then((chat) => {
-      // A different stream started while the fetch was in flight; skip.
-      if (
-        (store.get(chatStreamCountByIdAtom).get(chatId) ?? 0) !==
-        streamGenAtStart
-      )
-        return;
+      // The owning stream generation changed while the fetch was in flight.
+      if (isStale()) return;
       setMessagesById((prev) => {
         const prevMessages = prev.get(chatId);
         // A newer stream added messages while the fetch was in flight; skip.

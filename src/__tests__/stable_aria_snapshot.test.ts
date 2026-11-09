@@ -2,6 +2,16 @@ import { describe, expect, it } from "vitest";
 import { normalizeMessagesAriaSnapshot } from "../../e2e-tests/helpers/utils/stable-aria-snapshot";
 
 describe("normalizeMessagesAriaSnapshot", () => {
+  it("normalizes app preview IDs and ports without changing paths, idempotently", () => {
+    const normalized = normalizeMessagesAriaSnapshot(
+      '- link "http://app-12345.localhost:52123/auth?next=%2F":\n  - /url: http://app-12345.localhost:52123/auth?next=%2F\n',
+    );
+    expect(normalized).toBe(
+      '- link "http://app-[[id]].localhost:[[port]]/auth?next=%2F":\n  - /url: http://app-[[id]].localhost:[[port]]/auth?next=%2F\n',
+    );
+    expect(normalizeMessagesAriaSnapshot(normalized)).toBe(normalized);
+  });
+
   it("elides button descendants while preserving accessible names", () => {
     expect(
       normalizeMessagesAriaSnapshot(`- button "Copy Request ID":
@@ -26,6 +36,20 @@ describe("normalizeMessagesAriaSnapshot", () => {
         `- button "Script Call calculator_add through MCP 12ms"\n`,
       ),
     ).toBe(`- button "Script Call calculator_add through MCP [[duration]]"\n`);
+  });
+
+  it("normalizes generated pnpm lockfile diff stats", () => {
+    expect(
+      normalizeMessagesAriaSnapshot(`- button "M pnpm-lock.yaml +557 -5"\n`),
+    ).toBe(`- button "M pnpm-lock.yaml [[diff-stats]]"\n`);
+  });
+
+  it("drops environment-dependent source file diff buttons", () => {
+    expect(
+      normalizeMessagesAriaSnapshot(
+        `- button "M src/pages/Index.tsx +8 -15"\n`,
+      ),
+    ).toBe("\n");
   });
 
   it("elides nested button-card descendants", () => {
@@ -86,6 +110,25 @@ describe("normalizeMessagesAriaSnapshot", () => {
     ).toBe(`- text: "[[Version 2: files changed]]"
 - text: "[[Version 3: files changed]]"
 - text: "[[Version 4: files changed]]"
+`);
+  });
+
+  it("optionally normalizes version numbers", () => {
+    expect(
+      normalizeMessagesAriaSnapshot(
+        '- text: "Version 4: (6 files changed)"\n',
+        { normalizeVersionNumbers: true },
+      ),
+    ).toBe('- text: "[[Version *: files changed]]"\n');
+  });
+
+  it("normalizes localhost ports in links", () => {
+    expect(
+      normalizeMessagesAriaSnapshot(`- link "http://localhost:42101/src/pages/Index.tsx:6:6":
+  - /url: http://localhost:42101/src/pages/Index.tsx:6:6
+`),
+    ).toBe(`- link "http://localhost:[[port]]/src/pages/Index.tsx:6:6":
+  - /url: http://localhost:[[port]]/src/pages/Index.tsx:6:6
 `);
   });
 

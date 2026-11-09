@@ -41,8 +41,26 @@ describe("classifyMcpToolConsent", () => {
     const d = await classifyMcpToolConsent(baseInput);
     expect(d.decision).toBe("allow");
     expect(d.reason).toBe("safe read");
+    expect(mocks.getModelClient).toHaveBeenCalledWith(
+      { name: "gpt-6-luna", provider: "openai" },
+      baseInput.settings,
+    );
   });
 
+  it("uses the engine helper model for BYO consent classification", async () => {
+    withText('{"reason":"safe read","decision":"allow"}');
+    const settings = {
+      enableDyadPro: true,
+      providerSettings: { auto: { apiKey: { value: "pro-key" } } },
+      proModelUsage: "api-key",
+      selectedModel: { provider: "anthropic", name: "chosen-model" },
+    };
+    await classifyMcpToolConsent({ ...baseInput, settings: settings as any });
+    expect(mocks.getModelClient).toHaveBeenCalledWith(
+      { provider: "openai", name: "gpt-6-luna" },
+      { ...settings, proModelUsage: "pro" },
+    );
+  });
   it("parses a decision wrapped in prose/code fences", async () => {
     withText('Here:\n```json\n{"reason":"x","decision":"ask"}\n```');
     const d = await classifyMcpToolConsent(baseInput);

@@ -14,6 +14,7 @@ const MediaFileSchema = z.object({
   appId: z.number(),
   appName: z.string(),
   sizeBytes: z.number(),
+  modifiedAtMs: z.number(),
   mimeType: z.string(),
 });
 
@@ -40,6 +41,11 @@ export const RenameMediaFileParamsSchema = z.object({
 });
 
 export const DeleteMediaFileParamsSchema = z.object({
+  appId: z.number(),
+  fileName: z.string(),
+});
+
+export const OpenMediaFileParamsSchema = z.object({
   appId: z.number(),
   fileName: z.string(),
 });
@@ -73,6 +79,12 @@ export const mediaContracts = {
     output: z.void(),
   }),
 
+  openMediaFile: defineContract({
+    channel: "open-media-file",
+    input: OpenMediaFileParamsSchema,
+    output: z.void(),
+  }),
+
   moveMediaFile: defineContract({
     channel: "move-media-file",
     input: MoveMediaFileParamsSchema,
@@ -92,4 +104,5 @@ export const mediaClient = createClient(mediaContracts);
 
 export type RenameMediaFileParams = z.infer<typeof RenameMediaFileParamsSchema>;
 export type DeleteMediaFileParams = z.infer<typeof DeleteMediaFileParamsSchema>;
+export type OpenMediaFileParams = z.infer<typeof OpenMediaFileParamsSchema>;
 export type MoveMediaFileParams = z.infer<typeof MoveMediaFileParamsSchema>;

@@ -10,29 +10,19 @@ import {
   TooltipTrigger,
   TooltipContent,
 } from "@/components/ui/tooltip";
-import { useSettings } from "@/hooks/useSettings";
 import { useChatMode } from "@/hooks/useChatMode";
 import { useFreeAgentQuota } from "@/hooks/useFreeAgentQuota";
-import { useMcp } from "@/hooks/useMcp";
 import type { ChatMode } from "@/lib/schemas";
 import { isDyadProEnabled } from "@/lib/schemas";
-import {
-  getChatModeFallbackToastId,
-  getChatModeDisplayName,
-  showChatModeFallbackToast,
-} from "@/lib/chatModeToast";
+import { getChatModeDisplayName } from "@/lib/chatModeToast";
 import { cn } from "@/lib/utils";
 import { detectIsMac } from "@/hooks/useChatModeToggle";
 import { useRouterState } from "@tanstack/react-router";
 import { toast } from "sonner";
-import { LocalAgentNewChatToast } from "./LocalAgentNewChatToast";
-import { useAtomValue, useSetAtom } from "jotai";
-import {
-  chatMessagesByIdAtom,
-  hasManuallySelectedChatModeAtom,
-} from "@/atoms/chatAtoms";
+import { useSetAtom } from "jotai";
+import { hasManuallySelectedChatModeAtom } from "@/atoms/chatAtoms";
 import { Hammer, Bot, MessageCircle, Lightbulb } from "lucide-react";
-import { useEffect, useRef } from "react";
+import { useEffect } from "react";
 import {
   FREE_PRO_MODEL_FALLBACK_CHAT_MODE,
   isFreeProBuildModeCombination,
@@ -40,70 +30,38 @@ import {
 } from "@/lib/freeProModel";
 
 export function ChatModeSelector() {
-  const { updateSettings } = useSettings();
   const routerState = useRouterState();
   const isChatRoute = routerState.location.pathname === "/chat";
-  const messagesById = useAtomValue(chatMessagesByIdAtom);
   const chatId = routerState.location.search.id as number | undefined;
-  const currentChatMessages = chatId ? (messagesById.get(chatId) ?? []) : [];
-  const {
-    selectedMode,
-    effectiveMode,
-    storedChatMode,
-    fallbackReason,
-    setChatMode,
-    settings,
-  } = useChatMode(isChatRoute ? chatId : null);
+  const { selectedMode, storedChatMode, selectedModel, setChatMode, settings } =
+    useChatMode(isChatRoute ? chatId : null);
   const setHasManuallySelectedChatMode = useSetAtom(
     hasManuallySelectedChatModeAtom,
   );
-  const fallbackToastKeyRef = useRef<string | null>(null);
-
   const isProEnabled = settings ? isDyadProEnabled(settings) : false;
+  const isSubscription = selectedModel?.provider === "claude-code";
   const { messagesRemaining, messagesLimit, isQuotaExceeded } =
     useFreeAgentQuota();
-  const { servers } = useMcp();
-  const enabledMcpServersCount = servers.filter((s) => s.enabled).length;
-  const isDyadFreeSelected = isFreeProModel(settings?.selectedModel);
+  const isDyadFreeSelected = isFreeProModel(selectedModel);
   const buildUnavailableForDyadFree = isDyadFreeSelected;
-
-  useEffect(() => {
-    if (!chatId || !fallbackReason || !storedChatMode) {
-      fallbackToastKeyRef.current = null;
-      return;
-    }
-
-    const toastKey = getChatModeFallbackToastId({
-      chatId,
-      reason: fallbackReason,
-      effectiveMode,
-    });
-    if (fallbackToastKeyRef.current === toastKey) {
-      return;
-    }
-
-    fallbackToastKeyRef.current = toastKey;
-    showChatModeFallbackToast({
-      effectiveMode,
-      isPro: isProEnabled,
-      toastId: toastKey,
-    });
-  }, [chatId, effectiveMode, fallbackReason, isProEnabled, storedChatMode]);
 
   useEffect(() => {
     if (
       settings &&
-      isFreeProBuildModeCombination(settings.selectedModel, selectedMode)
+      storedChatMode === "build" &&
+      selectedModel &&
+      isFreeProBuildModeCombination(selectedModel, selectedMode)
     ) {
       void setChatMode(FREE_PRO_MODEL_FALLBACK_CHAT_MODE).catch(() => {});
     }
-  }, [selectedMode, setChatMode, settings]);
+  }, [selectedMode, selectedModel, setChatMode, settings, storedChatMode]);
 
   const handleModeChange = (value: string) => {
     const newMode = value as ChatMode;
     if (
       settings &&
-      isFreeProBuildModeCombination(settings.selectedModel, newMode)
+      selectedModel &&
+      isFreeProBuildModeCombination(selectedModel, newMode)
     ) {
       toast.error("Dyad Free is not available in Build mode.");
       return;
@@ -114,36 +72,10 @@ export function ChatModeSelector() {
       setHasManuallySelectedChatMode(true);
     }
     void setChatMode(newMode).catch(() => {});
-
-    // We want to show a toast when user is switching to the new agent mode
-    // because they might weird results mixing Build and Agent mode in the same chat.
-    //
-    // Only show toast if:
-    // - User is switching to the new agent mode
-    // - User is on the chat (not home page) with existing messages
-    // - User has not explicitly disabled the toast
-    if (
-      newMode === "local-agent" &&
-      isChatRoute &&
-      currentChatMessages.length > 0 &&
-      !settings?.hideLocalAgentNewChatToast
-    ) {
-      toast.custom(
-        (t) => (
-          <LocalAgentNewChatToast
-            toastId={t}
-            onNeverShowAgain={() => {
-              updateSettings({ hideLocalAgentNewChatToast: true });
-            }}
-          />
-        ),
-        // Make the toast shorter in test mode for faster tests.
-        { duration: settings?.isTestMode ? 50 : 8000 },
-      );
-    }
   };
 
   const getModeDisplayName = (mode: ChatMode) => {
+    if (isSubscription && mode === "local-agent") return "Agent";
     return getChatModeDisplayName(mode, isProEnabled);
   };
 
@@ -201,12 +133,14 @@ export function ChatModeSelector() {
           </TooltipContent>
         </Tooltip>
         <SelectContent align="start">
-          {isProEnabled && (
+          {(isProEnabled || isSubscription) && (
             <SelectItem value="local-agent">
               <div className="flex flex-col items-start">
                 <div className="flex items-center gap-1.5">
                   <Bot size={14} className="text-muted-foreground" />
-                  <span className="font-medium">Agent v2</span>
+                  <span className="font-medium">
+                    {isSubscription ? "Claude Code agent" : "Agent v2"}
+                  </span>
                 </div>
                 <span className="text-xs text-muted-foreground ml-[22px]">
                   Better at bigger tasks and debugging
@@ -225,7 +159,7 @@ export function ChatModeSelector() {
               </span>
             </div>
           </SelectItem>
-          {!isProEnabled && (
+          {!isProEnabled && !isSubscription && (
             <SelectItem value="local-agent" disabled={isQuotaExceeded}>
               <div className="flex flex-col items-start">
                 <div className="flex items-center gap-1.5">
@@ -269,30 +203,6 @@ export function ChatModeSelector() {
           </SelectItem>
         </SelectContent>
       </Select>
-      {selectedMode === "build" && <McpChip count={enabledMcpServersCount} />}
     </div>
-  );
-}
-
-function McpChip({ count }: { count: number }) {
-  if (count === 0) return null;
-  return (
-    <Tooltip>
-      <TooltipTrigger
-        render={
-          <span
-            data-testid="mcp-servers-chip"
-            className="inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium bg-purple-100 text-purple-700 dark:bg-purple-900/40 dark:text-purple-400 border border-purple-200 dark:border-purple-800 cursor-default"
-          />
-        }
-      >
-        {count} MCP
-      </TooltipTrigger>
-      <TooltipContent>
-        <span>
-          {count} MCP server{count !== 1 ? "s" : ""} enabled
-        </span>
-      </TooltipContent>
-    </Tooltip>
   );
 }

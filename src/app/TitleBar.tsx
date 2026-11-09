@@ -1,9 +1,12 @@
+import { SubscriptionConnectionStatus } from "@/components/SubscriptionConnectionStatus";
+import { SystemResourceIndicator } from "@/components/SystemResourceIndicator";
 import { useAtom, useAtomValue } from "jotai";
 import { selectedAppIdAtom } from "@/atoms/appAtoms";
 import { useLoadApps } from "@/hooks/useLoadApps";
 import { useRouter } from "@tanstack/react-router";
 import { useSettings } from "@/hooks/useSettings";
 import { Button } from "@/components/ui/button";
+import { AppAvatar } from "@/components/AppAvatar";
 // @ts-ignore
 import logo from "../../assets/logo.svg";
 import { providerSettingsRoute } from "@/routes/settings/providers/$provider";
@@ -22,14 +25,20 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { ChatTabs } from "@/components/chat/ChatTabs";
-import { pendingFirstPromptAtom, selectedChatIdAtom } from "@/atoms/chatAtoms";
+import { selectedChatIdAtom } from "@/atoms/chatAtoms";
 import { useQueryClient } from "@tanstack/react-query";
 import { queryKeys } from "@/lib/queryKeys";
+import {
+  useFirstPromptProviderResume,
+  useFirstPromptSaga,
+} from "@/first_prompt/FirstPromptProvider";
+import type { UserSettings } from "@/lib/schemas";
 
 export const TitleBar = () => {
   const [selectedAppId] = useAtom(selectedAppIdAtom);
   const selectedChatId = useAtomValue(selectedChatIdAtom);
-  const shouldResumeFirstPrompt = useAtomValue(pendingFirstPromptAtom);
+  const { hasArmedPayload } = useFirstPromptSaga();
+  const resumeFirstPrompt = useFirstPromptProviderResume();
   const { apps } = useLoadApps();
   const { navigate } = useRouter();
   const { settings, refreshSettings } = useSettings();
@@ -45,8 +54,11 @@ export const TitleBar = () => {
         await refreshSettings();
         // Refetch user budget when Dyad Pro key is set via deep link
         queryClient.invalidateQueries({ queryKey: queryKeys.userBudget.info });
-        if (shouldResumeFirstPrompt) {
-          navigate({ to: "/", search: {}, replace: true });
+        if (hasArmedPayload) {
+          const refreshedSettings = queryClient.getQueryData<UserSettings>(
+            queryKeys.settings.user,
+          );
+          resumeFirstPrompt(refreshedSettings);
         } else {
           setIsSuccessDialogOpen(true);
         }
@@ -57,10 +69,10 @@ export const TitleBar = () => {
   }, [
     clearLastDeepLink,
     lastDeepLink,
-    navigate,
+    hasArmedPayload,
     queryClient,
     refreshSettings,
-    shouldResumeFirstPrompt,
+    resumeFirstPrompt,
   ]);
 
   const selectedApp = apps.find((app) => app.id === selectedAppId);
@@ -87,6 +99,8 @@ export const TitleBar = () => {
         <div className="flex items-center shrink-0">
           <div className={`${showWindowControls ? "pl-2" : "pl-18"}`}></div>
 
+          <img src={logo} alt="Dyad" className="ml-2 w-5 h-5 shrink-0" />
+
           <Tooltip>
             <TooltipTrigger
               render={
@@ -103,7 +117,7 @@ export const TitleBar = () => {
                   size="sm"
                   disabled={!selectedApp}
                   className={cn(
-                    "no-app-region-drag ml-2 h-7 px-1.5 gap-1.5 flex items-center font-medium text-xs",
+                    "no-app-region-drag ml-1.5 h-7 px-2 flex items-center font-medium text-xs",
                     selectedApp
                       ? "cursor-pointer"
                       : "opacity-70 cursor-default disabled:opacity-70",
@@ -112,9 +126,15 @@ export const TitleBar = () => {
                 />
               }
             >
-              <img src={logo} alt="Dyad" className="w-5 h-5 shrink-0" />
-              <span className="hidden @2xl:inline max-w-40 truncate">
-                Manage app
+              {selectedApp && (
+                <AppAvatar
+                  appId={selectedApp.id}
+                  name={selectedApp.name}
+                  className="h-4 w-4 rounded-sm text-[8px]"
+                />
+              )}
+              <span className="max-w-24 @2xl:max-w-40 truncate">
+                {displayText}
               </span>
             </TooltipTrigger>
             <TooltipContent>{displayText}</TooltipContent>
@@ -126,9 +146,11 @@ export const TitleBar = () => {
           <ChatTabs selectedChatId={selectedChatId} />
         </div>
 
+        <SystemResourceIndicator />
         {showWindowControls && <WindowsControls />}
       </div>
 
+      <SubscriptionConnectionStatus />
       <DyadProSuccessDialog
         isOpen={isSuccessDialogOpen}
         onClose={() => setIsSuccessDialogOpen(false)}

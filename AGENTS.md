@@ -8,30 +8,42 @@ Please read `CONTRIBUTING.md` which includes information for human code contribu
 
 Detailed rules and learnings are in the `rules/` directory. Read the relevant file when working in that area.
 
-| File                                                                 | Read when...                                                                                                                                                                   |
-| -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| [rules/electron-ipc.md](rules/electron-ipc.md)                       | Adding/modifying IPC endpoints, handlers, React Query hooks, or renderer-to-main communication                                                                                 |
-| [rules/dyad-errors.md](rules/dyad-errors.md)                         | Classifying IPC/main errors with `DyadError` / `DyadErrorKind` and PostHog exception filtering                                                                                 |
-| [rules/local-agent-tools.md](rules/local-agent-tools.md)             | Adding/modifying local agent tools, tool flags (`modifiesState`), or read-only/plan-only guards                                                                                |
-| [rules/e2e-testing.md](rules/e2e-testing.md)                         | Writing or debugging E2E tests (Playwright, Base UI radio clicks, Lexical editor, test fixtures)                                                                               |
-| [rules/hybrid-testing.md](rules/hybrid-testing.md)                   | Writing or debugging Vitest integration tests, especially renderer+IPC harness tests and fake Dyad Engine/Gateway routing                                                      |
-| [rules/git-workflow.md](rules/git-workflow.md)                       | Pushing branches, creating PRs, or dealing with fork/upstream remotes                                                                                                          |
-| [rules/base-ui-components.md](rules/base-ui-components.md)           | Using TooltipTrigger, ToggleGroupItem, or other Base UI wrapper components                                                                                                     |
-| [rules/database-drizzle.md](rules/database-drizzle.md)               | Modifying the database schema, generating migrations, or resolving migration conflicts                                                                                         |
-| [rules/native-modules.md](rules/native-modules.md)                   | Adding Electron native modules or binaries that must survive Forge packaging/rebuild                                                                                           |
-| [rules/typescript-strict-mode.md](rules/typescript-strict-mode.md)   | Debugging type errors from `npm run ts` (tsgo) that pass normal tsc                                                                                                            |
-| [rules/openai-reasoning-models.md](rules/openai-reasoning-models.md) | Working with OpenAI reasoning model (o1/o3/o4-mini) conversation history                                                                                                       |
-| [rules/prompt-guides.md](rules/prompt-guides.md)                     | Editing prompt guide Markdown under `src/prompts/guides/` or prompt assembly snapshots                                                                                         |
-| [rules/adding-settings.md](rules/adding-settings.md)                 | Adding a new user-facing setting or toggle to the Settings page                                                                                                                |
-| [rules/chat-mentions.md](rules/chat-mentions.md)                     | Modifying chat input mention parsing, `@app:` formatting, Lexical mention sync, or referenced app extraction                                                                   |
-| [rules/chat-message-indicators.md](rules/chat-message-indicators.md) | Using `<dyad-status>` tags in chat messages for system indicators                                                                                                              |
-| [rules/supabase-functions.md](rules/supabase-functions.md)           | Deploying, bundling, or queueing Supabase Edge Functions                                                                                                                       |
-| [rules/product-principles.md](rules/product-principles.md)           | Planning new features, especially via `dyad:swarm-to-plan`, to guide design trade-offs                                                                                         |
-| [rules/jotai-testing.md](rules/jotai-testing.md)                     | Unit-testing Jotai atoms/hooks with `renderHook`, especially across unmount/remount                                                                                            |
-| [rules/jotai-state.md](rules/jotai-state.md)                         | Adding or refactoring Jotai atoms, especially deciding React Query vs Jotai ownership, entity-keyed state, derived atoms, and async runtime state                              |
-| [rules/claude-github-workflows.md](rules/claude-github-workflows.md) | Editing `.github/workflows/*.yml` that invoke `anthropics/claude-code-action` — workflow shape, untrusted-input handling, and **permission/`.claude/settings.json` hardening** |
-| [rules/ui-styling.md](rules/ui-styling.md)                           | Adding provider/brand icons, styling scrollable popovers, or using Tailwind v4 arbitrary values                                                                                |
-| [rules/auto-update.md](rules/auto-update.md)                         | Debugging Squirrel/update-electron-app failures, update feed URLs, or updater log capture in bug reports and session debug bundles                                             |
+| File                                                                       | Read when...                                                                                                                                                                                                                              |
+| -------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [rules/electron-ipc.md](rules/electron-ipc.md)                             | Adding/modifying IPC endpoints, handlers, React Query hooks, or renderer-to-main communication                                                                                                                                            |
+| [rules/app-operation-coordination.md](rules/app-operation-coordination.md) | Adding/modifying main-process operations that coordinate app paths, runtime, Git, providers, chats, media, tests, or app deletion                                                                                                         |
+| [rules/dyad-errors.md](rules/dyad-errors.md)                               | Classifying IPC/main errors with `DyadError` / `DyadErrorKind` and PostHog exception filtering                                                                                                                                            |
+| [rules/local-agent-tools.md](rules/local-agent-tools.md)                   | Adding/modifying local agent tools, tool flags (`modifiesState`), or read-only/plan-only guards                                                                                                                                           |
+| [rules/e2e-testing.md](rules/e2e-testing.md)                               | Writing or debugging E2E tests (Playwright, Base UI radio clicks, Lexical editor, test fixtures)                                                                                                                                          |
+| [rules/hybrid-testing.md](rules/hybrid-testing.md)                         | Writing or debugging Vitest integration tests, especially renderer+IPC harness tests and fake Dyad Engine/Gateway routing                                                                                                                 |
+| [rules/git-workflow.md](rules/git-workflow.md)                             | Pushing branches, creating PRs, or dealing with fork/upstream remotes                                                                                                                                                                     |
+| [rules/base-ui-components.md](rules/base-ui-components.md)                 | Using TooltipTrigger, ToggleGroupItem, or other Base UI wrapper components                                                                                                                                                                |
+| [rules/database-drizzle.md](rules/database-drizzle.md)                     | Modifying the database schema, generating migrations, or resolving migration conflicts                                                                                                                                                    |
+| [rules/native-modules.md](rules/native-modules.md)                         | Adding Electron native modules or binaries that must survive Forge packaging/rebuild                                                                                                                                                      |
+| [rules/typescript-strict-mode.md](rules/typescript-strict-mode.md)         | Debugging type errors from `npm run ts` (tsgo) that pass normal tsc                                                                                                                                                                       |
+| [rules/openai-reasoning-models.md](rules/openai-reasoning-models.md)       | Working with OpenAI reasoning model (o1/o3/o4-mini) conversation history                                                                                                                                                                  |
+| [rules/prompt-guides.md](rules/prompt-guides.md)                           | Editing prompt guide Markdown under `src/prompts/guides/` or prompt assembly snapshots                                                                                                                                                    |
+| [rules/adding-settings.md](rules/adding-settings.md)                       | Adding a new user-facing setting or toggle to the Settings page                                                                                                                                                                           |
+| [rules/chat-mentions.md](rules/chat-mentions.md)                           | Modifying chat input mention parsing, `@app:` formatting, Lexical mention sync, or referenced app extraction                                                                                                                              |
+| [rules/chat-message-indicators.md](rules/chat-message-indicators.md)       | Using `<dyad-status>` tags in chat messages for system indicators                                                                                                                                                                         |
+| [rules/chat-modes.md](rules/chat-modes.md)                                 | Adding or modifying features that select, create, persist, or fall back between Agent, Build, Ask, and Plan modes                                                                                                                         |
+| [rules/supabase-functions.md](rules/supabase-functions.md)                 | Deploying, bundling, or queueing Supabase Edge Functions                                                                                                                                                                                  |
+| [rules/product-principles.md](rules/product-principles.md)                 | Planning new features, especially via `dyad:swarm-to-plan`, to guide design trade-offs                                                                                                                                                    |
+| [rules/jotai-testing.md](rules/jotai-testing.md)                           | Unit-testing Jotai atoms/hooks with `renderHook`, especially across unmount/remount                                                                                                                                                       |
+| [rules/jotai-state.md](rules/jotai-state.md)                               | Adding or refactoring Jotai atoms, especially deciding React Query vs Jotai ownership, entity-keyed state, derived atoms, and async runtime state                                                                                         |
+| [rules/claude-github-workflows.md](rules/claude-github-workflows.md)       | Editing `.github/workflows/*.yml` that invoke `anthropics/claude-code-action` — workflow shape, untrusted-input handling, and **permission/`.claude/settings.json` hardening**                                                            |
+| [rules/ui-styling.md](rules/ui-styling.md)                                 | Adding provider/brand icons, styling scrollable popovers, or using Tailwind v4 arbitrary values                                                                                                                                           |
+| [rules/auto-update.md](rules/auto-update.md)                               | Debugging Squirrel/update-electron-app failures, update feed URLs, or updater log capture in bug reports and session debug bundles                                                                                                        |
+| [rules/safe-storage.md](rules/safe-storage.md)                             | Working with Electron `safeStorage`, macOS Keychain identities, or legacy os_crypt secret recovery                                                                                                                                        |
+| [rules/electron-workers.md](rules/electron-workers.md)                     | Spawning `worker_threads`/`utilityProcess`, moving heavy computation off the main process, or diagnosing main-process memory usage and OOM crashes                                                                                        |
+| [rules/app-naming.md](rules/app-naming.md)                                 | Touching app display names, folder slugs, or flows that create/move app directories (create, copy, import, rename, blueprint approval, template apply)                                                                                    |
+| [rules/state-machines.md](rules/state-machines.md)                         | Adding or modifying explicit state machines, transition functions, controllers, command runners, keyed hosts, or renderer bindings                                                                                                        |
+| [rules/windows-spawn.md](rules/windows-spawn.md)                           | Spawning child processes with arguments on Windows — `.cmd` shim resolution and what `cmd.exe` quoting can and cannot contain — or deleting a worktree or other tree that may contain junctions                                           |
+| [rules/i18n.md](rules/i18n.md)                                             | Adding translation keys to `src/i18n/locales/*/chat.json` or building i18n-aware chat tool cards                                                                                                                                          |
+| [rules/model-effort-and-catalog.md](rules/model-effort-and-catalog.md)     | Sending reasoning effort or output-token limits to models via the engine, editing the remote model catalog, or debugging 400s / truncation from a provider (Gemini thought signatures, OpenRouter context limits, Anthropic 4096 default) |
+
+| [rules/claude-code-backend.md](rules/claude-code-backend.md) | Claude Code backend, model picker, subscription usage, and tool presentation |
+| [rules/user-app-test-isolation.md](rules/user-app-test-isolation.md) | Changing Tests-panel database isolation: Supabase test users, Neon test data cleanup, per-test lifecycle timeouts, or the generated fixture shim |
 
 ## Project setup and lints
 
@@ -47,17 +59,19 @@ npm run init-precommit
 
 When you create a new git worktree for this repository, run `npm install` inside the new worktree before starting development. Each worktree has its own working directory and needs its dependencies installed there.
 
+After installation, verify that `node_modules/.bin/oxfmt` exists before running formatting. If `npm install` reports success without materializing `node_modules`, run `npm ci`; otherwise `npx` may download an unpinned formatter and rewrite unrelated files.
+
+A worktree's `node_modules` can also be _sparsely_ populated — every package directory exists, so `npm install` exits 0 and repairs nothing, but files inside are missing (`Cannot find module '.../oxfmt/dist/cli.js'`, `oxlint/dist/cli.js`, or a dangling `.bin/tsgo` symlink). Deleting the broken package directories and rerunning `npm install` then aborts at the `better-sqlite3` native rebuild (`gyp ERR! not ok`) before any JS package is written. Use `npm install --ignore-scripts` to restore the JS toolchain; it skips the native rebuild, which `npm run fmt` / `lint` / `ts` do not need. If you subsequently need `npm run build`, run `npm rebuild dugite` first; otherwise Electron Forge packaging fails with `ENOENT: no such file or directory, lstat 'node_modules/dugite/git'`.
+
+After `npm install --ignore-scripts`, unit tests that import Electron or open a test database also need `npm rebuild electron better-sqlite3`; otherwise they fail with “Electron failed to install correctly” or “Could not locate the bindings file.”
+
+Also run `npm install` in `testing/fake-llm-server/` before `npm run ts` in a fresh worktree. Otherwise the root type-check reports missing declarations for that package's local `express` and `cors` dependencies.
+
+If you symlink a worktree's `node_modules` at a shared install instead of installing into it, see [rules/git-workflow.md](rules/git-workflow.md) for why `.gitignore` must keep listing `node_modules` without a trailing slash.
+
 ## Pre-commit checks
 
 RUN THE FOLLOWING CHECKS before you do a commit.
-
-If you have access to the `/dyad:lint` skill, use it to run all pre-commit checks automatically:
-
-```
-/dyad:lint
-```
-
-Otherwise, run the following commands directly:
 
 **Formatting**
 
@@ -78,6 +92,10 @@ npm run lint:fix
 ```
 
 > **WARNING: Do NOT run `npx eslint` directly.** The project uses **oxlint** (not eslint) via `npm run lint`. Running `npx eslint <file>` produces spurious `import/no-unresolved` errors for `@/...` path aliases and other false positives — ignore those and rely on `npm run lint` / `npm run lint:fix`.
+
+> **WARNING: Do NOT run `npx prettier --write` either.** Formatting is **oxfmt** via `npm run fmt` (check with `npm run fmt:check`). Prettier disagrees with oxfmt on operator/argument indentation, so it silently reformats untouched blocks in files you edited — `worker/dyad-recorder-client.js` picked up an unrelated 6-line hunk this way. `npm run fmt` reverts it, but only if you notice; check `git diff` for hunks you did not write.
+
+> **WARNING: Never run `npx oxlint --fix` or `npx oxfmt` before `node_modules` is installed.** Without the pinned local binary, `npx` downloads the _latest_ version, which can rewrite files repo-wide differently from the pinned version (observed: de-indented code blocks inside `e2e-tests/fixtures/*.md` and reflowed unrelated `src/` files). Use the lockfile-pinned `./node_modules/.bin/oxlint` / `./node_modules/.bin/oxfmt`, and check `git status` for collateral edits after any repo-wide `--fix` run.
 
 **Type-checks**
 
@@ -110,12 +128,17 @@ This is the only supported way to type-check the project. It uses the correct co
 
 You should test your changes before committing or pushing. Run relevant unit tests and E2E tests to verify expected behavior. If it's truly impossible to test a change locally (e.g. CI-only behavior, third-party service integration), note this in the PR description explaining why and what manual verification is needed.
 
+When diagnosing a bug the user hit in their running dev app, read `logs/main.log` under the dev app's userData directory — `NODE_ENV=development` repoints Electron's userData away from the OS path (`~/.config/dyad/logs/main.log`), which holds unit-test noise instead. That directory is `./userData` **inside the repo** by default, but `DYAD_DEV_USER_DATA_DIR` overrides it (see `getUserDataPath` in `src/paths/paths.ts`) — `npm run start:onboarding` sets it to a throwaway directory, so a plain `userData/logs/main.log` there is stale or absent. Check the env var first, or read the path `electron-log` prints on startup. The main log carries scoped lines (`process_manager`, `app_runtime_service`, timings) that pin down whether a failure is main-process or renderer-side.
+
+For a chat that hangs with no error: a packaged macOS build logs to `~/Library/Logs/dyad/main.log`; check its `model_request` lines (request sent / headers / first chunk, keyed by `<requestId>:attempt-N`) and `turn_stall_watchdog` warnings (which setup phase is stuck). To check whether a request ever reached Dyad Engine, run `gcloud logging read '"<requestId>"' --project=dyad-prod --freshness=30d --format="value(timestamp,jsonPayload.message)"`. The engine logs `[cl:<requestId>:attempt-N] request received` on arrival, the bare UUID matches it, and the text is in `jsonPayload.message` (`textPayload` is empty). A plain `curl` to `engine.dyad.sh` may get a Cloudflare challenge (`cf-mitigated: challenge`) from some networks; don't read that as proof the user's app is blocked.
+
 ## General guidance
 
 - Favor descriptive module/function names that mirror IPC channel semantics.
 - Keep Electron security practices in mind (no `remote`, validate/lock by `appId` when mutating shared resources).
 - **Never embed GitHub tokens in git remote URLs** (e.g., `https://<token>@github.com/...`) — they persist in plaintext in users' `.git/config` and leak via git error output. Native git network operations (clone/fetch/pull/push) in `src/ipc/utils/git_utils.ts` inject auth per-invocation via `getGitNetworkEnv(accessToken)` (`GIT_CONFIG_*` env vars); any new network-touching git command must pass this env or auth will silently be missing for private repos.
 - Add tests in the same folder tree when touching renderer components.
+- **Sandbox hook restrictions:** inline `python3 -c "..."` is blocked, and Python scripts only run when the file lives inside the repo's `.claude/` directory — write helper scripts to `.claude/tmp/` (and clean them up before committing). jq string interpolation (`"\(.field)"`) in a `gh api --jq` filter is rejected with `Command contains shell metacharacters`; emit plain JSON instead and format it with `jq` string concatenation (`.a + " " + .b`) over the saved output. An inline `gh api graphql -f query='query($owner: String!) {...}'` is rejected the same way (the `$` variables); write the query to a scratch file and pass `-F query=@<path>` with `-f owner=... -F pr=...`.
 - **Always use Base UI (`@base-ui/react`) for UI primitives, never Radix UI.** This includes menus, tooltips, accordions, context menus, and other headless UI components. See [rules/base-ui-components.md](rules/base-ui-components.md) for component-specific guidance.
 
 Use these guidelines whenever you work within this repository.
@@ -130,6 +153,18 @@ Use unit testing for pure business logic and util functions.
 
 Target a Vitest file with `npm test -- path/to/file.test.ts`. Do not pass Jest-only flags such as `--runInBand`; Vitest will fail with `Unknown option '--runInBand'`.
 
+The pinned Vitest version does not support `--repeat`; it fails with `Unknown option '--repeat'`. Stress-run a target by repeating the supported `npm test -- path/to/file.test.ts` command externally.
+
+Loopback-server tests should request OS-selected ports with `listen(0)` instead of fixed high ports, which Windows can reject with `EACCES` in excluded ranges. Wait for listener readiness rather than sleeping before sending requests; keep a conflicting listener bound when testing port-in-use handling.
+
+Tests that inspect repository text files must account for Git's platform-specific line endings. Normalize newlines or match `\r?\n`; for a Windows-only failure, exercise synthetic LF and CRLF inputs locally so the regression does not depend on the runner OS.
+
+When a Git unit test needs an unmerged index, seed explicit stage 1/2/3 blob entries instead of relying on `git merge` to reject. On Windows, a merge can reject later in the workflow while leaving a stage-0 entry, so rejection alone does not prove the intended conflict fixture exists.
+
+When mocking a widely imported module such as `@/lib/schemas`, prefer a partial mock with `importOriginal` and override only the target exports. A full replacement can make unrelated transitive imports fail with `No "<export>" export is defined` as the module graph evolves.
+
+When adding another suite or prerequisite to the root `test` script, keep Vitest as the final shell command. `npm test -- <path>` appends its arguments only to the final command, so placing another runner last silently turns a targeted Vitest run into the full suite.
+
 Package-local Vitest suites may use their own config and not match the root `npm test -- path` include globs. For example, run `npm --prefix packages/ts-pg-schema-diff test` and `npm --prefix packages/ts-pg-schema-diff run typecheck` for `packages/ts-pg-schema-diff`.
 
 ### Vitest integration testing
@@ -138,7 +173,7 @@ Use Vitest integration tests (`*.integration.test.ts` / `*.integration.test.tsx`
 
 Use Playwright E2E instead when the test needs the packaged Electron runtime, real browser/Electron behavior, native dialogs, screenshots, Monaco/Lexical browser interactions, full navigation flows, or confidence that only the real app shell provides. See [rules/hybrid-testing.md](rules/hybrid-testing.md) for integration-test guidance and [rules/e2e-testing.md](rules/e2e-testing.md) for Playwright guidance.
 
-If `npm test` fails in files unrelated to your change, verify the failure is pre-existing before debugging: `git worktree add /tmp/main-check main`, symlink the repo's `node_modules` into it, and run the failing test file there. If it also fails on clean main, note it in the PR summary and move on. (Known example: `src/ipc/handlers/app_collection_handlers.test.ts` failed on main as of 2026-07-01.)
+If `npm test` fails in files unrelated to your change, verify the failure is pre-existing before debugging: `git worktree add /tmp/main-check main`, symlink the repo's `node_modules` into it, and run the failing test file there. If it also fails on clean main, note it in the PR summary and move on. (Known examples: `src/ipc/handlers/app_collection_handlers.test.ts` failed on main as of 2026-07-01; `src/ipc/services/git_overlay_workspace_diagnostics.test.ts` "logs an overlay removal failure…" failed on main as of 2026-11-04 because it still expects the pre-#4957 `Failed to unregister worktree` log text.)
 
 ### E2E testing
 

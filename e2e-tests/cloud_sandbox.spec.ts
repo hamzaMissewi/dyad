@@ -26,11 +26,8 @@ testSkipIfWindows(
       timeout: Timeout.LONG,
     });
     await expect(
-      po.previewPanel
-        .getPreviewIframeElement()
-        .contentFrame()
-        .getByRole("heading", { name: "Cloud Sandbox Preview" }),
-    ).toBeVisible({ timeout: Timeout.LONG });
+      po.previewPanel.getPreviewIframeElement().contentFrame().locator("body"),
+    ).toContainText("Cloud Sandbox Preview", { timeout: Timeout.LONG });
   },
 );
 
@@ -106,6 +103,7 @@ test.skip("cloud sandbox undo restores the remote snapshot", async ({ po }) => {
 
   await po.navigation.goToAppsTab();
   await po.sendPrompt("tc=write-index");
+  await po.previewPanel.selectPreviewMode("preview");
   await po.previewPanel.expectPreviewIframeIsVisible(Timeout.EXTRA_LONG);
 
   const appId = await getCurrentAppId();

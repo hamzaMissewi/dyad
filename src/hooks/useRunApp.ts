@@ -1,106 +1,54 @@
 import { useCallback, useEffect, useRef } from "react";
 import { ipc, type AppOutput } from "@/ipc/types";
 import { selectedAppIdAtom } from "@/atoms/appAtoms";
-import {
-  appendConsoleEntriesForAppAtom,
-  bumpPreviewReloadTokenForAppAtom,
-  currentPreviewLoadingAtom,
-  previewCurrentUrlAtom,
-  setAppUrlForAppAtom,
-  setConsoleEntriesForAppAtom,
-  setPackageManagerWarningForAppAtom,
-  setPreviewAppExitForAppAtom,
-  setPreviewErrorForAppAtom,
-  setPreviewRunStateForAppAtom,
-} from "@/atoms/previewRuntimeAtoms";
-import { useAtomValue, useSetAtom } from "jotai";
+import { useAtomValue } from "jotai";
 import { showError, showInputRequest } from "@/lib/toast";
-import {
-  shouldShowPnpmMinimumReleaseAgeWarning,
-  type RuntimeMode2,
-} from "@/lib/schemas";
+import { shouldShowPnpmMinimumReleaseAgeWarning } from "@/lib/schemas";
+import { useAppRunRemoteManager } from "@/app_run/AppRunRemoteProvider";
+import { useAppRunState } from "./useAppRun";
 import { useSettings } from "./useSettings";
+import { usePreviewErrorFacade } from "@/app_wiring/preview_error_facade";
+import { usePackageManagerWarningStore } from "@/package_manager_warnings/PackageManagerWarningProvider";
+import { useMachineMutation } from "@/distributed_machines/use_machine_mutation";
+import type {
+  AppRunAdmission,
+  AppRunRemoteManager,
+  AppRunOperationInput,
+  AppRunRefusal,
+} from "@/app_run/remote_manager";
+import type { AppRunOperationOutcome } from "@/app_run/operations";
 
 const CLOUD_SYNC_ERROR_TOAST_WINDOW_MS = 30_000;
 
+function classifyAppRunOutcome(outcome: AppRunOperationOutcome) {
+  if (outcome.kind === "succeeded") return { kind: "succeeded" } as const;
+  if (outcome.kind === "failed") {
+    return { kind: "failed", error: outcome.error } as const;
+  }
+  return outcome.reason === "superseded"
+    ? ({ kind: "superseded" } as const)
+    : ({ kind: "cancelled" } as const);
+}
+
+export function runAppLifecycleInBackground(
+  operation: "start" | "restart" | "rebuild",
+  promise: Promise<void>,
+): void {
+  void promise.catch((error) => {
+    console.error(`[app-run] Failed to ${operation} app:`, error);
+  });
+}
+
 export function useRebuildAppAfterPnpmInstall() {
-  const appendConsoleEntries = useSetAtom(appendConsoleEntriesForAppAtom);
-  const setConsoleEntries = useSetAtom(setConsoleEntriesForAppAtom);
-  const setAppUrl = useSetAtom(setAppUrlForAppAtom);
-  const bumpPreviewReloadToken = useSetAtom(bumpPreviewReloadTokenForAppAtom);
-  const setPreservedUrls = useSetAtom(previewCurrentUrlAtom);
-  const setPreviewRunState = useSetAtom(setPreviewRunStateForAppAtom);
-  const setPreviewAppExit = useSetAtom(setPreviewAppExitForAppAtom);
-  const setPreviewError = useSetAtom(setPreviewErrorForAppAtom);
+  const manager = useAppRunRemoteManager();
 
   return useCallback(
-    async (appId: number) => {
-      const startedAt = Date.now();
-      setPreviewRunState({
-        appId,
-        state: { operation: "restart", startedAt },
-      });
-      setPreviewAppExit({ appId, exit: null });
-
-      try {
-        setAppUrl({
-          appId,
-          appUrl: { appUrl: null, appId: null, originalUrl: null, mode: null },
-        });
-
-        setPreservedUrls((prev) => {
-          const next = new Map(prev);
-          next.delete(appId);
-          return next;
-        });
-
-        await ipc.misc.clearLogs({ appId });
-        setConsoleEntries({ appId, entries: [] });
-
-        const logEntry = {
-          level: "info" as const,
-          type: "server" as const,
-          message: "Rebuilding app after pnpm install...",
-          appId,
-          timestamp: startedAt,
-        };
-
-        ipc.misc.addLog(logEntry);
-        appendConsoleEntries({ appId, entries: [logEntry] });
-
-        await ipc.app.restartApp({
-          appId,
-          removeNodeModules: true,
-          recreateSandbox: false,
-        });
-        setPreviewError({ appId, error: undefined });
-      } catch (error) {
-        console.error(`Error rebuilding app ${appId}:`, error);
-        setPreviewError({
-          appId,
-          error:
-            error instanceof Error
-              ? { message: error.message, source: "dyad-app" }
-              : {
-                  message: error?.toString() || "Unknown error",
-                  source: "dyad-app",
-                },
-        });
-      } finally {
-        bumpPreviewReloadToken(appId);
-        setPreviewRunState({ appId, state: undefined });
-      }
-    },
-    [
-      appendConsoleEntries,
-      bumpPreviewReloadToken,
-      setAppUrl,
-      setConsoleEntries,
-      setPreservedUrls,
-      setPreviewAppExit,
-      setPreviewError,
-      setPreviewRunState,
-    ],
+    (appId: number) =>
+      manager.dispatch(appId, {
+        type: "REBUILD",
+        startedAt: Date.now(),
+      }),
+    [manager],
   );
 }
 
@@ -111,14 +59,9 @@ export function useRebuildAppAfterPnpmInstall() {
  */
 export function useAppOutputSubscription() {
   const { settings } = useSettings();
-  const appendConsoleEntries = useSetAtom(appendConsoleEntriesForAppAtom);
-  const setAppUrl = useSetAtom(setAppUrlForAppAtom);
-  const setPreviewError = useSetAtom(setPreviewErrorForAppAtom);
-  const setPreviewAppExit = useSetAtom(setPreviewAppExitForAppAtom);
-  const setPackageManagerWarning = useSetAtom(
-    setPackageManagerWarningForAppAtom,
-  );
-  const bumpPreviewReloadToken = useSetAtom(bumpPreviewReloadTokenForAppAtom);
+  const manager = useAppRunRemoteManager();
+  const previewErrors = usePreviewErrorFacade();
+  const packageWarnings = usePackageManagerWarningStore();
   const appId = useAtomValue(selectedAppIdAtom);
   const selectedAppIdRef = useRef(appId);
   const pnpmWarningSettingRef = useRef({
@@ -144,45 +87,8 @@ export function useAppOutputSubscription() {
     settings?.hidePnpmMinimumReleaseAgeWarning,
   ]);
 
-  const processProxyServerOutput = useCallback(
-    (output: AppOutput) => {
-      const matchesProxyServerStart = output.message.includes(
-        "[dyad-proxy-server]started=[",
-      );
-      if (matchesProxyServerStart) {
-        const proxyUrlMatch = output.message.match(
-          /\[dyad-proxy-server\]started=\[(.*?)\]/,
-        );
-        const originalUrlMatch = output.message.match(/original=\[(.*?)\]/);
-        const modeMatch = output.message.match(/mode=\[(.*?)\]/);
-
-        if (proxyUrlMatch && proxyUrlMatch[1]) {
-          const proxyUrl = proxyUrlMatch[1];
-          const originalUrl = originalUrlMatch && originalUrlMatch[1];
-          const mode = (modeMatch?.[1] as RuntimeMode2 | undefined) ?? "host";
-          setAppUrl({
-            appId: output.appId,
-            appUrl: {
-              appUrl: proxyUrl,
-              appId: output.appId,
-              originalUrl: originalUrl!,
-              mode,
-            },
-          });
-          bumpPreviewReloadToken(output.appId);
-        }
-      }
-    },
-    [bumpPreviewReloadToken, setAppUrl],
-  );
-
-  const onHotModuleReload = useCallback(
-    (appId: number) => {
-      bumpPreviewReloadToken(appId);
-    },
-    [bumpPreviewReloadToken],
-  );
-
+  // Runtime lifecycle producers route directly to the main actor. This
+  // renderer listener owns only presentation effects and console buffering.
   const processAppOutput = useCallback(
     (output: AppOutput) => {
       if (output.type === "input-requested") {
@@ -219,60 +125,29 @@ export function useAppOutputSubscription() {
           });
         }
 
-        setPreviewError({
-          appId: output.appId,
-          error: (current) => {
-            if (current && current.source !== "dyad-sync") {
-              return current;
-            }
-            return {
-              message: output.message,
-              source: "dyad-sync",
-            };
-          },
-        });
+        previewErrors.setSyncError(output.appId, output.message);
       }
 
       if (output.type === "sync-recovered") {
         syncErrorToastRef.current.delete(output.appId);
-        setPreviewError({
-          appId: output.appId,
-          error: (current) =>
-            current?.source === "dyad-sync" ? undefined : current,
-        });
+        previewErrors.clearSyncError(output.appId);
       }
 
       if (output.type === "app-exit") {
-        setPreviewAppExit({
-          appId: output.appId,
-          exit: {
-            appId: output.appId,
-            exitCode: output.exitCode ?? null,
-            timestamp: output.timestamp ?? Date.now(),
-          },
-        });
         return null;
       }
 
       if (
         output.type === "package-manager-warning" &&
-        pnpmWarningSettingRef.current.hasSettings &&
-        pnpmWarningSettingRef.current.showWarning
+        (output.warningKind === "pnpm-migration" ||
+          (pnpmWarningSettingRef.current.hasSettings &&
+            pnpmWarningSettingRef.current.showWarning))
       ) {
-        setPackageManagerWarning({
-          appId: output.appId,
-          warning: { message: output.message },
+        packageWarnings.setWarning(output.appId, {
+          kind: output.warningKind ?? "release-age",
+          message: output.message,
         });
       }
-
-      if (
-        output.message.includes("hmr update") &&
-        output.message.includes("[vite]")
-      ) {
-        onHotModuleReload(output.appId);
-      }
-
-      processProxyServerOutput(output);
 
       const logEntry = {
         level:
@@ -285,6 +160,11 @@ export function useAppOutputSubscription() {
         message: output.message,
         appId: output.appId,
         timestamp: output.timestamp ?? Date.now(),
+        runtimeBoundary:
+          output.runtimeBoundary ??
+          (output.type === "agent-lifecycle-started"
+            ? output.lifecycleOperation
+            : undefined),
       };
 
       if (output.type === "client-error") {
@@ -293,28 +173,19 @@ export function useAppOutputSubscription() {
 
       return logEntry;
     },
-    [
-      onHotModuleReload,
-      processProxyServerOutput,
-      setPackageManagerWarning,
-      setPreviewAppExit,
-      setPreviewError,
-    ],
+    [packageWarnings, previewErrors],
   );
 
   useEffect(() => {
     const unsubscribe = ipc.events.misc.onAppOutput((output) => {
       const entry = processAppOutput(output);
       if (entry) {
-        appendConsoleEntries({
-          appId: output.appId,
-          entries: [entry],
-        });
+        manager.previewConsole.append(output.appId, [entry]);
       }
     });
 
     return unsubscribe;
-  }, [appendConsoleEntries, processAppOutput]);
+  }, [manager, processAppOutput]);
 
   useEffect(() => {
     const unsubscribe = ipc.events.misc.onAppOutputBatch((outputs) => {
@@ -332,77 +203,75 @@ export function useAppOutputSubscription() {
       }
 
       for (const [appId, entries] of entriesByAppId) {
-        appendConsoleEntries({ appId, entries });
+        manager.previewConsole.append(appId, entries);
       }
     });
 
     return unsubscribe;
-  }, [appendConsoleEntries, processAppOutput]);
+  }, [manager, processAppOutput]);
 }
 
 export function useRunApp() {
-  const loading = useAtomValue(currentPreviewLoadingAtom);
-  const appendConsoleEntries = useSetAtom(appendConsoleEntriesForAppAtom);
-  const setConsoleEntries = useSetAtom(setConsoleEntriesForAppAtom);
-  const setAppUrl = useSetAtom(setAppUrlForAppAtom);
-  const bumpPreviewReloadToken = useSetAtom(bumpPreviewReloadTokenForAppAtom);
-  const setPreservedUrls = useSetAtom(previewCurrentUrlAtom);
-  const setPreviewRunState = useSetAtom(setPreviewRunStateForAppAtom);
-  const setPreviewAppExit = useSetAtom(setPreviewAppExitForAppAtom);
+  const manager = useAppRunRemoteManager();
+  const packageWarnings = usePackageManagerWarningStore();
   const appId = useAtomValue(selectedAppIdAtom);
-  const setPreviewError = useSetAtom(setPreviewErrorForAppAtom);
+  const runState = useAppRunState(appId);
+  const view = appId === null ? undefined : manager.getView(appId);
+  const prepareMutationRequest = useCallback(
+    (
+      input: {
+        readonly appId: number;
+        readonly operation: AppRunOperationInput;
+      },
+      observedRevision: Parameters<AppRunRemoteManager["prepareRequest"]>[2],
+    ) =>
+      manager.prepareRequest(
+        input.appId,
+        input.operation,
+        input.appId === appId ? observedRevision : undefined,
+      ),
+    [appId, manager],
+  );
+  const mutation = useMachineMutation<
+    { readonly appId: number; readonly operation: AppRunOperationInput },
+    AppRunAdmission,
+    AppRunOperationOutcome,
+    AppRunRefusal
+  >({
+    connection: view?.connection ?? "disconnected",
+    snapshot: view?.snapshot ?? { kind: "unavailable" },
+    request: prepareMutationRequest,
+    classifyOutcome: classifyAppRunOutcome,
+    requestOwnership: "parallel",
+  });
+  const mutateAppRunRef = useRef(mutation.mutate);
+  mutateAppRunRef.current = mutation.mutate;
+  const loading =
+    runState.phase === "starting" ||
+    runState.phase === "stopping" ||
+    mutation.admission.kind === "preparing" ||
+    mutation.execution.kind === "running";
+
+  const dispatchMutation = useCallback(
+    async (targetAppId: number, operation: AppRunOperationInput) => {
+      const settlement = await mutateAppRunRef.current({
+        appId: targetAppId,
+        operation,
+      });
+      await manager.applyPublicSettlement(targetAppId, operation, settlement);
+    },
+    [manager],
+  );
 
   const runApp = useCallback(
-    async (appId: number) => {
-      const startedAt = Date.now();
-      setPreviewRunState({
-        appId,
-        state: { operation: "run", startedAt },
+    (appId: number) => {
+      packageWarnings.clear(appId);
+      return dispatchMutation(appId, {
+        type: "START",
+        startedAt: Date.now(),
       });
-      setPreviewAppExit({ appId, exit: null });
-      try {
-        console.debug("Running app", appId);
-
-        setAppUrl({
-          appId,
-          appUrl: { appUrl: null, appId: null, originalUrl: null, mode: null },
-        });
-
-        const logEntry = {
-          level: "info" as const,
-          type: "server" as const,
-          message: "Connecting to app...",
-          appId,
-          timestamp: startedAt,
-        };
-
-        ipc.misc.addLog(logEntry);
-        appendConsoleEntries({ appId, entries: [logEntry] });
-        await ipc.app.runApp({ appId });
-        setPreviewError({ appId, error: undefined });
-      } catch (error) {
-        console.error(`Error running app ${appId}:`, error);
-        setPreviewError({
-          appId,
-          error:
-            error instanceof Error
-              ? { message: error.message, source: "dyad-app" }
-              : {
-                  message: error?.toString() || "Unknown error",
-                  source: "dyad-app",
-                },
-        });
-      } finally {
-        setPreviewRunState({ appId, state: undefined });
-      }
     },
-    [
-      appendConsoleEntries,
-      setAppUrl,
-      setPreviewAppExit,
-      setPreviewError,
-      setPreviewRunState,
-    ],
+    [dispatchMutation, packageWarnings],
   );
 
   const stopApp = useCallback(
@@ -410,118 +279,50 @@ export function useRunApp() {
       if (appId === null) {
         return;
       }
-
-      setPreviewRunState({
-        appId,
-        state: { operation: "stop", startedAt: Date.now() },
+      await dispatchMutation(appId, {
+        type: "STOP",
+        startedAt: Date.now(),
       });
-      try {
-        await ipc.app.stopApp({ appId });
-        setPreviewError({ appId, error: undefined });
-      } catch (error) {
-        console.error(`Error stopping app ${appId}:`, error);
-        setPreviewError({
-          appId,
-          error:
-            error instanceof Error
-              ? { message: error.message, source: "dyad-app" }
-              : {
-                  message: error?.toString() || "Unknown error",
-                  source: "dyad-app",
-                },
-        });
-      } finally {
-        setPreviewRunState({ appId, state: undefined });
-      }
     },
-    [setPreviewError, setPreviewRunState],
+    [dispatchMutation],
   );
 
   const restartApp = useCallback(
     async ({
+      appId: requestedAppId,
       removeNodeModules = false,
       recreateSandbox = false,
-    }: { removeNodeModules?: boolean; recreateSandbox?: boolean } = {}) => {
-      if (appId === null) {
+    }: {
+      appId?: number;
+      removeNodeModules?: boolean;
+      recreateSandbox?: boolean;
+    } = {}) => {
+      const targetAppId = requestedAppId ?? appId;
+      if (targetAppId === null) {
         return;
       }
-      const startedAt = Date.now();
-      setPreviewRunState({
-        appId,
-        state: { operation: "restart", startedAt },
+      const warningBeforeRestart = packageWarnings.getSnapshot(targetAppId);
+      await dispatchMutation(targetAppId, {
+        type: "RESTART",
+        startedAt: Date.now(),
+        options: { removeNodeModules, recreateSandbox },
       });
-      setPreviewAppExit({ appId, exit: null });
-      try {
-        console.debug(
-          "Restarting app",
-          appId,
-          recreateSandbox ? "with sandbox recreation" : "",
-          removeNodeModules ? "with node_modules cleanup" : "",
-        );
-
-        setAppUrl({
-          appId,
-          appUrl: { appUrl: null, appId: null, originalUrl: null, mode: null },
-        });
-
-        setPreservedUrls((prev) => {
-          const next = new Map(prev);
-          next.delete(appId);
-          return next;
-        });
-
-        await ipc.misc.clearLogs({ appId });
-        setConsoleEntries({ appId, entries: [] });
-
-        const logEntry = {
-          level: "info" as const,
-          type: "server" as const,
-          message: "Restarting app...",
-          appId,
-          timestamp: startedAt,
-        };
-
-        ipc.misc.addLog(logEntry);
-        appendConsoleEntries({ appId, entries: [logEntry] });
-
-        await ipc.app.restartApp({ appId, removeNodeModules, recreateSandbox });
-        setPreviewError({ appId, error: undefined });
-      } catch (error) {
-        console.error(`Error restarting app ${appId}:`, error);
-        setPreviewError({
-          appId,
-          error:
-            error instanceof Error
-              ? { message: error.message, source: "dyad-app" }
-              : {
-                  message: error?.toString() || "Unknown error",
-                  source: "dyad-app",
-                },
-        });
-      } finally {
-        bumpPreviewReloadToken(appId);
-        setPreviewRunState({ appId, state: undefined });
+      if (
+        warningBeforeRestart !== undefined &&
+        packageWarnings.getSnapshot(targetAppId) === warningBeforeRestart
+      ) {
+        packageWarnings.clear(targetAppId);
       }
     },
-    [
-      appId,
-      appendConsoleEntries,
-      bumpPreviewReloadToken,
-      setAppUrl,
-      setConsoleEntries,
-      setPreservedUrls,
-      setPreviewAppExit,
-      setPreviewError,
-      setPreviewRunState,
-    ],
+    [appId, dispatchMutation, packageWarnings],
   );
 
   const refreshAppIframe = useCallback(async () => {
     if (appId === null) {
       return;
     }
-    bumpPreviewReloadToken(appId);
-  }, [appId, bumpPreviewReloadToken]);
+    manager.requestManualReload(appId);
+  }, [appId, manager]);
 
   return {
     loading,

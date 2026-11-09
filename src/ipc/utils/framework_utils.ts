@@ -2,6 +2,7 @@ import fs from "node:fs";
 import * as path from "path";
 import {
   NEXTJS_CONFIG_FILES,
+  NITRO_CONFIG_FILES,
   VITE_CONFIG_FILES,
   type AppFrameworkType,
 } from "@/lib/framework_constants";
@@ -10,9 +11,10 @@ import {
  * Detect the framework type for an app by checking config files and package.json.
  *
  * Vite apps with a Nitro server layer (added via `enable_nitro`) are reported
- * as `"vite-nitro"`. Detection looks for `nitro.config.{ts,js,mjs}` first, then
- * falls back to `nitro` in package.json deps — either is sufficient since the
- * tool writes the config file and installs the package together.
+ * as `"vite-nitro"`. Detection looks for a Nitro config file (see
+ * `NITRO_CONFIG_FILES`) first, then falls back to `nitro` in package.json
+ * deps. Either is sufficient since the tool writes the config file and
+ * installs the package together.
  */
 export function detectFrameworkType(appPath: string): AppFrameworkType | null {
   try {
@@ -53,16 +55,37 @@ export function detectFrameworkType(appPath: string): AppFrameworkType | null {
   }
 }
 
+/**
+ * Whether the app names its own entry point.
+ *
+ * This is the same lookup a build pack does, in the same order: a `start`
+ * script, then `main`, then a root index module. An app that answers here is
+ * describing how to run itself, and knows things about its own build that
+ * nothing outside it can see.
+ */
+export function declaresStart(appPath: string): boolean {
+  try {
+    const packageJsonPath = path.join(appPath, "package.json");
+    if (fs.existsSync(packageJsonPath)) {
+      const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
+      if (typeof packageJson.scripts?.start === "string") return true;
+      if (typeof packageJson.main === "string") return true;
+    }
+    return ["index.js", "index.mjs", "index.cjs", "index.ts"].some((entry) =>
+      fs.existsSync(path.join(appPath, entry)),
+    );
+  } catch {
+    // An unreadable app is one Dyad knows nothing about, and claiming it
+    // starts itself would leave the deploy with no start command at all.
+    return false;
+  }
+}
+
 function hasNitro(
   appPath: string,
   deps: Record<string, string> | null,
 ): boolean {
-  const nitroConfigs = [
-    "nitro.config.ts",
-    "nitro.config.js",
-    "nitro.config.mjs",
-  ];
-  for (const config of nitroConfigs) {
+  for (const config of NITRO_CONFIG_FILES) {
     if (fs.existsSync(path.join(appPath, config))) return true;
   }
   return Boolean(deps?.nitro);

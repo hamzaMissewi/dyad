@@ -1,3 +1,6 @@
+import { stopClaudeProcesses } from "./ipc/services/claude_code/runtime";
+import { windowsResourceHelper } from "./utils/windows_resource_helper";
+import { isPreviewCookieIsolationEnabled } from "./ipc/services/preview_cookie_isolation";
 import {
   app,
   autoUpdater,
@@ -6,15 +9,16 @@ import {
   Menu,
   protocol,
   net,
+  nativeImage,
   crashReporter,
+  type Event as ElectronEvent,
 } from "electron";
 import * as path from "node:path";
+import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { registerIpcHandlers } from "./ipc/ipc_host";
 import dotenv from "dotenv";
-// @ts-ignore
-import started from "electron-squirrel-startup";
 import { updateElectronApp, UpdateSourceType } from "update-electron-app";
 import log from "electron-log";
 import {
@@ -22,24 +26,45 @@ import {
   tryWriteSettings,
   readSettings,
   readEffectiveSettings,
-  writeCrashSentinel,
+  claimCrashSentinel,
   clearCrashSentinel,
-  crashSentinelExists,
-  readCrashSentinel,
   recordRendererCrash,
   readRendererCrashRecord,
   clearRendererCrashRecord,
   setInitialLoadIsFirstSession,
+  rewriteRecoveredSafeStorageSecretsAfterKeychainUnlock,
 } from "./main/settings";
+import {
+  recoveryNeedsKeychainUnlock,
+  retryRecoveryWithKeychainUnlock,
+  setSafeStorageRecoveryFailureListener,
+} from "./main/safe_storage_legacy";
 import { recordUpdaterError } from "./main/updater_state";
-import { sendTelemetryEvent } from "./ipc/utils/telemetry";
+import { recordPreviousSessionCrash } from "./main/previous_session_crash";
+import {
+  sendTelemetryEvent,
+  sendTelemetryEventToWindow,
+} from "./ipc/utils/telemetry";
 import { handleSupabaseOAuthReturn } from "./supabase_admin/supabase_return_handler";
 import { handleDyadProReturn } from "./main/pro";
 import { IS_TEST_BUILD } from "./ipc/utils/test_utils";
 import { BackupManager } from "./backup_manager";
-import { getDatabasePath, initializeDatabase } from "./db";
+import { db, getDatabasePath, initializeDatabase } from "./db";
+import { apps } from "./db/schema";
+import { eq } from "drizzle-orm";
+import { reconcileOrphanTestBranches } from "./ipc/utils/neon_test_branch";
+import { reconcileOrphanTestUsers } from "./ipc/utils/supabase_test_user";
+import { reconcileOrphanE2eTestWorkspaces } from "./ipc/services/e2e_test_workspace";
+import { stopAllAppTestsSync } from "./ipc/handlers/tests_handlers";
 import { UserSettings } from "./lib/schemas";
 import { handleNeonOAuthReturn } from "./neon_admin/neon_return_handler";
+import {
+  disposeConnectionFlowsForShutdown,
+  connectionFlowRegistry,
+  runOAuthReturnExchange,
+} from "./ipc/handlers/connection_flow_handlers";
+import { parseOAuthCallbackInvocationRef } from "./connection_flow/oauth_deep_link";
+import type { ConnectionFlowInvocationRef } from "./connection_flow/state";
 import {
   AddMcpServerConfigSchema,
   AddMcpServerPayload,
@@ -50,27 +75,44 @@ import {
   startPerformanceMonitoring,
   stopPerformanceMonitoring,
 } from "./utils/performance_monitor";
+import { queryWindowsPagefileSettings } from "./utils/windows_pagefile";
 import {
+  browserCrashAttribution,
   parseMinidumpSummary,
   type MinidumpSummary,
 } from "./utils/minidump_summary";
 import {
   listDumpFilesRecursive,
+  MAX_RETAINED_DUMPS,
   moveDump,
   pruneDumps,
+  RETAINED_DUMPS_DIR,
 } from "./utils/crash_dumps";
 import {
-  DYAD_INTERNAL_DIR_NAME,
-  DYAD_MEDIA_SUBDIR,
-  DYAD_SCREENSHOT_SUBDIR,
-} from "./ipc/utils/media_path_utils";
+  crashAnnotationEventFields,
+  crashPerformanceEventFields,
+} from "./utils/crash_telemetry_fields";
+import { appSizeEventFields } from "./shared/app_size_telemetry";
+import {
+  claimPreviousSessionAppSize,
+  getPreviousSessionAppSize,
+} from "./main/last_session_store";
+import { classifyOom } from "./utils/oom_classifier";
 import {
   stopAllAppsSync,
   stopAppGarbageCollection,
 } from "./ipc/utils/process_manager";
 import { cleanupOldAiMessagesJson } from "./pro/main/ipc/handlers/local_agent/ai_messages_cleanup";
+import { cleanupStaleBuildSnapshots } from "./pro/main/ipc/handlers/local_agent/tools/run_build";
+import {
+  startChatSearchIndexer,
+  stopChatSearchIndexer,
+} from "./pro/main/ipc/handlers/local_agent/chat_search_indexer";
+import { recoverInterruptedSubagents } from "./pro/main/ipc/handlers/local_agent/subagents/subagent_manager";
 import { cleanupOldMediaFiles } from "./ipc/utils/media_cleanup";
-import { scrubGithubTokenFromRemotes } from "./ipc/utils/git_remote_token_scrub";
+import { scrubTokensFromRemotes } from "./ipc/utils/git_remote_token_scrub";
+import { encryptStoredMcpSecrets } from "./ipc/utils/mcp_secret_encryption";
+import { reconcileCloudSandboxes } from "./ipc/utils/cloud_sandbox_provider";
 import fs from "fs";
 import { gitAddSafeDirectory } from "./ipc/utils/git_utils";
 import {
@@ -79,6 +121,14 @@ import {
   getUserDataPath,
 } from "./paths/paths";
 import { createDeepLinkQueue } from "./main/deep_link_queue";
+import { DeepLinkWindowReadiness } from "./main/deep_link_window_readiness";
+import { appRelaunchRequest } from "./main/app_relaunch_request";
+import {
+  shouldCreateWindowOnActivate,
+  shouldRequestRelaunchOnActivate,
+  shouldRetainClosedWindowForActivation,
+  shouldQuitAfterAllWindowsClosed,
+} from "./main/window_lifecycle_policy";
 import { registerDyadProtocolLinux } from "./main/linux_protocol_registration";
 import {
   applyManagedPnpmToProcessPath,
@@ -90,10 +140,90 @@ import {
   getManagedNodeVersion,
   maybeUpgradeManagedNode,
 } from "./ipc/utils/managed_node";
+import { createDyadMediaProtocolHandler } from "./main/dyad_media_protocol";
+import {
+  createPlatformThumbnailFromPath,
+  getMediaThumbnailCacheRoot,
+} from "./ipc/utils/media_thumbnail";
+import {
+  createMcpBeforeQuitHandler,
+  disposeMcpClientsForShutdown,
+} from "./ipc/utils/mcp_shutdown";
+import { disposeMcpOAuthForShutdown } from "./ipc/utils/mcp_oauth_flow";
+import { remoteMachineHost } from "./ipc/services/distributed_machine_host";
+import { configureTrustedRenderer } from "./ipc/utils/renderer_security";
+import {
+  getWindowOpenHandlerResponse,
+  securePreviewPopupOptions,
+  shouldBlockMainWindowNavigation,
+} from "./main/window_security";
+import { pathToFileURL } from "node:url";
+import { windowRegistry } from "./window_infrastructure/main/window_registry";
+import {
+  PRIMARY_WINDOW_SESSION_ID,
+  type WindowSessionId,
+} from "./window_infrastructure/types";
+import {
+  awaitProductWindowRenderer,
+  configureWindowProductController,
+} from "./window_infrastructure/main/window_product_controller";
+import {
+  clearLegacyWindowSessionPersistence,
+  MAX_PRODUCT_WINDOWS,
+  restorableVisibleEntity,
+  type WindowSessionDescriptor,
+} from "./window_infrastructure/main/window_session";
+import { DyadError, DyadErrorKind, isDyadError } from "./errors/dyad_error";
+import {
+  formatErrorBanner,
+  formatExitBanner,
+  formatPreviousSessionBanner,
+  formatStartBanner,
+} from "./main/session_banner";
 
-log.errorHandler.startCatching();
+const LAUNCH_TIME = Date.now();
+
+// Above the dev block so a failure there is still reported. Only registers
+// process handlers; it writes nothing, so it can't fix the log directory early.
+log.errorHandler.startCatching({
+  // Runs before electron-log logs the error itself. Must not return false:
+  // that suppresses both the stack trace and the error dialog.
+  onError: ({ errorName }) => {
+    const kind =
+      errorName === "Unhandled rejection"
+        ? "unhandledRejection"
+        : "uncaughtException";
+    log.error(formatErrorBanner(process.pid, kind, Date.now() - LAUNCH_TIME));
+  },
+});
+
+// In dev, keep minidumps and logs under the project's ./userData, not the OS
+// one. Must run before crashReporter.start and before the first log call, when
+// electron-log caches its dir. macOS logs ignore userData: ~/Library/Logs/dyad.
+if (process.env.NODE_ENV === "development") {
+  const devUserData = getUserDataPath();
+  fs.mkdirSync(devUserData, { recursive: true });
+  app.setPath("userData", devUserData);
+
+  const devCrashDumps = path.join(devUserData, "Crashpad");
+  fs.mkdirSync(devCrashDumps, { recursive: true });
+  app.setPath("crashDumps", devCrashDumps);
+}
+
 log.eventLogger.startLogging();
 log.scope.labelPadding = false;
+
+// First line of every session. See session_banner.ts.
+log.info(
+  formatStartBanner({
+    pid: process.pid,
+    version: app.getVersion(),
+    platform: process.platform,
+    arch: process.arch,
+    electron: process.versions.electron ?? "unknown",
+    node: process.versions.node ?? "unknown",
+  }),
+);
 const execFileAsync = promisify(execFile);
 
 // Prefer the Dyad-managed pnpm (if installed) for everything spawned from the
@@ -133,7 +263,10 @@ async function logStartupExecutablePaths(): Promise<void> {
     resolveStartupExecutablePath("pnpm"),
   ]);
 
+  // Resolves after module evaluation, so in a short-lived second instance this
+  // lands after that process's exit banner. The pid keeps it attributable.
   log.info("Startup executable paths", {
+    pid: process.pid,
     node,
     npm,
     pnpm,
@@ -143,19 +276,6 @@ async function logStartupExecutablePaths(): Promise<void> {
 }
 
 void logStartupExecutablePaths();
-
-// In dev, keep minidumps under the project's ./userData (matching where Dyad
-// writes its other dev files) instead of the OS userData dir, so they don't
-// mingle with a prod install's dumps. Must run before crashReporter.start.
-if (process.env.NODE_ENV === "development") {
-  const devUserData = getUserDataPath();
-  fs.mkdirSync(devUserData, { recursive: true });
-  app.setPath("userData", devUserData);
-
-  const devCrashDumps = path.join(devUserData, "Crashpad");
-  fs.mkdirSync(devCrashDumps, { recursive: true });
-  app.setPath("crashDumps", devCrashDumps);
-}
 
 // Capture native crashes (main/renderer/GPU/utility) as local minidumps. Not
 // uploaded; parsed on the next launch into a summary we send as telemetry.
@@ -175,11 +295,12 @@ crashReporter.start({
 
 const logger = log.scope("main");
 
-// Cap retained dumps so they don't accumulate indefinitely; keep only a few
-// recent ones for examination/export.
-const MAX_RETAINED_DUMPS = 5;
 let nativeCrashDumpsProcessed = false;
-let pendingNativeBrowserCrash: MinidumpSummary | null = null;
+let pendingNativeBrowserCrash: {
+  summary: MinidumpSummary;
+  attribution: "ptype" | "sentinel";
+  dumpFile: string; // its name in the retain dir
+} | null = null;
 
 // Summarize each new minidump (signal, faulting module + offset, process type —
 // no memory). A main-process crash is the app crash, so its summary is stashed
@@ -196,7 +317,7 @@ function processNativeCrashDumps(): void {
   // Where we keep dumps we've already reported, for later examination. Under
   // userData (not inside crashDumpsDir) so it stays separate from Crashpad's
   // own dump dirs and isn't picked up by the scan above.
-  const retainDir = path.join(app.getPath("userData"), "dyad-crash-reports");
+  const retainDir = path.join(app.getPath("userData"), RETAINED_DUMPS_DIR);
   try {
     fs.mkdirSync(retainDir, { recursive: true });
   } catch (error) {
@@ -207,6 +328,7 @@ function processNativeCrashDumps(): void {
   }
 
   for (const file of listDumpFilesRecursive(crashDumpsDir)) {
+    const retainedName = crashReportName(file);
     const summary = parseMinidumpSummary(file);
     if (summary) {
       logger.info(
@@ -216,17 +338,34 @@ function processNativeCrashDumps(): void {
         summary.faultingModule,
         summary.faultingOffset,
       );
-      if (summary.ptype === "browser" && !pendingNativeBrowserCrash) {
-        pendingNativeBrowserCrash = summary;
-        // A browser-process dump is direct evidence of a main-process crash, so
-        // report it even if the crash sentinel wasn't written (e.g. a crash
-        // during early startup).
+      // The sentinel check in onReady runs before the window exists, so
+      // pendingCrashDetected already reflects it by the time this runs
+      // from did-finish-load.
+      const attribution = browserCrashAttribution(
+        summary,
+        pendingCrashDetected,
+      );
+      // A ptype dump outranks a sentinel-attributed one, so a stripped
+      // child dump cannot claim the crash when the labeled browser dump
+      // is also in the scan.
+      const outranks =
+        attribution === "ptype" &&
+        pendingNativeBrowserCrash?.attribution === "sentinel";
+      if (attribution && (!pendingNativeBrowserCrash || outranks)) {
+        pendingNativeBrowserCrash = {
+          summary,
+          attribution,
+          dumpFile: retainedName,
+        };
+        // A browser-process dump is direct evidence of a main-process crash,
+        // so report it even if the crash sentinel wasn't written (e.g. a
+        // crash during early startup).
         pendingCrashDetected = true;
       }
     }
     // Retain (timestamp-named) so it can be examined/exported and isn't
     // re-summarized next launch; this also drains Crashpad's dump dirs.
-    moveDump(file, path.join(retainDir, crashReportName(file)));
+    moveDump(file, path.join(retainDir, retainedName));
   }
   pruneDumps(retainDir, MAX_RETAINED_DUMPS);
 }
@@ -245,17 +384,23 @@ function crashReportName(dumpPath: string): string {
   return `crash-${ts}-${id}.dmp`;
 }
 const deepLinkQueue = createDeepLinkQueue(handleDeepLinkReturn);
+const deepLinkWindowReadiness = new DeepLinkWindowReadiness<BrowserWindow>(
+  deepLinkQueue,
+);
+let crashRecoveryWindowReadiness: DeepLinkWindowReadiness<BrowserWindow>;
+crashRecoveryWindowReadiness = new DeepLinkWindowReadiness<BrowserWindow>({
+  markReady: () => {
+    const target = crashRecoveryWindowReadiness.getTarget();
+    if (target) deliverPendingCrashRecovery(target);
+  },
+  markNotReady: () => undefined,
+});
 
 // Load environment variables from .env file
 dotenv.config();
 
 // Register IPC handlers before app is ready
 registerIpcHandlers();
-
-// Handle creating/removing shortcuts on Windows when installing/uninstalling.
-if (started) {
-  app.quit();
-}
 
 // Decide the git directory depending on environment
 function resolveLocalGitDirectory() {
@@ -285,9 +430,23 @@ if (process.defaultApp) {
 }
 
 export async function onReady() {
+  // Take over the sentinel before any startup work that can crash. Migrations,
+  // the keychain and git all run below; if one of them kills us, a sentinel
+  // still naming the previous session would report this crash as that one.
+  const previousSession = claimCrashSentinel(LAUNCH_TIME);
+
+  // Cookie isolation changes require restarting Dyad, not individual apps.
+  isPreviewCookieIsolationEnabled();
+
+  // Claimed here, before anything can overwrite it, so the record always
+  // describes the session that just ended. Runs whether or not that session
+  // crashed: both populations have to be measured the same way.
+  claimPreviousSessionAppSize();
+
   // Linux: claim the dyad:// scheme for this build (best-effort, see module).
-  // setAsDefaultProtocolClient above is unreliable on Linux.
-  void registerDyadProtocolLinux();
+  // setAsDefaultProtocolClient above is unreliable on Linux. Pass this instance's
+  // userData so a browser-launched deep link forwards here, not a second window.
+  void registerDyadProtocolLinux(app.getPath("userData"));
 
   // React DevTools extension loading is intentionally disabled. In Electron it
   // can spam startup logs with:
@@ -316,25 +475,67 @@ export async function onReady() {
     return;
   }
 
+  void recoverInterruptedSubagents().catch((error) =>
+    logger.error("Failed to reconcile interrupted sub-agents", error),
+  );
+  void cleanupStaleBuildSnapshots().catch((error) =>
+    logger.error("Failed to clean stale production build snapshots", error),
+  );
+
+  // Reconcile any Neon test branches / Supabase test users leaked by a previous
+  // session that crashed mid test-run. Fire-and-forget: best-effort cleanup
+  // must not block startup.
+  void reconcileOrphanTestBranches();
+  void reconcileOrphanTestUsers();
+  // Also prunes retained test artifacts whose app no longer exists — nothing
+  // else ever removes them, and the user has no surface that shows they exist.
+  // Read when the prune is about to run, not now: the sandbox sweep it happens
+  // after can take a long time, and an app created in the meantime must not
+  // have its first run's artifacts deleted as orphans.
+  void reconcileOrphanE2eTestWorkspaces({
+    refreshKnownAppIds: async () =>
+      new Set(
+        (await db.query.apps.findMany({ columns: { id: true } })).map(
+          (row) => row.id,
+        ),
+      ),
+  }).catch((error) =>
+    logger.error("Failed to reconcile abandoned E2E test workspaces", error),
+  );
+
   // Cleanup old ai_messages_json entries to prevent database bloat
   cleanupOldAiMessagesJson();
+
+  // Start the chat-search FTS index maintenance (backfill runs in the
+  // background; never blocks startup)
+  startChatSearchIndexer();
 
   // Cleanup old media files to reclaim disk space
   cleanupOldMediaFiles();
 
   // Remove GitHub tokens that older versions embedded in git remote URLs
-  scrubGithubTokenFromRemotes();
+  scrubTokensFromRemotes();
+
+  // Encrypt MCP headers and env vars that are still stored as
+  // plaintext. Awaited so no MCP read can see a row the pass is about
+  // to correct. It returns rather than throwing on failure, and does
+  // no work at all once there are no plaintext values left.
+  await encryptStoredMcpSecrets();
 
   const settings = await readEffectiveSettings();
+
+  // Handler registration happens before ready. Reconciliation can decrypt
+  // settings, so start it here after the runtime and database are ready.
+  void reconcileCloudSandboxes().catch((error) => {
+    logger.warn("Failed to reconcile cloud sandboxes on startup:", error);
+  });
 
   // Add dyad-apps directory to git safe.directory (required for Windows).
   // The trailing /* allows access to all repositories under the named directory.
   // See: https://git-scm.com/docs/git-config#Documentation/git-config.txt-safedirectory
-  if (settings.enableNativeGit) {
-    // Don't need to await because this only needs to run before
-    // the user starts interacting with Dyad app and uses a git-related feature.
-    gitAddSafeDirectory(`${getDyadAppsBaseDirectory()}/*`);
-  }
+  // Don't need to await because this only needs to run before
+  // the user starts interacting with Dyad app and uses a git-related feature.
+  gitAddSafeDirectory(`${getDyadAppsBaseDirectory()}/*`);
 
   // Check if app was force-closed by checking for the crash sentinel file.
   // The sentinel is written at startup and deleted in before-quit on clean exit.
@@ -346,8 +547,19 @@ export async function onReady() {
   // settings.isRunning may still be true. Honour it once, then clear it so
   // subsequent runs rely solely on the sentinel.
   const legacyIsRunningCrash = settings.isRunning === true;
-  if (crashSentinelExists() || legacyIsRunningCrash) {
-    logger.warn("App was force-closed on previous run");
+  // previousSession.previous is null for the legacy bare-timestamp sentinel,
+  // which still counts as existing.
+  if (previousSession.existed || legacyIsRunningCrash) {
+    // Scoped and at warn, unlike this session's own banners. Deliberate: warn is
+    // the only level that survives the filtered log tail users paste into bug
+    // reports (see readAppLogs in debug_handlers), and this is the line that
+    // tells us their last session crashed.
+    logger.warn(
+      formatPreviousSessionBanner(
+        previousSession.previous?.ts,
+        settings.lastKnownPerformance?.timestamp,
+      ),
+    );
     pendingCrashDetected = true;
 
     // Store performance data to send after window is created
@@ -358,7 +570,7 @@ export async function onReady() {
 
     // The chat that was streaming when the crash happened, if any, so the
     // dialog can offer a one-click upload of it.
-    pendingActiveChatId = readCrashSentinel()?.activeChatId ?? null;
+    pendingActiveChatId = previousSession.previous?.activeChatId ?? null;
   }
 
   // TODO: Remove legacyIsRunningCrash migration path after a few releases
@@ -369,8 +581,6 @@ export async function onReady() {
       "clearing the legacy isRunning crash flag",
     );
   }
-
-  writeCrashSentinel();
 
   // Record the GPU's feature status (is compositing / WebGL hardware-accelerated)
   // on every dump written from here on. It's useful context when reading a dump,
@@ -392,62 +602,37 @@ export async function onReady() {
   }
   logger.info("Crash dumps directory:", app.getPath("crashDumps"));
 
-  // Start performance monitoring
-  startPerformanceMonitoring();
+  // Read the pagefile configuration once, in the background, so the
+  // heartbeat and app:initial-load can report it. A no-op off Windows.
+  void queryWindowsPagefileSettings();
 
-  // Handle dyad-media:// protocol requests to serve persistent media and screenshot files.
-  protocol.handle("dyad-media", async (request) => {
-    const url = new URL(request.url);
-    // Format: dyad-media://media/{app-path}/.dyad/{subdir}/{filename}
-    //   where {subdir} is DYAD_MEDIA_SUBDIR or DYAD_SCREENSHOT_SUBDIR.
-    //   Uses a fixed hostname to avoid URL hostname normalization (lowercasing).
-    //   The app-path segment is URI-encoded, so split on "/" before decoding
-    //   to correctly handle absolute paths (which contain encoded slashes).
-    const pathSegments = url.pathname.slice(1).split("/");
-    const allowedSubdirs = [DYAD_MEDIA_SUBDIR, DYAD_SCREENSHOT_SUBDIR];
-    if (
-      pathSegments.length !== 4 ||
-      pathSegments[1] !== DYAD_INTERNAL_DIR_NAME ||
-      !allowedSubdirs.includes(pathSegments[2])
-    ) {
-      return new Response("Forbidden", { status: 403 });
-    }
-
-    const appPathRaw = decodeURIComponent(pathSegments[0]);
-    const subdir = pathSegments[2];
-    const filename = decodeURIComponent(pathSegments[3]);
-
-    // Defense-in-depth: reject filenames with path separators or traversal
-    if (
-      filename.includes("..") ||
-      filename.includes("/") ||
-      filename.includes("\\")
-    ) {
-      return new Response("Forbidden", { status: 403 });
-    }
-
-    // Resolve the app directory, handling both relative names and absolute
-    // paths from imported apps (skipCopy).
-    const appPath = getDyadAppPath(appPathRaw);
-    const targetDir = path.resolve(
-      path.join(appPath, DYAD_INTERNAL_DIR_NAME, subdir),
-    );
-    const resolvedPath = path.resolve(path.join(targetDir, filename));
-
-    // Security: ensure the resolved path stays within the app's .dyad/{subdir} directory
-    const relativePath = path.relative(targetDir, resolvedPath);
-    if (relativePath.startsWith("..") || path.isAbsolute(relativePath)) {
-      return new Response("Forbidden", { status: 403 });
-    }
-
-    try {
-      return await net.fetch(
-        require("node:url").pathToFileURL(resolvedPath).href,
-      );
-    } catch {
-      return new Response("Not Found", { status: 404 });
-    }
+  // Start performance monitoring. The registry lookup is passed in rather
+  // than imported there: window registry internals stay inside main-only
+  // modules (see the boundaries test).
+  startPerformanceMonitoring({
+    isProductWebContents: (webContentsId) =>
+      windowRegistry.sessionForWebContents(webContentsId) !== undefined,
   });
+
+  // Handle dyad-media:// requests. Media-library tiles use bounded, cached
+  // derivatives while explicit previews continue to receive the source file.
+  protocol.handle(
+    "dyad-media",
+    createDyadMediaProtocolHandler({
+      cacheRoot: getMediaThumbnailCacheRoot(app.getPath("sessionData")),
+      resolveAppPath: getDyadAppPath,
+      resolveAppId: async (appId) => {
+        const appRecord = await db.query.apps.findFirst({
+          where: eq(apps.id, appId),
+          columns: { path: true },
+        });
+        return appRecord ? getDyadAppPath(appRecord.path) : null;
+      },
+      fetchFile: (url) => net.fetch(url),
+      createThumbnailFromPath: (sourcePath, size) =>
+        createPlatformThumbnailFromPath(nativeImage, sourcePath, size),
+    }),
+  );
 
   const shouldUseManagedNode =
     settings.nodeRuntimePreference === "managed" && !settings.customNodePath;
@@ -464,7 +649,7 @@ export async function onReady() {
   }
 
   await onFirstRunMaybe(settings);
-  createWindow();
+  await createFreshStartupWindow();
   createApplicationMenu();
 
   sendTelemetryEvent("runtime_source", {
@@ -502,6 +687,25 @@ export async function onReady() {
       },
     }); // additional configuration options available
   }
+}
+
+function scheduleSafeStorageKeychainUnlockRetryAfterRendererLoad(): void {
+  setSafeStorageRecoveryFailureListener(
+    scheduleSafeStorageKeychainUnlockRetryAfterRendererLoad,
+  );
+  if (safeStorageKeychainUnlockRetryScheduled) {
+    return;
+  }
+  safeStorageKeychainUnlockRetryScheduled = true;
+  setTimeout(() => {
+    try {
+      if (recoveryNeedsKeychainUnlock() && retryRecoveryWithKeychainUnlock()) {
+        rewriteRecoveredSafeStorageSecretsAfterKeychainUnlock();
+      }
+    } finally {
+      safeStorageKeychainUnlockRetryScheduled = false;
+    }
+  }, 0);
 }
 
 export async function onFirstRunMaybe(settings: UserSettings) {
@@ -550,14 +754,173 @@ declare global {
 }
 
 let mainWindow: BrowserWindow | null = null;
+const productWindows = new Map<WindowSessionId, BrowserWindow>();
+const productWindowDescriptors = new Map<
+  WindowSessionId,
+  WindowSessionDescriptor
+>();
+let lastClosedWindowSession: WindowSessionDescriptor | undefined;
+let hasCreatedInitialWindow = false;
 let pendingForceCloseData: any = null;
 let pendingActiveChatId: number | null = null;
 let pendingCrashDetected = false;
 let isAppQuitting = false;
+let safeStorageKeychainUnlockRetryScheduled = false;
+const lifecycleLogger = log.scope("app_lifecycle");
+const lifecycleStartedAt = Date.now();
+let lifecycleSequence = 0;
 
-const createWindow = () => {
+function logLifecycle(
+  event: string,
+  details: Record<string, unknown> = {},
+): void {
+  let windows: Array<{
+    id: number;
+    destroyed: boolean;
+    visible: boolean;
+    focused: boolean;
+    webContentsDestroyed: boolean;
+  }> = [];
+  try {
+    windows = BrowserWindow.getAllWindows().map((window) => ({
+      id: window.id,
+      destroyed: window.isDestroyed(),
+      visible: window.isVisible(),
+      focused: window.isFocused(),
+      webContentsDestroyed: window.webContents.isDestroyed(),
+    }));
+  } catch (error) {
+    lifecycleLogger.warn("snapshot-failed", event, error);
+  }
+
+  lifecycleLogger.info(event, {
+    sequence: ++lifecycleSequence,
+    elapsedMs: Date.now() - lifecycleStartedAt,
+    isAppQuitting,
+    hasCreatedInitialWindow,
+    mainWindowId:
+      mainWindow && !mainWindow.isDestroyed() ? mainWindow.id : null,
+    productWindowCount: productWindows.size,
+    windows,
+    ...details,
+  });
+}
+
+async function observeLifecycleCleanup(
+  name: string,
+  cleanup: () => Promise<void>,
+): Promise<void> {
+  const startedAt = Date.now();
+  logLifecycle("cleanup:start", { name });
+  try {
+    await cleanup();
+    logLifecycle("cleanup:settled", {
+      name,
+      durationMs: Date.now() - startedAt,
+      outcome: "fulfilled",
+    });
+  } catch (error) {
+    logLifecycle("cleanup:settled", {
+      name,
+      durationMs: Date.now() - startedAt,
+      outcome: "rejected",
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
+}
+
+function requestRelaunchAfterQuit(deepLinkUrl?: string): void {
+  if (appRelaunchRequest.request({ deepLinkUrl })) {
+    logger.info("Reopen requested during shutdown; relaunching after cleanup");
+    logLifecycle("relaunch:requested", { hasDeepLink: !!deepLinkUrl });
+  }
+}
+
+function deliverPendingCrashRecovery(target: BrowserWindow): void {
+  if (!pendingCrashDetected || target !== mainWindow || target.isDestroyed()) {
+    return;
+  }
+
+  target.webContents.send("force-close-detected", {
+    ...(pendingForceCloseData && {
+      performanceData: pendingForceCloseData,
+    }),
+    ...(pendingActiveChatId != null && {
+      activeChatId: pendingActiveChatId,
+    }),
+  });
+
+  const nativeCrash = pendingNativeBrowserCrash?.summary ?? null;
+  const nativeCrashAttribution = pendingNativeBrowserCrash?.attribution ?? null;
+  // A report started from the crash dialog names this dump.
+  recordPreviousSessionCrash(pendingNativeBrowserCrash?.dumpFile ?? null);
+  pendingNativeBrowserCrash = null;
+
+  const oom = classifyOom({
+    nativeCrash,
+    performance: pendingForceCloseData,
+  });
+
+  sendTelemetryEventToWindow(target, "app:crash_detected", {
+    // Mark as error so renderer PostHog before_send sampling does not
+    // drop 90% of events for non-Pro users (see src/renderer.tsx).
+    error: true,
+    has_performance_data: !!pendingForceCloseData,
+    ...(pendingForceCloseData &&
+      crashPerformanceEventFields(pendingForceCloseData)),
+    // "native" when a minidump was attributed to this crash, else
+    // "unknown" (no dump: force-kill / OOM-kill / power loss / missed).
+    crash_cause: nativeCrash ? "native" : "unknown",
+    ...(nativeCrash && {
+      // "ptype" when the dump named the browser process itself; "sentinel"
+      // when an annotation-stripped dump was correlated with the crash
+      // sentinel instead (see browserCrashAttribution). Sentinel
+      // attribution is weaker: the dump could belong to a child process
+      // that also lost its labels.
+      crash_attribution: nativeCrashAttribution,
+      crash_reason: nativeCrash.crashReason,
+      exception_code: nativeCrash.exceptionCode,
+      fault_address: nativeCrash.faultAddress,
+      access_type: nativeCrash.accessType,
+      in_page_error_status: nativeCrash.inPageErrorStatus,
+      oom_allocation_size_bytes: nativeCrash.oomAllocationSizeBytes,
+      fast_fail_code: nativeCrash.fastFailCode,
+      faulting_module: nativeCrash.faultingModule,
+      faulting_offset: nativeCrash.faultingOffset,
+      faulting_debug_file: nativeCrash.faultingDebugFile,
+      faulting_debug_id: nativeCrash.faultingDebugId,
+    }),
+    ...(nativeCrash?.annotations &&
+      crashAnnotationEventFields(nativeCrash.annotations)),
+    // The OOM verdict and the signals behind it (see classifyOom).
+    // Comma-joined: crash event properties stay scalar for PostHog.
+    oom_verdict: oom.verdict,
+    ...(oom.signals.length > 0 && { oom_signals: oom.signals.join(",") }),
+    // How big the app was that this session died on. Same helper as
+    // app:initial-load, so both events carry identical fields.
+    ...appSizeEventFields(getPreviousSessionAppSize()),
+  });
+
+  pendingForceCloseData = null;
+  pendingActiveChatId = null;
+  pendingCrashDetected = false;
+}
+
+const createWindow = ({
+  windowSessionId = randomUUID() as WindowSessionId,
+  visibleEntity,
+}: Partial<WindowSessionDescriptor> = {}): {
+  windowSessionId: WindowSessionId;
+  browserWindow: BrowserWindow;
+  rendererLoad: Promise<void>;
+} => {
+  if (isAppQuitting) {
+    throw new DyadError("Dyad is shutting down", DyadErrorKind.Precondition);
+  }
+
   // Create the browser window.
-  mainWindow = new BrowserWindow({
+  const browserWindow = new BrowserWindow({
     width: process.env.NODE_ENV === "development" ? 1280 : 960,
     minWidth: 800,
     height: 700,
@@ -578,35 +941,150 @@ const createWindow = () => {
     // backgroundColor: "#00000001",
     // frame: false,
   });
-  // In development, wait for DevTools to open, then reload the page once so React DevTools initializes correctly
-  if (process.env.NODE_ENV === "development") {
-    mainWindow.webContents.once("devtools-opened", () => {
-      setTimeout(() => {
-        const windowRef = mainWindow;
-        if (!windowRef?.isDestroyed()) {
-          windowRef?.webContents.reloadIgnoringCache();
-        }
-      }, 300);
+  mainWindow = browserWindow;
+  deepLinkWindowReadiness.setTarget(browserWindow);
+  crashRecoveryWindowReadiness.setTarget(browserWindow);
+  productWindows.set(windowSessionId, browserWindow);
+  productWindowDescriptors.set(windowSessionId, {
+    windowSessionId,
+    visibleEntity,
+  });
+  logLifecycle("window:created", {
+    windowId: browserWindow.id,
+    windowSessionId,
+  });
+  windowRegistry.register(browserWindow.webContents, windowSessionId);
+  browserWindow.on("focus", () => {
+    mainWindow = browserWindow;
+    deepLinkWindowReadiness.setTarget(browserWindow);
+    crashRecoveryWindowReadiness.setTarget(browserWindow);
+    windowRegistry.setFocused(windowSessionId);
+  });
+  browserWindow.once("closed", () => {
+    const descriptor = productWindowDescriptors.get(windowSessionId);
+    const retainForActivation = shouldRetainClosedWindowForActivation({
+      isAppQuitting,
+      openWindowCountBeforeClose: productWindows.size,
     });
-    mainWindow.webContents.openDevTools();
-  }
+    productWindows.delete(windowSessionId);
+    productWindowDescriptors.delete(windowSessionId);
+    if (retainForActivation && descriptor) {
+      lastClosedWindowSession = descriptor;
+    }
+    if (mainWindow === browserWindow) {
+      mainWindow =
+        [...productWindows.values()].find((window) => window.isFocused()) ??
+        [...productWindows.values()].at(-1) ??
+        null;
+      deepLinkWindowReadiness.setTarget(mainWindow);
+      crashRecoveryWindowReadiness.setTarget(mainWindow);
+    }
+    logLifecycle("window:closed", {
+      windowId: browserWindow.id,
+      windowSessionId,
+      retainedForActivation: retainForActivation,
+    });
+  });
+  browserWindow.on("close", (event) => {
+    logLifecycle("window:close", {
+      windowId: browserWindow.id,
+      windowSessionId,
+      defaultPrevented: event.defaultPrevented,
+    });
+  });
+  browserWindow.on("unresponsive", () => {
+    logLifecycle("window:unresponsive", {
+      windowId: browserWindow.id,
+      windowSessionId,
+    });
+  });
+  browserWindow.on("responsive", () => {
+    logLifecycle("window:responsive", {
+      windowId: browserWindow.id,
+      windowSessionId,
+    });
+  });
+  browserWindow.webContents.on("will-prevent-unload", (event) => {
+    logLifecycle("renderer:will-prevent-unload", {
+      windowId: browserWindow.id,
+      windowSessionId,
+      defaultPrevented: event.defaultPrevented,
+    });
+  });
+  const packagedRendererUrl = pathToFileURL(
+    path.join(__dirname, "../renderer/main_window/index.html"),
+  ).href;
+  const allowedDevServerUrl = MAIN_WINDOW_VITE_DEV_SERVER_URL || undefined;
+  configureTrustedRenderer({
+    devServerUrl: allowedDevServerUrl,
+    packagedRendererUrl,
+  });
+  const rejectUnexpectedNavigation = (
+    event: ElectronEvent<{ isMainFrame: boolean; url: string }>,
+  ) => {
+    if (
+      shouldBlockMainWindowNavigation(
+        event.url,
+        event.isMainFrame,
+        allowedDevServerUrl,
+        packagedRendererUrl,
+      )
+    ) {
+      event.preventDefault();
+      logger.warn("Blocked unexpected main-window navigation:", event.url);
+    }
+  };
+  browserWindow.webContents.on("will-navigate", rejectUnexpectedNavigation);
+  browserWindow.webContents.on("will-redirect", rejectUnexpectedNavigation);
+  const previewPopupWindows = new Set<BrowserWindow>();
+  browserWindow.webContents.setWindowOpenHandler((details) => {
+    const response = getWindowOpenHandlerResponse(details, allowedDevServerUrl);
+    if (response.action === "deny") {
+      logger.warn("Blocked unexpected child window:", details.url);
+      return response;
+    }
+
+    logger.debug("Allowing sandboxed preview child window:", details.url);
+    return {
+      ...response,
+      createWindow: (options) => {
+        const popup = new BrowserWindow(securePreviewPopupOptions(options));
+        previewPopupWindows.add(popup);
+        popup.once("closed", () => previewPopupWindows.delete(popup));
+        popup.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+        return popup.webContents;
+      },
+    };
+  });
+  browserWindow.webContents.on(
+    "did-start-navigation",
+    (_event, _url, isInPlace, isMainFrame) => {
+      if (!isMainFrame || isInPlace) return;
+
+      deepLinkWindowReadiness.markNotReady(browserWindow);
+      crashRecoveryWindowReadiness.markNotReady(browserWindow);
+    },
+  );
 
   // and load the index.html of the app.
+  let initialLoad: Promise<void>;
   if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
-    mainWindow.loadURL(MAIN_WINDOW_VITE_DEV_SERVER_URL);
+    initialLoad = browserWindow.loadURL(MAIN_WINDOW_VITE_DEV_SERVER_URL);
   } else {
-    mainWindow.loadFile(
+    initialLoad = browserWindow.loadFile(
       path.join(__dirname, "../renderer/main_window/index.html"),
     );
   }
+  void initialLoad.catch((error) => {
+    logger.error("Product window renderer failed to load:", error);
+  });
 
   // Handle force-close message and development reload coordination
-  let forceCloseMessageSent = false;
   let devToolsReloadedCount = 0;
-
-  mainWindow.webContents.on("did-finish-load", () => {
-    // Must run on first load, else deep links break in dev.
-    deepLinkQueue.markReady();
+  browserWindow.webContents.on("did-finish-load", () => {
+    // Mark every completed load ready before development-only coordination so
+    // transport readiness does not depend on the DevTools reload heuristic.
+    deepLinkWindowReadiness.markReady(browserWindow);
 
     if (process.env.NODE_ENV === "development") {
       // In dev, wait until AFTER the DevTools-triggered reload before sending the message
@@ -620,58 +1098,10 @@ const createWindow = () => {
     // the main process crashed natively, that summary becomes the crash cause
     // reported in app:crash_detected.
     processNativeCrashDumps();
-
-    // Send force-close once after the correct load
-    if (pendingCrashDetected && !forceCloseMessageSent) {
-      forceCloseMessageSent = true;
-
-      const windowRef = mainWindow;
-      if (!windowRef?.isDestroyed()) {
-        windowRef?.webContents.send("force-close-detected", {
-          ...(pendingForceCloseData && {
-            performanceData: pendingForceCloseData,
-          }),
-          ...(pendingActiveChatId != null && {
-            activeChatId: pendingActiveChatId,
-          }),
-        });
-      }
-
-      const nativeCrash = pendingNativeBrowserCrash;
-      pendingNativeBrowserCrash = null;
-
-      sendTelemetryEvent("app:crash_detected", {
-        // Mark as error so renderer PostHog before_send sampling does not
-        // drop 90% of events for non-Pro users (see src/renderer.tsx).
-        error: true,
-        has_performance_data: !!pendingForceCloseData,
-        ...(pendingForceCloseData && {
-          last_known_memory_mb: pendingForceCloseData.memoryUsageMB,
-          last_known_cpu_pct: pendingForceCloseData.cpuUsagePercent,
-          last_known_system_memory_mb:
-            pendingForceCloseData.systemMemoryUsageMB,
-          last_known_system_memory_total_mb:
-            pendingForceCloseData.systemMemoryTotalMB,
-          last_known_system_cpu_pct: pendingForceCloseData.systemCpuPercent,
-          last_known_snapshot_timestamp: pendingForceCloseData.timestamp,
-          time_since_last_heartbeat_ms:
-            Date.now() - pendingForceCloseData.timestamp,
-        }),
-        // "native" when a main-process minidump was captured for this crash,
-        // else "unknown" (no dump: force-kill / OOM-kill / power loss / missed).
-        crash_cause: nativeCrash ? "native" : "unknown",
-        ...(nativeCrash && {
-          crash_reason: nativeCrash.crashReason,
-          exception_code: nativeCrash.exceptionCode,
-          faulting_module: nativeCrash.faultingModule,
-          faulting_offset: nativeCrash.faultingOffset,
-        }),
-      });
-
-      pendingForceCloseData = null;
-      pendingActiveChatId = null;
-      pendingCrashDetected = false;
-    }
+    // Crash recovery follows the focused/current product window and waits for
+    // its post-DevTools-reload renderer. Background product windows cannot
+    // consume the one-shot dialog or telemetry event.
+    crashRecoveryWindowReadiness.markReady(browserWindow);
 
     // Forward any pending renderer crash recorded on a previous load. We send
     // this from `did-finish-load` rather than `render-process-gone` because the
@@ -679,7 +1109,7 @@ const createWindow = () => {
     const rendererCrash = readRendererCrashRecord();
     if (rendererCrash) {
       const perf = rendererCrash.performance;
-      sendTelemetryEvent("renderer:crash_detected", {
+      sendTelemetryEventToWindow(browserWindow, "renderer:crash_detected", {
         // Mark as error so renderer PostHog before_send sampling does not
         // drop 90% of events for non-Pro users (see src/renderer.tsx).
         error: true,
@@ -691,34 +1121,45 @@ const createWindow = () => {
         // Mirror the `app:crash_detected` performance fields so the two
         // events can be unioned in PostHog without per-event field mapping.
         has_performance_data: !!perf,
-        ...(perf && {
-          last_known_memory_mb: perf.memoryUsageMB,
-          last_known_cpu_pct: perf.cpuUsagePercent,
-          last_known_system_memory_mb: perf.systemMemoryUsageMB,
-          last_known_system_memory_total_mb: perf.systemMemoryTotalMB,
-          last_known_system_cpu_pct: perf.systemCpuPercent,
-          last_known_snapshot_timestamp: perf.timestamp,
-          // Match `app:crash_detected` semantics: measured at send time, not
-          // crash time. `ms_since_crash` already covers the crash → send gap.
-          time_since_last_heartbeat_ms: Date.now() - perf.timestamp,
-        }),
+        ...(perf && crashPerformanceEventFields(perf)),
       });
       clearRendererCrashRecord();
     }
+
+    scheduleSafeStorageKeychainUnlockRetryAfterRendererLoad();
   });
+  // Start the development-only DevTools reload after the initial renderer load
+  // succeeds. Explicit new-window creation can safely await `initialLoad`
+  // without that intentional reload aborting its promise.
+  if (process.env.NODE_ENV === "development") {
+    void initialLoad.then(
+      () => {
+        if (browserWindow.isDestroyed()) return;
+        browserWindow.webContents.once("devtools-opened", () => {
+          setTimeout(() => {
+            if (!browserWindow.isDestroyed()) {
+              browserWindow.webContents.reloadIgnoringCache();
+            }
+          }, 300);
+        });
+        browserWindow.webContents.openDevTools();
+      },
+      () => undefined,
+    );
+  }
 
   // Persist any non-clean renderer-process termination so we can report it on
   // the next successful renderer load. We deliberately do nothing here besides
   // writing the record: triggering reloads/dialogs is out of scope for the
   // telemetry hook.
-  mainWindow.webContents.on("render-process-gone", (_event, details) => {
+  browserWindow.webContents.on("render-process-gone", (_event, details) => {
     if (isAppQuitting) {
       return;
     }
     if (details.reason === "clean-exit") {
       return;
     }
-    logger.warn(
+    logger.error(
       "Renderer process gone:",
       details.reason,
       "exitCode=",
@@ -736,7 +1177,7 @@ const createWindow = () => {
   });
 
   // Enable native context menu on right-click
-  mainWindow.webContents.on("context-menu", (event, params) => {
+  browserWindow.webContents.on("context-menu", (event, params) => {
     // Prevent any default behavior and show our own menu
     event.preventDefault();
 
@@ -757,7 +1198,7 @@ const createWindow = () => {
             label: suggestion,
             click: () => {
               try {
-                mainWindow?.webContents.replaceMisspelling(suggestion);
+                browserWindow.webContents.replaceMisspelling(suggestion);
               } catch (error) {
                 logger.error("Failed to replace misspelling:", error);
               }
@@ -786,15 +1227,86 @@ const createWindow = () => {
         {
           label: "Inspect Element",
           click: () =>
-            mainWindow?.webContents.inspectElement(params.x, params.y),
+            browserWindow.webContents.inspectElement(params.x, params.y),
         },
       );
     }
 
     const menu = Menu.buildFromTemplate(template);
-    menu.popup({ window: mainWindow! });
+    menu.popup({ window: browserWindow });
   });
+  return { windowSessionId, browserWindow, rendererLoad: initialLoad };
 };
+
+async function createFreshStartupWindow(): Promise<void> {
+  try {
+    await clearLegacyWindowSessionPersistence(app.getPath("userData"));
+  } catch (error) {
+    logger.error(
+      "Failed to clear legacy window sessions; continuing with one fresh window:",
+      error,
+    );
+  }
+  if (isAppQuitting) {
+    logger.info("Skipping initial window creation during shutdown");
+    return;
+  }
+  createWindow({ windowSessionId: PRIMARY_WINDOW_SESSION_ID });
+  hasCreatedInitialWindow = true;
+}
+
+configureWindowProductController({
+  openEntityInNewWindow: async (entity) => {
+    if (productWindows.size >= MAX_PRODUCT_WINDOWS) {
+      throw new DyadError(
+        `Dyad supports up to ${MAX_PRODUCT_WINDOWS} open windows`,
+        DyadErrorKind.Precondition,
+      );
+    }
+    try {
+      const created = createWindow({
+        windowSessionId: randomUUID() as WindowSessionId,
+        visibleEntity: entity,
+      });
+      return await awaitProductWindowRenderer({
+        rendererLoad: created.rendererLoad,
+        result: created.windowSessionId,
+        rollback: () => {
+          const {
+            windowSessionId: failedSessionId,
+            browserWindow: failedWindow,
+          } = created;
+          const failedWebContentsId = failedWindow.webContents.id;
+          productWindows.delete(failedSessionId);
+          productWindowDescriptors.delete(failedSessionId);
+          if (!failedWindow.isDestroyed()) failedWindow.destroy();
+          windowRegistry.unregister(failedWebContentsId);
+        },
+      });
+    } catch (error) {
+      if (isDyadError(error)) throw error;
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new DyadError(
+        `Failed to open a new window: ${detail}`,
+        DyadErrorKind.External,
+        { cause: error },
+      );
+    }
+  },
+  initialEntityForSession: (windowSessionId) =>
+    productWindowDescriptors.get(windowSessionId)?.visibleEntity,
+  setVisibleEntities: (windowSessionId, entities) => {
+    const descriptor = productWindowDescriptors.get(windowSessionId);
+    if (!descriptor) return;
+    productWindowDescriptors.set(windowSessionId, {
+      ...descriptor,
+      visibleEntity: restorableVisibleEntity(entities),
+    });
+  },
+  mayMigrateLegacyChatTabSession: (windowSessionId) =>
+    productWindows.keys().next().value === windowSessionId,
+  restorableWindowSessionIds: () => [...productWindows.keys()],
+});
 
 /**
  * Create application menu with Edit shortcuts (Undo, Redo, Cut, Copy, Paste, etc.)
@@ -842,12 +1354,22 @@ const createApplicationMenu = () => {
     {
       label: "View",
       submenu: [
-        { role: "reload" as const },
-        { role: "forceReload" as const },
-        ...(process.env.NODE_ENV === "development"
-          ? [{ role: "toggleDevTools" as const }]
-          : []),
+        {
+          label: "Reload Dyad",
+          click: () => BrowserWindow.getFocusedWindow()?.reload(),
+        },
+        {
+          label: "Force Reload Dyad",
+          click: () =>
+            BrowserWindow.getFocusedWindow()?.webContents.reloadIgnoringCache(),
+        },
         { type: "separator" as const },
+        ...(process.env.NODE_ENV === "development"
+          ? [
+              { role: "toggleDevTools" as const },
+              { type: "separator" as const },
+            ]
+          : []),
         { role: "togglefullscreen" as const },
       ],
     },
@@ -887,6 +1409,14 @@ protocol.registerSchemesAsPrivileged([
   },
 ]);
 
+// A cold-start protocol URL arrives in argv before any renderer is ready.
+// Queue it in both production and E2E builds; the latter skips only the
+// singleton lock so parallel test processes can coexist.
+const initialDeepLink = process.argv.find((arg) => arg.startsWith("dyad://"));
+if (initialDeepLink) {
+  deepLinkQueue.handle(initialDeepLink);
+}
+
 // Skip singleton lock for E2E test builds to allow parallel test execution.
 // Deep link handling still works via the 'open-url' event registered below.
 // The 'second-instance' handler is intentionally omitted since it requires the singleton lock.
@@ -896,32 +1426,26 @@ if (IS_TEST_BUILD) {
   const gotTheLock = app.requestSingleInstanceLock();
 
   if (!gotTheLock) {
+    // This instance already logged a start banner above, so terminate it.
+    log.info(formatExitBanner(process.pid, "duplicate instance"));
     app.quit();
   } else {
     app.on("second-instance", (_event, commandLine, _workingDirectory) => {
+      const url = commandLine.find((arg) => arg.startsWith("dyad://"));
+      if (isAppQuitting) {
+        requestRelaunchAfterQuit(url);
+        return;
+      }
+
       // Someone tried to run a second instance, we should focus our window.
       if (mainWindow) {
         if (mainWindow.isMinimized()) mainWindow.restore();
         mainWindow.focus();
       }
-      // the commandLine is array of strings in which last element is deep link url
-      const url = commandLine.at(-1);
       if (url) {
         deepLinkQueue.handle(url);
       }
     });
-
-    // On a cold start the deep link arrives in this instance's argv (the
-    // .desktop Exec %u), and second-instance only fires for later launches, so
-    // drain the initial argv here. The queue holds it until the app is ready.
-    // This runs on every launch, so match by dyad:// prefix to ignore the
-    // normal (no-deep-link) startup args.
-    const initialDeepLink = process.argv.find((arg) =>
-      arg.startsWith("dyad://"),
-    );
-    if (initialDeepLink) {
-      deepLinkQueue.handle(initialDeepLink);
-    }
 
     startAppWhenReady();
   }
@@ -929,6 +1453,10 @@ if (IS_TEST_BUILD) {
 
 // Handle the protocol. In this case, we choose to show an Error Box.
 app.on("open-url", (event, url) => {
+  if (isAppQuitting) {
+    requestRelaunchAfterQuit(url);
+    return;
+  }
   deepLinkQueue.handle(url);
 });
 
@@ -945,6 +1473,34 @@ function showDeepLinkSettingsError(action: string, error: unknown): void {
   dialog.showErrorBox(
     "Unable to Save Settings",
     `Failed to ${action}: ${getErrorMessage(error)}`,
+  );
+}
+
+/**
+ * Surfaces a Neon/Supabase deep-link callback that did not claim an active
+ * flow. The proxy's success page keeps an "Open Dyad" link that replays the
+ * same callback, so a repeat of one Dyad already accepted is logged and
+ * dropped quietly; only unknown, stale, or expired callbacks get the dialog.
+ * Neither path writes credentials.
+ */
+function reportUnclaimedOAuthReturn(
+  provider: "neon" | "supabase",
+  label: string,
+  invocationRef: ConnectionFlowInvocationRef,
+  error: unknown,
+) {
+  if (
+    connectionFlowRegistry.isDuplicateOfAcceptedReturn(provider, invocationRef)
+  ) {
+    logger.info(
+      `Ignoring repeat ${provider} OAuth callback for an already accepted connection flow.`,
+    );
+    return;
+  }
+  logger.warn(`Rejected unmatched ${provider} OAuth callback:`, error);
+  dialog.showErrorBox(
+    "Sign-in Could Not Be Verified",
+    `This ${label} sign-in expired or no longer matches the connection started by Dyad. Please connect again.`,
   );
 }
 
@@ -983,16 +1539,39 @@ async function handleDeepLinkReturn(url: string) {
       );
       return;
     }
-    try {
-      handleNeonOAuthReturn({ token, refreshToken, expiresIn });
-    } catch (error) {
-      showDeepLinkSettingsError("save Neon credentials", error);
+    const expectedInvocationRef = parseOAuthCallbackInvocationRef(
+      "neon",
+      parsed.searchParams.get("state"),
+    );
+    if (!expectedInvocationRef) {
+      dialog.showErrorBox(
+        "Invalid URL",
+        "This Neon sign-in could not be verified. Please connect again from Dyad.",
+      );
       return;
     }
-    // Send message to renderer to trigger re-render
-    mainWindow?.webContents.send("deep-link-received", {
-      type: parsed.hostname,
-    });
+    {
+      // Runs the token write through the connection flow machine. Only the
+      // exact active invocation may advance and persist credentials.
+      const outcome = await runOAuthReturnExchange(
+        "neon",
+        () => {
+          handleNeonOAuthReturn({ token, refreshToken, expiresIn });
+        },
+        { expectedInvocationRef },
+      );
+      if (!outcome.ok) {
+        if (!outcome.claimed) {
+          reportUnclaimedOAuthReturn(
+            "neon",
+            "Neon",
+            expectedInvocationRef,
+            outcome.error,
+          );
+        }
+        return;
+      }
+    }
     return;
   }
   if (parsed.hostname === "supabase-oauth-return") {
@@ -1006,16 +1585,39 @@ async function handleDeepLinkReturn(url: string) {
       );
       return;
     }
-    try {
-      await handleSupabaseOAuthReturn({ token, refreshToken, expiresIn });
-    } catch (error) {
-      showDeepLinkSettingsError("save Supabase credentials", error);
+    const expectedInvocationRef = parseOAuthCallbackInvocationRef(
+      "supabase",
+      parsed.searchParams.get("state"),
+    );
+    if (!expectedInvocationRef) {
+      dialog.showErrorBox(
+        "Invalid URL",
+        "This Supabase sign-in could not be verified. Please connect again from Dyad.",
+      );
       return;
     }
-    // Send message to renderer to trigger re-render
-    mainWindow?.webContents.send("deep-link-received", {
-      type: parsed.hostname,
-    });
+    {
+      // See the neon-oauth-return branch above for why the token write is
+      // wrapped by the connection flow machine.
+      const outcome = await runOAuthReturnExchange(
+        "supabase",
+        async () => {
+          await handleSupabaseOAuthReturn({ token, refreshToken, expiresIn });
+        },
+        { expectedInvocationRef },
+      );
+      if (!outcome.ok) {
+        if (!outcome.claimed) {
+          reportUnclaimedOAuthReturn(
+            "supabase",
+            "Supabase",
+            expectedInvocationRef,
+            outcome.error,
+          );
+        }
+        return;
+      }
+    }
     return;
   }
   // dyad://dyad-pro-return?key=123&budget_reset_at=2025-05-26T16:31:13.492000Z&max_budget=100
@@ -1042,6 +1644,14 @@ async function handleDeepLinkReturn(url: string) {
   // Fired by the OAuth callback page to hand focus back to Dyad
   // after consent. Tokens land via the loopback listener; focusing
   // the window is the only side-effect needed here.
+  if (parsed.hostname === "chatgpt-connected") {
+    if (mainWindow?.isMinimized()) mainWindow.restore();
+    mainWindow?.focus();
+    mainWindow?.webContents.send("deep-link-received", {
+      type: "chatgpt-connected",
+    });
+    return;
+  }
   if (parsed.hostname === "mcp-oauth-return") {
     if (mainWindow) {
       if (mainWindow.isMinimized()) mainWindow.restore();
@@ -1108,11 +1718,45 @@ async function handleDeepLinkReturn(url: string) {
   dialog.showErrorBox("Invalid deep link URL", url);
 }
 
+// Report unexpected utility process deaths (tsc worker, code explorer).
+// These do not take down the app, so we can report them right away.
+// Skip clean-exit and killed: routine teardown stops these workers with
+// kill(), and reporting that would flood telemetry with non-crashes.
+app.on("child-process-gone", (_event, details) => {
+  if (details.type !== "Utility" || isAppQuitting) {
+    return;
+  }
+  if (details.reason === "clean-exit" || details.reason === "killed") {
+    return;
+  }
+  logger.error(
+    "Utility process gone:",
+    details.serviceName,
+    details.reason,
+    "exitCode=",
+    details.exitCode,
+  );
+  sendTelemetryEvent("utility_process:crash_detected", {
+    // Mark as error so renderer PostHog before_send sampling does not
+    // drop 90% of events for non-Pro users (see src/renderer.tsx).
+    error: true,
+    reason: details.reason,
+    exit_code: details.exitCode,
+    service_name: details.serviceName,
+    process_name: details.name,
+  });
+});
+
 // Quit when all windows are closed, except on macOS. There, it's common
 // for applications and their menu bar to stay active until the user quits
 // explicitly with Cmd + Q.
 app.on("window-all-closed", () => {
-  if (process.platform !== "darwin") {
+  const shouldQuit = shouldQuitAfterAllWindowsClosed(
+    process.platform,
+    isAppQuitting,
+  );
+  logLifecycle("app:window-all-closed", { shouldQuit });
+  if (shouldQuit) {
     app.quit();
   }
 });
@@ -1120,14 +1764,57 @@ app.on("window-all-closed", () => {
 // Clear the crash sentinel as early as possible on clean exit so that slow
 // cleanup in will-quit cannot race against OS-imposed termination timeouts
 // (e.g. Windows WM_ENDSESSION) and leave the sentinel behind as a false positive.
-app.on("before-quit", () => {
+const handleMcpBeforeQuit = createMcpBeforeQuitHandler({
+  quit: () => {
+    logLifecycle("app:quit-resume");
+    appRelaunchRequest.finish({
+      currentArgs: process.argv.slice(1),
+      relaunch: (options) => {
+        logLifecycle("app:relaunch", {
+          argumentCount: options?.args?.length ?? 0,
+        });
+        app.relaunch(options);
+      },
+      quit: () => {
+        logLifecycle("app:quit-reentered");
+        app.quit();
+      },
+    });
+  },
+  cleanup: async () => {
+    await Promise.all([
+      observeLifecycleCleanup("mcp-clients", () =>
+        disposeMcpClientsForShutdown(),
+      ),
+      observeLifecycleCleanup("mcp-oauth", () => disposeMcpOAuthForShutdown()),
+      observeLifecycleCleanup("connection-flows", () =>
+        disposeConnectionFlowsForShutdown(),
+      ),
+      observeLifecycleCleanup("remote-machine-host", () =>
+        remoteMachineHost.dispose(),
+      ),
+    ]);
+  },
+});
+
+app.on("before-quit", (event) => {
+  logLifecycle("app:before-quit", {
+    defaultPreventedBeforeHandler: event.defaultPrevented,
+  });
   isAppQuitting = true;
   clearCrashSentinel();
+  handleMcpBeforeQuit(event);
+  logLifecycle("app:before-quit-handler-complete", {
+    defaultPreventedAfterHandler: event.defaultPrevented,
+  });
 });
 
 // IMPORTANT: This handler must be synchronous because Electron's EventEmitter
 // does not await async callbacks — the returned Promise would be silently ignored.
 app.on("will-quit", () => {
+  windowsResourceHelper.dispose();
+  stopClaudeProcesses();
+  logLifecycle("app:will-quit");
   logger.info("App is quitting");
 
   // Stop the garbage collection timer
@@ -1135,17 +1822,55 @@ app.on("will-quit", () => {
 
   // Synchronously send kill signals to all running apps (fire-and-forget).
   // We cannot use async/await here because Electron won't wait for it.
+  stopAllAppTestsSync();
   stopAllAppsSync();
 
   // Stop performance monitoring and capture final metrics
   stopPerformanceMonitoring();
+
+  // Stop the chat-search index maintenance timers
+  stopChatSearchIndexer();
+});
+
+app.on("quit", (_event, exitCode) => {
+  logLifecycle("app:quit", { exitCode });
+  // Unscoped and at info, matching this session's start banner. The
+  // previous-session banner is deliberately scoped and at warn; see onReady.
+  log.info(
+    formatExitBanner(
+      process.pid,
+      `exitCode=${exitCode}`,
+      Date.now() - LAUNCH_TIME,
+    ),
+  );
 });
 
 app.on("activate", () => {
+  const activationContext = {
+    isAppQuitting,
+    hasCreatedInitialWindow,
+    openWindowCount: BrowserWindow.getAllWindows().length,
+  };
+  const shouldRequestRelaunch =
+    shouldRequestRelaunchOnActivate(activationContext);
+  const shouldCreateWindow = shouldCreateWindowOnActivate(activationContext);
+  logLifecycle("app:activate", {
+    shouldRequestRelaunch,
+    shouldCreateWindow,
+  });
+  if (shouldRequestRelaunch) {
+    requestRelaunchAfterQuit();
+  }
+  if (isAppQuitting) return;
+
   // On OS X it's common to re-create a window in the app when the
   // dock icon is clicked and there are no other windows open.
-  if (BrowserWindow.getAllWindows().length === 0) {
-    createWindow();
+  if (shouldCreateWindow) {
+    const descriptor = lastClosedWindowSession ?? {
+      windowSessionId: PRIMARY_WINDOW_SESSION_ID,
+    };
+    lastClosedWindowSession = undefined;
+    createWindow(descriptor);
   }
 });
 

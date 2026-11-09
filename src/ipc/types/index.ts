@@ -30,14 +30,46 @@ export { settingsContracts } from "./settings";
 export { appContracts } from "./app";
 export { chatContracts, chatStreamContract } from "./chat";
 export { agentContracts, agentEvents } from "./agent";
-export { githubContracts, gitContracts, githubEvents } from "./github";
-export { mcpContracts, mcpEvents } from "./mcp";
+export { githubContracts, gitContracts, gitEvents } from "./github";
+export {
+  connectionFlowContracts,
+  connectionFlowEvents,
+} from "./connection_flow";
+export { mcpContracts } from "./mcp";
 export { vercelContracts } from "./vercel";
-export { supabaseContracts } from "./supabase";
+export { cloudflareContracts } from "./cloudflare";
+export { coolifyContracts, coolifyEvents, coolifyEventClient } from "./coolify";
+export {
+  coolifySetupContracts,
+  coolifySetupEvents,
+  coolifySetupEventClient,
+} from "./coolify_setup";
+export type {
+  SetupTarget,
+  SetupPreflight,
+  SetupResult,
+  SetupSnapshot,
+  SetupStep,
+  RevealedCredentials,
+} from "./coolify_setup";
+export type {
+  CoolifyConnection,
+  CoolifyDeploySnapshot,
+  CoolifyStatus,
+  CoolifyDiscovery,
+  CoolifyServerInfo,
+  CoolifyProjectInfo,
+} from "./coolify";
+export { supabaseContracts, supabaseEvents } from "./supabase";
 export { neonContracts } from "./neon";
 export { migrationContracts } from "./migration";
-export { systemContracts, systemEvents } from "./system";
-export { versionContracts, MAX_VERSION_NOTE_LENGTH } from "./version";
+export { systemContracts, systemEvents, systemSendContracts } from "./system";
+export {
+  versionContracts,
+  versionEvents,
+  versionEventClient,
+  MAX_VERSION_NOTE_LENGTH,
+} from "./version";
 export { languageModelContracts } from "./language-model";
 export { promptContracts } from "./prompts";
 export { templateContracts } from "./templates";
@@ -54,10 +86,34 @@ export { freeAgentQuotaContracts } from "./free_agent_quota";
 export { freeModelQuotaContracts } from "./free_model_quota";
 export { audioContracts } from "./audio";
 export { mediaContracts } from "./media";
-export { imageGenerationContracts } from "./image_generation";
+export {
+  imageGenerationContracts,
+  imageGenerationEvents,
+} from "./image_generation";
 export { appBlueprintContracts, appBlueprintEvents } from "./app_blueprint";
 export { appCollectionContracts } from "./app_collections";
 export { terminalContracts } from "./terminal";
+export { testsContracts, testsEvents } from "./tests";
+export { userInputContracts, userInputEvents } from "./user_input";
+export { firstPromptSendContracts } from "./first_prompt";
+export {
+  previewViewContracts,
+  previewViewEvents,
+  previewViewSendContracts,
+  PreviewViewBoundsSchema,
+} from "./preview_view";
+export type {
+  PreviewViewBounds,
+  PreviewViewNavigationState,
+} from "./preview_view";
+export {
+  windowInfrastructureContracts,
+  windowInfrastructureEvents,
+} from "./window_infrastructure";
+export {
+  distributedMachineContracts,
+  distributedMachineEvents,
+} from "./distributed_machines";
 
 // =============================================================================
 // Client Exports
@@ -67,10 +123,16 @@ export { settingsClient } from "./settings";
 export { appClient } from "./app";
 export { chatClient, chatStreamClient } from "./chat";
 export { agentClient, agentEventClient } from "./agent";
-export { githubClient, gitClient, githubEventClient } from "./github";
-export { mcpClient, mcpEventClient } from "./mcp";
+export { githubClient, gitClient, gitEventClient } from "./github";
+export { gitlabClient } from "./gitlab";
+export {
+  connectionFlowClient,
+  connectionFlowEventClient,
+} from "./connection_flow";
+export { mcpClient } from "./mcp";
 export { vercelClient } from "./vercel";
-export { supabaseClient } from "./supabase";
+export { cloudflareClient } from "./cloudflare";
+export { supabaseClient, supabaseEventClient } from "./supabase";
 export { neonClient } from "./neon";
 export { migrationClient } from "./migration";
 export { systemClient, systemEventClient } from "./system";
@@ -91,10 +153,35 @@ export { freeAgentQuotaClient } from "./free_agent_quota";
 export { freeModelQuotaClient } from "./free_model_quota";
 export { audioClient } from "./audio";
 export { mediaClient } from "./media";
-export { imageGenerationClient } from "./image_generation";
+export {
+  imageGenerationClient,
+  imageGenerationEventClient,
+} from "./image_generation";
 export { appBlueprintClient, appBlueprintEventClient } from "./app_blueprint";
 export { appCollectionClient } from "./app_collections";
 export { terminalClient } from "./terminal";
+export { testsClient, testsEventClient } from "./tests";
+export { userInputClient, userInputEventClient } from "./user_input";
+export { firstPromptClient } from "./first_prompt";
+export {
+  previewViewClient,
+  previewViewEventClient,
+  previewViewSendClient,
+} from "./preview_view";
+export {
+  windowInfrastructureClient,
+  windowInfrastructureEventClient,
+} from "./window_infrastructure";
+export {
+  distributedMachineClient,
+  distributedMachineEventClient,
+} from "./distributed_machines";
+export {
+  recordingClient,
+  recordingContracts,
+  recordingEventClient,
+  recordingEvents,
+} from "./recording";
 
 // =============================================================================
 // Type Exports
@@ -114,6 +201,7 @@ export type {
 // App types
 export type {
   App,
+  DeploymentProvidersInUse,
   CreateAppParams,
   CreateAppResult,
   CopyAppParams,
@@ -154,15 +242,18 @@ export type {
 export type {
   AgentTool,
   AgentTodo,
-  AgentToolConsentRequestPayload,
-  AgentToolConsentDecision,
-  AgentToolConsentResponseParams,
+  SubagentPersona,
+  SubagentStatus,
+  SubagentThreadSummary,
+  SubagentMessage,
+  SubagentActivity,
   AgentTodosUpdatePayload,
   AgentProblemsUpdatePayload,
   SetAgentToolConsentParams,
   Problem,
   ProblemReport,
 } from "./agent";
+export { isSubagentAcceptingMessages, isSubagentActive } from "./agent";
 
 // GitHub types
 export type {
@@ -174,7 +265,8 @@ export type {
   CommitChangesParams,
   UncommittedFile,
   UncommittedFileStatus,
-  GithubSyncOptions,
+  GetUncommittedFileDiffParams,
+  UncommittedFileDiff,
   CloneRepoParams,
   GithubRepository,
 } from "./github";
@@ -189,10 +281,7 @@ export type {
   McpListToolsResult,
   McpToolConsent,
   McpConsentValue,
-  McpConsentDecision,
   SetMcpToolConsentParams,
-  McpConsentRequestPayload,
-  McpConsentResponseParams,
 } from "./mcp";
 
 // Vercel types
@@ -208,6 +297,19 @@ export type {
   DisconnectVercelProjectParams,
 } from "./vercel";
 
+// Cloudflare types
+export type {
+  CloudflareAccount,
+  CloudflareWorkerSummary,
+  CloudflareTargetSummary,
+  CloudflareConnection,
+  CloudflareAppStatus,
+  CloudflareDeploymentStatus,
+  CloudflareRecentBuild,
+  ConnectCloudflareWorkerParams,
+  ConnectCloudflareWorkerResult,
+} from "./cloudflare";
+
 // Supabase types
 export type {
   SupabaseOrganizationInfo,
@@ -216,6 +318,15 @@ export type {
   DeleteSupabaseOrganizationParams,
   SetSupabaseAppProjectParams,
   ConsoleEntry,
+  SupabaseRedeployProgress,
+  CreateSupabaseProjectParams,
+  SupabaseRegionId,
+} from "./supabase";
+export {
+  SUPABASE_REGIONS,
+  DEFAULT_SUPABASE_REGION,
+  SUPABASE_PROJECT_NAME_MAX_LENGTH,
+  SUPABASE_PROJECT_CREATED_BUT_UNLINKED,
 } from "./supabase";
 
 // Neon types
@@ -228,6 +339,7 @@ export type {
   GetNeonProjectResponse,
   ListNeonProjectsResponse,
   NeonAuthEmailAndPasswordConfig,
+  NeonDevelopmentBranchStatus,
 } from "./neon";
 
 // Migration types
@@ -238,12 +350,14 @@ export type {
 
 // System types
 export type {
+  SystemResourceUsage,
   NodeSystemInfo,
   ManagedNodeInstallProgress,
   SystemDebugInfo,
   SelectNodeFolderResult,
   DoesReleaseNoteExistParams,
   UserBudgetInfo,
+  SubscriptionStatus,
   TelemetryEventPayload,
 } from "./system";
 
@@ -255,6 +369,9 @@ export type {
   RevertVersionResponse,
   VersionChangedFile,
   CheckoutVersionResponse,
+  RestoreToMessageParams,
+  RestoreToMessageResponse,
+  VersionCommandResult,
 } from "./version";
 
 // Language model types
@@ -264,6 +381,7 @@ export type {
   LocalModel,
   CreateCustomLanguageModelProviderParams,
   CreateCustomLanguageModelParams,
+  UpdateCustomLanguageModelParams,
 } from "./language-model";
 
 // Prompt types
@@ -347,9 +465,35 @@ export type {
 // Image generation types
 export type {
   ImageThemeMode,
-  GenerateImageParams,
-  GenerateImageResponse,
+  ImageGenerationResultView,
+  ImageGenerationOperationOutcome,
 } from "./image_generation";
+
+// Tests types
+export type {
+  TestSpec,
+  TestCase,
+  TestRunStatus,
+  TestResult,
+  TestCaseResult,
+  RunAppTestsResult,
+  TestIsolation,
+  TestOutputPayload,
+} from "./tests";
+export type {
+  UserInputDescriptorPayload,
+  UserInputResponsePayload,
+  PendingUserInputPayload,
+} from "./user_input";
+
+// Recording types
+export type {
+  RecordingAuth,
+  StartRecordingResult,
+  RecordingSetupProgressPayload,
+  RecordingEndedPayload,
+  RecordingDraftConsumedPayload,
+} from "./recording";
 
 // App blueprint types
 export type {
@@ -385,10 +529,9 @@ export {
   AgentTodoSchema,
   AgentTodosUpdateSchema,
   AgentToolSchema,
-  AgentToolConsentRequestSchema,
 } from "./agent";
 
-export { UserBudgetInfoSchema } from "./system";
+export { SubscriptionStatusSchema, UserBudgetInfoSchema } from "./system";
 
 // =============================================================================
 // Aggregated IPC Client
@@ -398,10 +541,18 @@ import { settingsClient } from "./settings";
 import { appClient } from "./app";
 import { chatClient, chatStreamClient } from "./chat";
 import { agentClient, agentEventClient } from "./agent";
-import { githubClient, gitClient, githubEventClient } from "./github";
-import { mcpClient, mcpEventClient } from "./mcp";
+import { githubClient, gitClient, gitEventClient } from "./github";
+import {
+  connectionFlowClient,
+  connectionFlowEventClient,
+} from "./connection_flow";
+import { mcpClient } from "./mcp";
 import { vercelClient } from "./vercel";
-import { supabaseClient } from "./supabase";
+import { gitlabClient } from "./gitlab";
+import { cloudflareClient } from "./cloudflare";
+import { coolifyClient, coolifyEventClient } from "./coolify";
+import { coolifySetupClient, coolifySetupEventClient } from "./coolify_setup";
+import { supabaseClient, supabaseEventClient } from "./supabase";
 import { neonClient } from "./neon";
 import { migrationClient } from "./migration";
 import { systemClient, systemEventClient } from "./system";
@@ -422,10 +573,30 @@ import { freeAgentQuotaClient } from "./free_agent_quota";
 import { freeModelQuotaClient } from "./free_model_quota";
 import { audioClient } from "./audio";
 import { mediaClient } from "./media";
-import { imageGenerationClient } from "./image_generation";
+import {
+  imageGenerationClient,
+  imageGenerationEventClient,
+} from "./image_generation";
 import { appBlueprintClient, appBlueprintEventClient } from "./app_blueprint";
 import { appCollectionClient } from "./app_collections";
 import { terminalClient } from "./terminal";
+import { testsClient, testsEventClient } from "./tests";
+import { recordingClient, recordingEventClient } from "./recording";
+import { userInputClient, userInputEventClient } from "./user_input";
+import { firstPromptClient } from "./first_prompt";
+import {
+  previewViewClient,
+  previewViewEventClient,
+  previewViewSendClient,
+} from "./preview_view";
+import {
+  windowInfrastructureClient,
+  windowInfrastructureEventClient,
+} from "./window_infrastructure";
+import {
+  distributedMachineClient,
+  distributedMachineEventClient,
+} from "./distributed_machines";
 
 /**
  * Unified IPC client with all domains organized by namespace.
@@ -460,8 +631,13 @@ export const ipc = {
   // Integrations
   github: githubClient,
   git: gitClient,
+  connectionFlow: connectionFlowClient,
   mcp: mcpClient,
   vercel: vercelClient,
+  gitlab: gitlabClient,
+  cloudflare: cloudflareClient,
+  coolify: coolifyClient,
+  coolifySetup: coolifySetupClient,
   supabase: supabaseClient,
   neon: neonClient,
   migration: migrationClient,
@@ -485,18 +661,39 @@ export const ipc = {
   freeModelQuota: freeModelQuotaClient,
   audio: audioClient,
   media: mediaClient,
-  imageGeneration: imageGenerationClient,
   appBlueprint: appBlueprintClient,
   appCollection: appCollectionClient,
   terminal: terminalClient,
+  tests: testsClient,
+  recording: recordingClient,
+  userInput: userInputClient,
+  firstPrompt: firstPromptClient,
+  windowInfrastructure: windowInfrastructureClient,
+  distributedMachine: distributedMachineClient,
+  imageGeneration: imageGenerationClient,
+  previewView: {
+    ...previewViewClient,
+    setBounds: previewViewSendClient.setBounds,
+    setOverlayActive: previewViewSendClient.setOverlayActive,
+  },
 
   // Event clients for main->renderer pub/sub
   events: {
     agent: agentEventClient,
-    github: githubEventClient,
-    mcp: mcpEventClient,
+    git: gitEventClient,
+    connectionFlow: connectionFlowEventClient,
+    supabase: supabaseEventClient,
     system: systemEventClient,
     misc: miscEventClient,
     appBlueprint: appBlueprintEventClient,
+    tests: testsEventClient,
+    userInput: userInputEventClient,
+    coolify: coolifyEventClient,
+    coolifySetup: coolifySetupEventClient,
+    imageGeneration: imageGenerationEventClient,
+    windowInfrastructure: windowInfrastructureEventClient,
+    distributedMachine: distributedMachineEventClient,
+    recording: recordingEventClient,
+    previewView: previewViewEventClient,
   },
 } as const;

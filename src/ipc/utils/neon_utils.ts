@@ -12,7 +12,10 @@ import {
   updateNeonEnvVars,
 } from "../utils/app_env_var_utils";
 import { detectFrameworkType } from "./framework_utils";
+import { reconcileTrustedDomains } from "./vercel_neon_sync_helpers";
+import { retryOnLocked } from "./retryOnLocked";
 import { getDyadAppPath } from "@/paths/paths";
+import { abortable } from "./abortable";
 
 export type NeonBranchType = "production" | "development";
 
@@ -90,9 +93,17 @@ export async function ensureNeonAuth({
 }): Promise<string | undefined> {
   const neonClient = await getNeonClient();
 
+  // Every call backs off on 423/429: a branch created moments ago can still
+  // have operations running. Callers should not add their own retry on top.
+  const getNeonAuth = () =>
+    retryOnLocked(
+      () => neonClient.getNeonAuth(projectId, branchId),
+      `Get Neon Auth for branch ${branchId}`,
+    );
+
   // Check if Neon Auth is already enabled on this branch
   try {
-    const response = await neonClient.getNeonAuth(projectId, branchId);
+    const response = await getNeonAuth();
     return response.data.base_url;
   } catch (error: any) {
     // 404 means auth not enabled — proceed to create
@@ -101,12 +112,12 @@ export async function ensureNeonAuth({
 
   // Enable Neon Auth on this branch
   try {
-    const createResponse = await neonClient.createNeonAuth(
-      projectId,
-      branchId,
-      {
-        auth_provider: NeonAuthSupportedAuthProvider.BetterAuth,
-      },
+    const createResponse = await retryOnLocked(
+      () =>
+        neonClient.createNeonAuth(projectId, branchId, {
+          auth_provider: NeonAuthSupportedAuthProvider.BetterAuth,
+        }),
+      `Enable Neon Auth on branch ${branchId}`,
     );
     return createResponse.data.base_url;
   } catch (createError: any) {
@@ -114,7 +125,7 @@ export async function ensureNeonAuth({
     // Try fetching the auth config again since it may now be available.
     if (createError.response?.status === 409) {
       try {
-        const retryResponse = await neonClient.getNeonAuth(projectId, branchId);
+        const retryResponse = await getNeonAuth();
         return retryResponse.data.base_url;
       } catch (retryError: any) {
         // Auth schema exists but isn't formally enabled — log warning and return undefined
@@ -282,6 +293,13 @@ export async function autoInjectNeonEnvVars({
     preserveExistingAuth: !neonAuthBaseUrl,
   });
 
+  if (neonAuthBaseUrl) {
+    // Already under the provider/runtime-config claim held by connect/switch.
+    const { reconcileRunningNeonPreview } =
+      await import("../services/app_runtime_service");
+    await reconcileRunningNeonPreview(appId, { projectId, branchId });
+  }
+
   return warning;
 }
 
@@ -361,6 +379,117 @@ export function getSelectedDeployBranchType(appData: AppRow): NeonBranchType {
     : "production";
 }
 
+/**
+ * Registers a deployed origin as a Neon Auth trusted domain.
+ *
+ * Neon Auth refuses sign-in requests from origins it does not know, which the
+ * app surfaces as an "Invalid origin" error. Vercel deployments get this from
+ * the Vercel sync; every other host needs the same registration or auth is
+ * broken even with the right environment variables in place.
+ *
+ * Returns the origin it added, or null when Neon already knew about it.
+ */
+export async function ensureNeonAuthTrustedDomain({
+  projectId,
+  branchId,
+  origin,
+  signal,
+}: {
+  projectId: string;
+  branchId: string;
+  origin: string;
+  signal?: AbortSignal;
+}): Promise<string | null> {
+  signal?.throwIfAborted();
+  // Token refresh is shared with other callers; cancel this wait, not their
+  // refresh. Recheck before any domain mutation after credential acquisition.
+  const neonClient = await abortable(getNeonClient(), signal);
+  signal?.throwIfAborted();
+  const existing = await neonClient.listBranchNeonAuthTrustedDomains(
+    projectId,
+    branchId,
+    { signal },
+  );
+  signal?.throwIfAborted();
+  const existingDomains = (existing.data?.domains ?? []).map((d) => d.domain);
+  // Shared with the Vercel sync so both hosts normalise an origin the same way.
+  const [toAdd] = reconcileTrustedDomains(existingDomains, [origin]);
+  if (!toAdd) return null;
+  try {
+    await neonClient.addBranchNeonAuthTrustedDomain(
+      projectId,
+      branchId,
+      {
+        domain: toAdd,
+        auth_provider: NeonAuthSupportedAuthProvider.BetterAuth,
+      },
+      { signal },
+    );
+  } catch (error) {
+    signal?.throwIfAborted();
+    // Another app/window may have registered the same project/branch origin.
+    if ((error as { response?: { status: number } }).response?.status !== 409)
+      throw error;
+    const current = await neonClient.listBranchNeonAuthTrustedDomains(
+      projectId,
+      branchId,
+      { signal },
+    );
+    if (
+      reconcileTrustedDomains(
+        (current.data?.domains ?? []).map((d) => d.domain),
+        [origin],
+      ).length
+    )
+      throw error;
+  }
+  return toAdd;
+}
+
+/**
+ * Registers an exact HTTP(S) origin without applying deployment-domain
+ * normalization. Run-scoped E2E servers use HTTP loopback origins, so changing
+ * their scheme to HTTPS would register a different origin and Better Auth would
+ * continue rejecting sign-in requests.
+ */
+export async function ensureNeonAuthTrustedOrigin({
+  projectId,
+  branchId,
+  origin,
+}: {
+  projectId: string;
+  branchId: string;
+  origin: string;
+}): Promise<string | null> {
+  const trustedOrigin = new URL(origin).origin;
+  const neonClient = await getNeonClient();
+  // Both calls back off on 423/429 like every other Neon call in the test-run
+  // flow. Running several specs back to back is exactly the burst that trips
+  // the rate limit, and an unretried clash here refuses the whole run — even
+  // one whose specs never touch sign-in.
+  const existing = await retryOnLocked(
+    () => neonClient.listBranchNeonAuthTrustedDomains(projectId, branchId),
+    `List Neon Auth trusted domains for branch ${branchId}`,
+  );
+  const alreadyTrusted = (existing.data?.domains ?? []).some(({ domain }) => {
+    try {
+      return new URL(domain).origin === trustedOrigin;
+    } catch {
+      return domain === trustedOrigin;
+    }
+  });
+  if (alreadyTrusted) return null;
+  await retryOnLocked(
+    () =>
+      neonClient.addBranchNeonAuthTrustedDomain(projectId, branchId, {
+        domain: trustedOrigin,
+        auth_provider: NeonAuthSupportedAuthProvider.BetterAuth,
+      }),
+    `Add Neon Auth trusted origin for branch ${branchId}`,
+  );
+  return trustedOrigin;
+}
+
 export interface ResolvedNeonBranchEnvVars {
   databaseUrl: string;
   neonAuthBaseUrl?: string;
@@ -427,6 +556,15 @@ export async function resolveNeonBranchEnvVars({
       appData,
       branchType,
     });
+  }
+
+  if (
+    neonAuthBaseUrl &&
+    branchId === (appData.neonActiveBranchId ?? appData.neonDevelopmentBranchId)
+  ) {
+    const { reconcileRunningNeonPreview } =
+      await import("../services/app_runtime_service");
+    await reconcileRunningNeonPreview(appData.id, { projectId, branchId });
   }
 
   return {

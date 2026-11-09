@@ -4,7 +4,13 @@ import { and, eq } from "drizzle-orm";
 import fs from "node:fs";
 import { getDyadAppPath } from "../../paths/paths";
 import path from "node:path";
-import { safeJoin } from "../utils/path_utils";
+import {
+  assertNotProjectRootPath,
+  lstatIfExists,
+  prepareDeletePath,
+  PreparedDeletePath,
+  safeJoin,
+} from "../utils/path_utils";
 
 import log from "electron-log";
 import {
@@ -22,6 +28,7 @@ import {
   deployAffectedSupabaseFunctions,
   extractFunctionNameFromPath,
 } from "../../supabase_admin/supabase_utils";
+import { isSupabaseFunctionSyncDeferred } from "../../supabase_admin/supabase_recording_deferred_sync";
 import { UserSettings } from "../../lib/schemas";
 import {
   gitCommit,
@@ -64,6 +71,34 @@ function formatOutputError(error: unknown): string {
   }
 
   return error instanceof Error ? error.toString() : String(error);
+}
+
+function formatSkippedActionSummary(fullResponse: string): string {
+  const counts: Array<[number, string, string]> = [
+    [getDyadWriteTags(fullResponse).length, "write", "writes"],
+    [getDyadRenameTags(fullResponse).length, "rename", "renames"],
+    [getDyadDeleteTags(fullResponse).length, "delete", "deletes"],
+    [
+      getDyadAddDependencyTags(fullResponse).length,
+      "dependency install",
+      "dependency installs",
+    ],
+    [getDyadExecuteSqlTags(fullResponse).length, "SQL query", "SQL queries"],
+    [
+      getDyadSearchReplaceTags(fullResponse).length,
+      "search-replace",
+      "search-replaces",
+    ],
+    [getDyadCopyTags(fullResponse).length, "copy", "copies"],
+  ];
+
+  return counts
+    .filter(([count]) => count > 0)
+    .map(
+      ([count, singular, plural]) =>
+        `${count} ${count === 1 ? singular : plural}`,
+    )
+    .join(", ");
 }
 
 export async function dryRunSearchReplace({
@@ -116,9 +151,11 @@ export async function processFullResponseActions(
   {
     chatSummary,
     messageId,
+    signal,
   }: {
     chatSummary: string | undefined;
     messageId: number;
+    signal?: AbortSignal;
   },
 ): Promise<{
   updatedFiles?: boolean;
@@ -138,6 +175,27 @@ export async function processFullResponseActions(
   if (!chatWithApp || !chatWithApp.app) {
     logger.error(`No app found for chat ID: ${chatId}`);
     return {};
+  }
+
+  const appPath = getDyadAppPath(chatWithApp.app.path);
+  const dyadDeletePaths = getDyadDeleteTags(fullResponse);
+  let preparedDeletePaths: PreparedDeletePath[];
+  try {
+    // Perform the lexical pass across the entire batch first so a later root
+    // alias cannot cause even read-only filesystem work for an earlier path.
+    for (const filePath of dyadDeletePaths) {
+      assertNotProjectRootPath(appPath, filePath);
+    }
+    preparedDeletePaths = await Promise.all(
+      dyadDeletePaths.map((filePath) => prepareDeletePath(appPath, filePath)),
+    );
+  } catch (error) {
+    logger.error("Refusing unsafe delete response:", error);
+    const message = error instanceof Error ? error.message : String(error);
+    const skippedActions = formatSkippedActionSummary(fullResponse);
+    return {
+      error: `${message} No actions from this response were applied. Skipped: ${skippedActions}.`,
+    };
   }
 
   if (
@@ -160,10 +218,10 @@ export async function processFullResponseActions(
   }
 
   const settings: UserSettings = readSettings();
-  const appPath = getDyadAppPath(chatWithApp.app.path);
   const writtenFiles: string[] = [];
   const renamedFiles: string[] = [];
   const deletedFiles: string[] = [];
+  const processedDeletePaths: string[] = [];
   let hasChanges = false;
   // Track if any shared modules were modified
   let sharedModulesChanged = false;
@@ -172,14 +230,32 @@ export async function processFullResponseActions(
 
   const warnings: Output[] = [];
   const errors: Output[] = [];
+  // A deploy/delete deferred until an active recording ends is not a failure;
+  // report it once as a warning instead.
+  let reportedDeferredSupabaseSync = false;
+  const reportSupabaseFailure = (
+    output: Output,
+    severity: "error" | "warning" = "error",
+  ) => {
+    if (!isSupabaseFunctionSyncDeferred(output.error)) {
+      (severity === "error" ? errors : warnings).push(output);
+      return;
+    }
+    if (reportedDeferredSupabaseSync) return;
+    reportedDeferredSupabaseSync = true;
+    warnings.push({
+      message: "Supabase function changes will deploy after the recording ends",
+      error: output.error,
+    });
+  };
   const warningMessages: string[] = [];
 
   try {
     // Extract all tags
     const dyadWriteTags = getDyadWriteTags(fullResponse);
     const dyadRenameTags = getDyadRenameTags(fullResponse);
-    const dyadDeletePaths = getDyadDeleteTags(fullResponse);
     const dyadAddDependencyPackages = getDyadAddDependencyTags(fullResponse);
+    let installedOrUpdatedDependencyPackages: string[] = [];
     const hasDbProvider =
       chatWithApp.app.supabaseProjectId || chatWithApp.app.neonProjectId;
     const dyadExecuteSqlQueries = hasDbProvider
@@ -291,11 +367,16 @@ export async function processFullResponseActions(
           appPath,
         });
         warningMessages.push(...addDependencyResult.warningMessages);
+        installedOrUpdatedDependencyPackages = dyadAddDependencyPackages;
       } catch (error) {
         if (error instanceof ExecuteAddDependencyError) {
           warningMessages.push(...error.warningMessages);
+          installedOrUpdatedDependencyPackages = error.completedPackages;
           errors.push({
-            message: `Failed to add dependencies: ${dyadAddDependencyPackages.join(", ")}. ${error.displaySummary}`,
+            message:
+              error.completedPackages.length > 0
+                ? `Partially installed or updated dependencies: ${error.completedPackages.join(", ")}. ${error.displaySummary}`
+                : `Failed to add dependencies: ${dyadAddDependencyPackages.join(", ")}. ${error.displaySummary}`,
             error: error.displayDetails,
           });
         } else {
@@ -305,14 +386,16 @@ export async function processFullResponseActions(
           });
         }
       }
-      writtenFiles.push("package.json");
-      const pnpmFilename = "pnpm-lock.yaml";
-      if (fs.existsSync(safeJoin(appPath, pnpmFilename))) {
-        writtenFiles.push(pnpmFilename);
-      }
-      const packageLockFilename = "package-lock.json";
-      if (fs.existsSync(safeJoin(appPath, packageLockFilename))) {
-        writtenFiles.push(packageLockFilename);
+      if (installedOrUpdatedDependencyPackages.length > 0) {
+        writtenFiles.push("package.json");
+        const pnpmFilename = "pnpm-lock.yaml";
+        if (fs.existsSync(safeJoin(appPath, pnpmFilename))) {
+          writtenFiles.push(pnpmFilename);
+        }
+        const packageLockFilename = "package-lock.json";
+        if (fs.existsSync(safeJoin(appPath, packageLockFilename))) {
+          writtenFiles.push(packageLockFilename);
+        }
       }
     }
 
@@ -329,8 +412,12 @@ export async function processFullResponseActions(
     //////////////////////
 
     // Process all file deletions
-    for (const filePath of dyadDeletePaths) {
-      const fullFilePath = safeJoin(appPath, filePath);
+    for (const preparedDeletePath of preparedDeletePaths) {
+      // Revalidate as a best-effort check after the batch preflight. A narrow
+      // TOCTOU window remains before the userspace unlink/rmdir call.
+      const { relativePath: filePath, fullPath: fullFilePath } =
+        await prepareDeletePath(appPath, preparedDeletePath.relativePath);
+      processedDeletePaths.push(filePath);
 
       // Track if this is a shared module
       if (isSharedServerModule(filePath)) {
@@ -339,8 +426,9 @@ export async function processFullResponseActions(
       }
 
       // Delete the file if it exists
-      if (fs.existsSync(fullFilePath)) {
-        if (fs.lstatSync(fullFilePath).isDirectory()) {
+      const targetStat = lstatIfExists(fullFilePath);
+      if (targetStat) {
+        if (targetStat.isDirectory()) {
           fs.rmdirSync(fullFilePath, { recursive: true });
         } else {
           fs.unlinkSync(fullFilePath);
@@ -362,12 +450,14 @@ export async function processFullResponseActions(
       if (isServerFunction(filePath)) {
         try {
           await deleteSupabaseFunction({
+            appId: chatWithApp.app.id,
+            signal,
             supabaseProjectId: chatWithApp.app.supabaseProjectId!,
             functionName: extractFunctionNameFromPath(filePath),
             organizationSlug: chatWithApp.app.supabaseOrganizationSlug ?? null,
           });
         } catch (error) {
-          errors.push({
+          reportSupabaseFailure({
             message: `Failed to delete Supabase function: ${filePath}`,
             error: error,
           });
@@ -416,15 +506,20 @@ export async function processFullResponseActions(
       if (isServerFunction(tag.from)) {
         try {
           await deleteSupabaseFunction({
+            appId: chatWithApp.app.id,
+            signal,
             supabaseProjectId: chatWithApp.app.supabaseProjectId!,
             functionName: extractFunctionNameFromPath(tag.from),
             organizationSlug: chatWithApp.app.supabaseOrganizationSlug ?? null,
           });
         } catch (error) {
-          warnings.push({
-            message: `Failed to delete Supabase function: ${tag.from} as part of renaming ${tag.from} to ${tag.to}`,
-            error: error,
-          });
+          reportSupabaseFailure(
+            {
+              message: `Failed to delete Supabase function: ${tag.from} as part of renaming ${tag.from} to ${tag.to}`,
+              error: error,
+            },
+            "warning",
+          );
         }
       }
       // Deploy renamed function (skip if shared modules changed - will be handled later)
@@ -433,6 +528,8 @@ export async function processFullResponseActions(
         if (!sharedModulesChanged) {
           try {
             await deploySupabaseFunction({
+              appId: chatWithApp.app.id,
+              signal,
               supabaseProjectId: chatWithApp.app.supabaseProjectId!,
               functionName,
               appPath,
@@ -440,7 +537,7 @@ export async function processFullResponseActions(
                 chatWithApp.app.supabaseOrganizationSlug ?? null,
             });
           } catch (error) {
-            errors.push({
+            reportSupabaseFailure({
               message: `Failed to deploy Supabase function: ${tag.to} as part of renaming ${tag.from} to ${tag.to}`,
               error: error,
             });
@@ -488,6 +585,8 @@ export async function processFullResponseActions(
           if (!sharedModulesChanged) {
             try {
               await deploySupabaseFunction({
+                appId: chatWithApp.app.id,
+                signal,
                 supabaseProjectId: chatWithApp.app.supabaseProjectId!,
                 functionName,
                 appPath,
@@ -495,7 +594,7 @@ export async function processFullResponseActions(
                   chatWithApp.app.supabaseOrganizationSlug ?? null,
               });
             } catch (error) {
-              errors.push({
+              reportSupabaseFailure({
                 message: `Failed to deploy Supabase function after search-replace: ${filePath}`,
                 error: error,
               });
@@ -520,9 +619,7 @@ export async function processFullResponseActions(
           from: tag.from,
           to: tag.to,
           appId: chatWithApp.app.id,
-          appPath,
-          supabaseProjectId: chatWithApp.app.supabaseProjectId,
-          supabaseOrganizationSlug: chatWithApp.app.supabaseOrganizationSlug,
+          signal,
           isSharedModulesChanged: sharedModulesChanged,
         });
 
@@ -538,7 +635,7 @@ export async function processFullResponseActions(
         }
 
         if (result.deployError) {
-          errors.push({
+          reportSupabaseFailure({
             message: `Failed to deploy Supabase function after copy: ${tag.to}`,
             error: result.deployError,
           });
@@ -581,6 +678,8 @@ export async function processFullResponseActions(
         if (!sharedModulesChanged) {
           try {
             await deploySupabaseFunction({
+              appId: chatWithApp.app.id,
+              signal,
               supabaseProjectId: chatWithApp.app.supabaseProjectId!,
               functionName,
               appPath,
@@ -588,7 +687,7 @@ export async function processFullResponseActions(
                 chatWithApp.app.supabaseOrganizationSlug ?? null,
             });
           } catch (error) {
-            errors.push({
+            reportSupabaseFailure({
               message: `Failed to deploy Supabase function: ${filePath}`,
               error: error,
             });
@@ -607,6 +706,8 @@ export async function processFullResponseActions(
       try {
         const settings = readSettings();
         const deployErrors = await deployAffectedSupabaseFunctions({
+          appId: chatWithApp.app.id,
+          signal,
           appPath,
           supabaseProjectId: chatWithApp.app.supabaseProjectId,
           supabaseOrganizationSlug:
@@ -627,7 +728,7 @@ export async function processFullResponseActions(
           }
         }
       } catch (error) {
-        errors.push({
+        reportSupabaseFailure({
           message:
             "Failed to redeploy Supabase functions after shared module change",
           error: error,
@@ -662,16 +763,20 @@ export async function processFullResponseActions(
         changes.push(`renamed ${renamedFiles.length} file(s)`);
       if (deletedFiles.length > 0)
         changes.push(`deleted ${deletedFiles.length} file(s)`);
-      if (dyadAddDependencyPackages.length > 0)
+      if (installedOrUpdatedDependencyPackages.length > 0)
         changes.push(
-          `added ${dyadAddDependencyPackages.join(", ")} package(s)`,
+          `installed or updated ${installedOrUpdatedDependencyPackages.join(", ")} package(s)`,
         );
       if (dyadExecuteSqlQueries.length > 0)
         changes.push(`executed ${dyadExecuteSqlQueries.length} SQL queries`);
 
-      let message = chatSummary
-        ? `[dyad] ${chatSummary} - ${changes.join(", ")}`
-        : `[dyad] ${changes.join(", ")}`;
+      const changeSummary = changes.join(", ");
+      const trimmedChatSummary = chatSummary?.trim();
+      const message = trimmedChatSummary
+        ? changeSummary
+          ? `${trimmedChatSummary} - ${changeSummary}`
+          : trimmedChatSummary
+        : changeSummary || "updated project files";
 
       // Verify there are actual staged changes before committing.
       // Files may be "written" with identical content (e.g. regenerated by the AI),
@@ -740,7 +845,7 @@ export async function processFullResponseActions(
         appId: chatWithApp.app.id,
         changedPaths: [...writtenFiles, ...renamedFiles],
         deletedPaths: [
-          ...dyadDeletePaths,
+          ...processedDeletePaths,
           ...dyadRenameTags.map((renameTag) => renameTag.from),
         ],
       });

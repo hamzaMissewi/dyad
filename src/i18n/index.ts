@@ -29,6 +29,27 @@ import esChat from "./locales/es/chat.json";
 import esHome from "./locales/es/home.json";
 import esErrors from "./locales/es/errors.json";
 
+// Korean
+import koCommon from "./locales/ko/common.json";
+import koSettings from "./locales/ko/settings.json";
+import koChat from "./locales/ko/chat.json";
+import koHome from "./locales/ko/home.json";
+import koErrors from "./locales/ko/errors.json";
+
+// Turkish
+import trCommon from "./locales/tr/common.json";
+import trSettings from "./locales/tr/settings.json";
+import trChat from "./locales/tr/chat.json";
+import trHome from "./locales/tr/home.json";
+import trErrors from "./locales/tr/errors.json";
+
+// French
+import frCommon from "./locales/fr/common.json";
+import frSettings from "./locales/fr/settings.json";
+import frChat from "./locales/fr/chat.json";
+import frHome from "./locales/fr/home.json";
+import frErrors from "./locales/fr/errors.json";
+
 const resources = {
   en: {
     common: enCommon,
@@ -57,6 +78,27 @@ const resources = {
     chat: esChat,
     home: esHome,
     errors: esErrors,
+  },
+  ko: {
+    common: koCommon,
+    settings: koSettings,
+    chat: koChat,
+    home: koHome,
+    errors: koErrors,
+  },
+  tr: {
+    common: trCommon,
+    settings: trSettings,
+    chat: trChat,
+    home: trHome,
+    errors: trErrors,
+  },
+  fr: {
+    common: frCommon,
+    settings: frSettings,
+    chat: frChat,
+    home: frHome,
+    errors: frErrors,
   },
 };
 

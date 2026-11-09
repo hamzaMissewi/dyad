@@ -1,26 +1,117 @@
-import { getGitAuthor } from "./git_author";
-import git from "isomorphic-git";
-import http from "isomorphic-git/http/node";
+import { getGitAuthor, type GitAuthor } from "./git_author";
+import { createHash } from "node:crypto";
 import {
   exec,
+  ExecError,
+  setupEnvironment,
   type IGitStringExecutionOptions,
   type IGitStringResult,
 } from "dugite";
 import fs from "node:fs";
 import { promises as fsPromises } from "node:fs";
 import pathModule from "node:path";
-import { platform } from "node:os";
-import { readSettings } from "../../main/settings";
+import { platform, tmpdir } from "node:os";
 import log from "electron-log";
 import { normalizePath } from "../../../shared/normalizePath";
+import { safeJoin } from "./path_utils";
 import { ensureLibcurlShimOnLinux } from "./linux_libcurl_shim";
 import { getPathEnvKey } from "./path_env";
 import type { UncommittedFile, UncommittedFileStatus } from "@/ipc/types";
-import { DyadError, DyadErrorKind } from "@/errors/dyad_error";
+import { DyadError, DyadErrorKind, isDyadError } from "@/errors/dyad_error";
+import { GIT_ERROR_CODES, type GitErrorCode } from "@/shared/git_error_codes";
+import {
+  isDotenvFilePath,
+  redactDotenvValues,
+  selectTextLineRange,
+} from "@/utils/dotenv_redaction";
+import { runBufferedProcess } from "./buffered_process";
+import {
+  collectGitLaunchDiagnostics,
+  getGitLaunchTelemetryProperties,
+  type GitLaunchDiagnostics,
+} from "./git_launch_diagnostics";
+import { sendTelemetryEvent } from "./telemetry";
+
+export { GIT_ERROR_CODES } from "@/shared/git_error_codes";
+
 const logger = log.scope("git_utils");
 
-function isUserVisibleGitPath(filePath: string) {
+const GIT_STATE_FINGERPRINT_TIMEOUT_MS = 30_000;
+const GIT_STATE_FINGERPRINT_MAX_PATH_BYTES = 16 * 1024 * 1024;
+const GIT_STATE_FINGERPRINT_MAX_UNTRACKED_PATHS = 10_000;
+let didReportGitLaunchFailure = false;
+
+export function isUserVisibleGitPath(filePath: string) {
   return !filePath.startsWith(".dyad/") && filePath !== "pnpm-workspace.yaml";
+}
+
+function isAgentGitPatchVisiblePath(filePath: string) {
+  return isUserVisibleGitPath(filePath) || filePath === "pnpm-workspace.yaml";
+}
+
+// Single-character C-style escapes emitted by git's `quote_c_style` (see
+// git's quote.c). Everything else is either a literal byte or an octal escape.
+const PORCELAIN_C_ESCAPES: Record<string, number> = {
+  a: 0x07,
+  b: 0x08,
+  t: 0x09,
+  n: 0x0a,
+  v: 0x0b,
+  f: 0x0c,
+  r: 0x0d,
+  '"': 0x22,
+  "\\": 0x5c,
+};
+
+function splitQuotedPorcelainRename(filePath: string): [string, string] | null {
+  if (!filePath.startsWith('"')) {
+    return null;
+  }
+
+  let escaped = false;
+  for (let index = 1; index < filePath.length; index++) {
+    const char = filePath[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (char === '"') {
+      const separator = " -> ";
+      if (!filePath.startsWith(separator, index + 1)) {
+        return null;
+      }
+      const oldPath = filePath.slice(0, index + 1);
+      const newPath = filePath.slice(index + 1 + separator.length);
+      return [unquoteGitPath(oldPath), unquoteGitPath(newPath)];
+    }
+  }
+
+  return null;
+}
+
+function getPorcelainPaths(line: string): string[] {
+  const statusCode = line.substring(0, 2);
+  const filePath = line.slice(3).trim();
+  if (!statusCode.includes("R")) {
+    return [unquoteGitPath(filePath)];
+  }
+
+  const quotedRename = splitQuotedPorcelainRename(filePath);
+  if (quotedRename) {
+    return quotedRename;
+  }
+
+  const renameIndex = filePath.indexOf(" -> ");
+  return renameIndex === -1
+    ? [unquoteGitPath(filePath)]
+    : [
+        unquoteGitPath(filePath.slice(0, renameIndex)),
+        unquoteGitPath(filePath.slice(renameIndex + 4)),
+      ];
 }
 
 /**
@@ -74,57 +165,324 @@ function getWindowsSanitizedEnv():
   };
 }
 
+/** Build caller overrides for Dugite without bypassing Dyad's platform fixes. */
+function getSanitizedGitEnv(
+  callerEnv?: Record<string, string | undefined>,
+): Record<string, string | undefined> {
+  const sanitizedEnv = getWindowsSanitizedEnv();
+
+  if (sanitizedEnv) {
+    const pathKey = getPathEnvKey(sanitizedEnv);
+    const env = {
+      ...sanitizedEnv,
+      ...callerEnv,
+      // Keep the sanitized PATH authoritative even when a caller supplies env.
+      [pathKey]: sanitizedEnv[pathKey],
+    };
+    // Both regular checkouts and isolated workspaces can exceed MAX_PATH.
+    // Append to the effective per-process config so inherited settings and
+    // getGitNetworkEnv's authentication entries survive, without writing config.
+    const configCount = Number(env.GIT_CONFIG_COUNT ?? 0);
+    if (Number.isSafeInteger(configCount) && configCount >= 0) {
+      env.GIT_CONFIG_COUNT = String(configCount + 1);
+      env[`GIT_CONFIG_KEY_${configCount}`] = "core.longpaths";
+      env[`GIT_CONFIG_VALUE_${configCount}`] = "true";
+    }
+    // Leave invalid counts untouched so Git reports its configuration error.
+    return env;
+  }
+
+  const shimDir = ensureLibcurlShimOnLinux();
+  if (shimDir) {
+    const existingLdPath =
+      callerEnv?.LD_LIBRARY_PATH ?? process.env.LD_LIBRARY_PATH;
+    return {
+      ...callerEnv,
+      LD_LIBRARY_PATH: [shimDir, existingLdPath].filter(Boolean).join(":"),
+    };
+  }
+
+  return callerEnv ?? {};
+}
+
 /**
- * Wrapper around dugite's exec that uses a sanitized environment on Windows
- * to prevent WSL interop issues.
+ * Return the bundled Git executable and hardened environment used by Dyad.
+ * Use this for Git processes that need streaming or bounded execution and
+ * therefore cannot go through {@link execGit}.
  */
-async function execGit(
+export function getGitProcessEnvironment(
+  callerEnv?: Record<string, string | undefined>,
+): ReturnType<typeof setupEnvironment> {
+  return setupEnvironment(getSanitizedGitEnv(callerEnv));
+}
+
+export async function execGit(
   args: string[],
   path: string,
   options?: IGitStringExecutionOptions,
 ): Promise<IGitStringResult> {
-  const sanitizedEnv = getWindowsSanitizedEnv();
-
-  // Only create execOptions if we need to modify the environment
-  // On Windows: merge sanitized env with any caller-provided env, ensuring sanitized PATH takes precedence
-  // On non-Windows: pass through options unchanged (dugite will use process.env by default)
-  if (sanitizedEnv) {
-    // Find the PATH key used in the sanitized env
-    const pathKey = getPathEnvKey(sanitizedEnv);
-    const execOptions: IGitStringExecutionOptions = {
+  const env = getSanitizedGitEnv(options?.env);
+  try {
+    return await exec(args, path, {
       ...options,
-      env: {
-        ...sanitizedEnv,
-        ...options?.env,
-        // Ensure sanitized PATH always takes precedence to prevent WSL contamination
-        [pathKey]: sanitizedEnv[pathKey],
-      },
-    };
-    return exec(args, path, execOptions);
-  }
-
-  // On Linux, the bundled git http helpers are linked against
-  // libcurl-gnutls.so.4, which RHEL-based distros don't ship. When needed,
-  // prepend a shim directory to LD_LIBRARY_PATH that exposes the system
-  // libcurl under that soname. No-op (returns undefined) on distros that
-  // already have libcurl-gnutls.so.4.
-  const shimDir = ensureLibcurlShimOnLinux();
-  if (shimDir) {
-    const existingLdPath =
-      options?.env?.LD_LIBRARY_PATH ?? process.env.LD_LIBRARY_PATH;
-    const ldLibraryPath = [shimDir, existingLdPath].filter(Boolean).join(":");
-    return exec(args, path, {
-      ...options,
-      env: {
-        ...process.env,
-        ...options?.env,
-        LD_LIBRARY_PATH: ldLibraryPath,
-      },
+      env,
     });
+  } catch (error) {
+    if (error instanceof ExecError && error.code === "ENOENT") {
+      let diagnostics: GitLaunchDiagnostics | null = null;
+      try {
+        const { env: gitEnv, gitLocation } = setupEnvironment(env);
+        diagnostics = await collectGitLaunchDiagnostics({
+          gitLocation,
+          cwd: path,
+          localGitDirectory: gitEnv.LOCAL_GIT_DIRECTORY,
+          error,
+        });
+
+        if (!didReportGitLaunchFailure) {
+          didReportGitLaunchFailure = true;
+          logger.error("Git process failed to launch", diagnostics);
+          sendTelemetryEvent(
+            "git:launch_error",
+            getGitLaunchTelemetryProperties(diagnostics),
+          );
+        }
+      } catch (diagnosticError) {
+        logger.warn(
+          "Failed to collect Git launch diagnostics",
+          diagnosticError,
+        );
+      }
+      // Node reports a missing cwd with the same ENOENT as a missing binary,
+      // and dugite's message blames the binary. Name the folder instead.
+      if (
+        diagnostics &&
+        !diagnostics.cwdPath.targetExists &&
+        diagnostics.gitBinary.targetExists
+      ) {
+        throw new DyadError(
+          `Folder not found: '${path}'. It may have been moved or deleted, or be on a drive that isn't connected.`,
+          DyadErrorKind.NotFound,
+        );
+      }
+    }
+    throw error;
+  }
+}
+
+async function hashGitOutput(
+  appPath: string,
+  args: string[],
+  signal?: AbortSignal,
+): Promise<string> {
+  const hash = createHash("sha256");
+  const { env, gitLocation } = getGitProcessEnvironment();
+  const result = await runBufferedProcess({
+    command: gitLocation,
+    args,
+    cwd: appPath,
+    env,
+    signal,
+    timeoutMs: GIT_STATE_FINGERPRINT_TIMEOUT_MS,
+    maxOutputBytes: 1_024,
+    captureOutputOnSuccess: false,
+    waitForCloseAfterForceKill: true,
+    onStdoutBytes: (chunk) => hash.update(chunk),
+  });
+  if (result.code !== 0 || result.aborted || result.timedOut) {
+    throw new Error(`Git fingerprint command failed: git ${args.join(" ")}`);
+  }
+  return hash.digest("hex");
+}
+
+async function collectRawGitOutput(
+  appPath: string,
+  args: string[],
+  signal?: AbortSignal,
+): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+  const { env, gitLocation } = getGitProcessEnvironment();
+  const result = await runBufferedProcess({
+    command: gitLocation,
+    args,
+    cwd: appPath,
+    env,
+    signal,
+    timeoutMs: GIT_STATE_FINGERPRINT_TIMEOUT_MS,
+    maxOutputBytes: 1_024,
+    captureOutputOnSuccess: false,
+    waitForCloseAfterForceKill: true,
+    onStdoutBytes: (chunk) => {
+      totalBytes += chunk.length;
+      if (totalBytes > GIT_STATE_FINGERPRINT_MAX_PATH_BYTES) {
+        throw new Error("Git fingerprint path output exceeded its byte limit");
+      }
+      chunks.push(Buffer.from(chunk));
+    },
+  });
+  if (result.code !== 0 || result.aborted || result.timedOut) {
+    throw new Error(`Git fingerprint command failed: git ${args.join(" ")}`);
+  }
+  return Buffer.concat(chunks, totalBytes);
+}
+
+function parseUntrackedPorcelainPaths(output: Buffer): Buffer[] {
+  const paths: Buffer[] = [];
+  let offset = 0;
+  while (offset < output.length) {
+    const terminator = output.indexOf(0, offset);
+    const end = terminator === -1 ? output.length : terminator;
+    const record = output.subarray(offset, end);
+    offset = end + 1;
+    if (record.length < 3) {
+      continue;
+    }
+
+    const x = record[0];
+    const y = record[1];
+    if (x === 0x3f && y === 0x3f) {
+      paths.push(Buffer.from(record.subarray(3)));
+      if (paths.length > GIT_STATE_FINGERPRINT_MAX_UNTRACKED_PATHS) {
+        throw new Error("Git fingerprint exceeded its untracked-path limit");
+      }
+    }
+
+    // In porcelain v1 -z output, rename/copy records are followed by a second
+    // NUL-delimited pathname without another status prefix.
+    if (x === 0x52 || x === 0x43 || y === 0x52 || y === 0x43) {
+      const sourceTerminator = output.indexOf(0, offset);
+      offset = sourceTerminator === -1 ? output.length : sourceTerminator + 1;
+    }
+  }
+  return paths;
+}
+
+function resolveRawGitPath(appPath: string, relativePath: Buffer): fs.PathLike {
+  if (
+    relativePath.length === 0 ||
+    relativePath[0] === 0x2f ||
+    relativePath.includes(0)
+  ) {
+    throw new Error("Git returned an invalid relative pathname");
   }
 
-  // On non-Windows without a shim, pass options through unchanged
-  return exec(args, path, options);
+  const components = relativePath.toString("latin1").split("/");
+  if (components.some((component) => component === "..")) {
+    throw new Error("Git returned a pathname outside the repository");
+  }
+
+  if (process.platform === "win32") {
+    return safeJoin(appPath, relativePath.toString("utf8"));
+  }
+  return Buffer.concat([
+    Buffer.from(appPath),
+    Buffer.from(pathModule.sep),
+    relativePath,
+  ]);
+}
+
+async function hashUntrackedPath(
+  appPath: string,
+  relativePath: Buffer,
+  signal?: AbortSignal,
+): Promise<Buffer> {
+  signal?.throwIfAborted();
+  const filePath = resolveRawGitPath(appPath, relativePath);
+  const stat = await fsPromises.lstat(filePath);
+  const hash = createHash("sha256");
+  hash.update(`${stat.mode}\0`);
+  if (stat.isSymbolicLink()) {
+    hash.update(await fsPromises.readlink(filePath, { encoding: "buffer" }));
+  } else if (stat.isFile()) {
+    for await (const chunk of fs.createReadStream(filePath, { signal })) {
+      hash.update(chunk as Buffer);
+    }
+  }
+  return hash.digest();
+}
+
+async function hashUntrackedContents(
+  appPath: string,
+  statusOutput: Buffer,
+  signal?: AbortSignal,
+): Promise<string> {
+  const hash = createHash("sha256");
+  for (const relativePath of parseUntrackedPorcelainPaths(statusOutput)) {
+    const pathLength = Buffer.allocUnsafe(4);
+    pathLength.writeUInt32BE(relativePath.length);
+    hash.update(pathLength);
+    hash.update(relativePath);
+    hash.update(await hashUntrackedPath(appPath, relativePath, signal));
+  }
+  return hash.digest("hex");
+}
+
+/** Fingerprint staged, tracked-worktree, and untracked path/content state. */
+export async function getGitStateFingerprint(
+  appPath: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const timeoutSignal = AbortSignal.timeout(GIT_STATE_FINGERPRINT_TIMEOUT_MS);
+  const fingerprintSignal = signal
+    ? AbortSignal.any([signal, timeoutSignal])
+    : timeoutSignal;
+  const results = await Promise.allSettled([
+    hashGitOutput(
+      appPath,
+      [
+        "-c",
+        "core.fsmonitor=false",
+        "diff",
+        "--cached",
+        "--binary",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--",
+      ],
+      fingerprintSignal,
+    ),
+    hashGitOutput(
+      appPath,
+      [
+        "-c",
+        "core.fsmonitor=false",
+        "diff",
+        "--binary",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--",
+      ],
+      fingerprintSignal,
+    ),
+    (async () => {
+      const args = [
+        "-c",
+        "core.fsmonitor=false",
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+      ];
+      const statusOutput = await collectRawGitOutput(
+        appPath,
+        args,
+        fingerprintSignal,
+      );
+      return [
+        createHash("sha256").update(statusOutput).digest("hex"),
+        await hashUntrackedContents(appPath, statusOutput, fingerprintSignal),
+      ].join(":");
+    })(),
+  ]);
+  return results
+    .map((result) => {
+      if (result.status === "rejected") {
+        throw result.reason;
+      }
+      return result.value;
+    })
+    .join("\0");
 }
 import type {
   GitBaseParams,
@@ -137,6 +495,7 @@ import type {
   GitLogParams,
   GitFileAtCommitParams,
   GitSetRemoteUrlParams,
+  FetchRefspecState,
   GitStageToRevertParams,
   GitInitParams,
   GitPushParams,
@@ -146,9 +505,13 @@ import type {
   GitMergeParams,
   GitCreateBranchParams,
   GitDeleteBranchParams,
+  AgentGitDiffScope,
+  AgentGitStatus,
+  AgentGitTextResult,
   GitChangedFile,
   GitChangedFileType,
   GitListChangedFilesParams,
+  GitRemoteAuth,
 } from "../git_types";
 
 /**
@@ -161,20 +524,14 @@ import type {
  * cleared and terminal prompting is disabled so git fails fast instead of
  * invoking system helpers or waiting for input that can never arrive.
  */
-function getGitNetworkEnv(accessToken?: string): Record<string, string> {
+function getGitNetworkEnv(auth?: GitRemoteAuth): Record<string, string> {
   const configs: [key: string, value: string][] = [
     // An empty credential.helper entry resets the helper list, so helpers
     // from system/global config (osxkeychain, manager, etc.) never run.
     ["credential.helper", ""],
   ];
-  if (accessToken) {
-    const basicAuth = Buffer.from(`${accessToken}:x-oauth-basic`).toString(
-      "base64",
-    );
-    configs.push([
-      "http.https://github.com/.extraheader",
-      `Authorization: Basic ${basicAuth}`,
-    ]);
+  if (auth) {
+    configs.push(gitAuthHeaderConfig(auth));
   }
   const env: Record<string, string> = {
     GIT_TERMINAL_PROMPT: "0",
@@ -185,6 +542,23 @@ function getGitNetworkEnv(accessToken?: string): Record<string, string> {
     env[`GIT_CONFIG_VALUE_${index}`] = value;
   });
   return env;
+}
+
+/**
+ * The `http.<url>.extraheader` config entry that authenticates one host.
+ *
+ * Git applies the header to every URL that starts with `<url>`, so the key
+ * ends in a slash: `https://github.com/` covers github.com repositories and
+ * nothing at a host that merely starts with those characters.
+ */
+export function gitAuthHeaderConfig(
+  auth: GitRemoteAuth,
+): [key: string, value: string] {
+  const basicAuth = Buffer.from(`${auth.username}:${auth.password}`).toString(
+    "base64",
+  );
+  const hostUrl = auth.hostUrl.replace(/\/+$/, "");
+  return [`http.${hostUrl}/.extraheader`, `Authorization: Basic ${basicAuth}`];
 }
 
 /**
@@ -265,11 +639,6 @@ export async function ensureGitLineEndingPolicy({
     }
   }
 
-  const settings = readSettings();
-  if (!settings.enableNativeGit) {
-    return;
-  }
-
   const resolvedPath = pathModule.resolve(path);
   const existingPromise = gitLineEndingConfigPromises.get(resolvedPath);
   if (existingPromise) {
@@ -297,7 +666,18 @@ export async function ensureGitLineEndingPolicy({
  * Doing -c user.name/email sets both the committer and author identity.
  */
 export async function withGitAuthor(args: string[]): Promise<string[]> {
-  const author = await getGitAuthor();
+  return withGitAuthorConfig(await getGitAuthor(), args);
+}
+
+/**
+ * `withGitAuthor` for callers that already resolved the author and need it for
+ * something else too (the commit-hook environment, for example), so the
+ * identity is fetched once instead of once per use.
+ */
+export function withGitAuthorConfig(
+  author: GitAuthor,
+  args: string[],
+): string[] {
   return [
     "-c",
     `user.name=${author.name}`,
@@ -358,48 +738,25 @@ export async function getCurrentCommitHash({
   path,
   ref = "HEAD",
 }: GitInitParams): Promise<string> {
-  const settings = readSettings();
-  if (settings.enableNativeGit) {
-    const result = await execGit(["rev-parse", ref], path);
-    if (result.exitCode !== 0) {
-      throw new DyadError(
-        `Failed to resolve ref '${ref}': ${result.stderr.trim() || result.stdout.trim()}`,
-        DyadErrorKind.Conflict,
-      );
-    }
-    return result.stdout.trim();
-  } else {
-    return await git.resolveRef({
-      fs,
-      dir: path,
-      ref,
-    });
+  const result = await execGit(["rev-parse", ref], path);
+  if (result.exitCode !== 0) {
+    throw new DyadError(
+      `Failed to resolve ref '${ref}': ${result.stderr.trim() || result.stdout.trim()}`,
+      DyadErrorKind.Conflict,
+    );
   }
+  return result.stdout.trim();
 }
 
 export async function gitCommitExists({
   path,
   commitHash,
 }: GitBaseParams & { commitHash: string }): Promise<boolean> {
-  const settings = readSettings();
-  if (settings.enableNativeGit) {
-    const result = await execGit(
-      ["cat-file", "-e", `${commitHash}^{commit}`],
-      path,
-    );
-    return result.exitCode === 0;
-  }
-
-  try {
-    await git.readCommit({
-      fs,
-      dir: path,
-      oid: commitHash,
-    });
-    return true;
-  } catch {
-    return false;
-  }
+  const result = await execGit(
+    ["cat-file", "-e", `${commitHash}^{commit}`],
+    path,
+  );
+  return result.exitCode === 0;
 }
 
 export async function isGitStatusClean({
@@ -407,26 +764,172 @@ export async function isGitStatusClean({
 }: {
   path: string;
 }): Promise<boolean> {
-  const settings = readSettings();
-  if (settings.enableNativeGit) {
-    const result = await execGit(["status", "--porcelain"], path);
+  const result = await execGit(
+    ["status", "--porcelain", "--untracked-files=all"],
+    path,
+  );
 
-    if (result.exitCode !== 0) {
-      throw new DyadError(
-        `Failed to get status: ${result.stderr}`,
-        DyadErrorKind.Conflict,
-      );
-    }
-
-    // If output is empty, working directory is clean (no changes)
-    const isClean = result.stdout.trim().length === 0;
-    return isClean;
-  } else {
-    const statusMatrix = await git.statusMatrix({ fs, dir: path });
-    return statusMatrix.every(
-      (row) => row[1] === 1 && row[2] === 1 && row[3] === 1,
+  if (result.exitCode !== 0) {
+    throw new DyadError(
+      `Failed to get status: ${result.stderr}`,
+      DyadErrorKind.Conflict,
     );
   }
+
+  // If output is empty, working directory is clean (no changes)
+  const isClean = result.stdout.trim().length === 0;
+  return isClean;
+}
+
+/**
+ * Returns whether the user-visible working tree is clean. Dyad-managed runtime
+ * paths are deliberately ignored so every restore/recovery guard uses the
+ * same definition of work that needs user acknowledgement.
+ */
+export async function isUserVisibleGitStatusClean({
+  path,
+}: GitBaseParams): Promise<boolean> {
+  const result = await execGit(
+    ["status", "--porcelain", "--untracked-files=all"],
+    path,
+  );
+  if (result.exitCode !== 0) {
+    throw new DyadError(
+      `Failed to get status: ${result.stderr.trim() || result.stdout.trim()}`,
+      DyadErrorKind.Conflict,
+    );
+  }
+  return !result.stdout
+    .split("\n")
+    .filter((line) => line.trim() !== "")
+    .flatMap(getPorcelainPaths)
+    .some(isUserVisibleGitPath);
+}
+
+export type GitOperationInProgress =
+  | "merge"
+  | "rebase"
+  | "cherry-pick"
+  | "revert"
+  | "bisect";
+
+export interface RepositoryHealth {
+  branch: string | null;
+  headOid: string;
+  isClean: boolean;
+  unmergedFiles: string[];
+  operationInProgress: GitOperationInProgress | null;
+}
+
+async function gitInternalPath(
+  repositoryPath: string,
+  marker: string,
+): Promise<string> {
+  const result = await execGit(
+    ["rev-parse", "--git-path", marker],
+    repositoryPath,
+  );
+  if (result.exitCode !== 0) {
+    throw new DyadError(
+      `Failed to inspect Git state: ${result.stderr.trim() || result.stdout.trim()}`,
+      DyadErrorKind.Conflict,
+    );
+  }
+  const markerPath = result.stdout.trim();
+  return pathModule.isAbsolute(markerPath)
+    ? markerPath
+    : pathModule.resolve(repositoryPath, markerPath);
+}
+
+/** One source of truth for whether a repository is safe to accept as current. */
+export async function inspectRepositoryHealth({
+  path,
+}: GitBaseParams): Promise<RepositoryHealth> {
+  const [branch, headOid, isClean, unmergedFiles, markerPaths] =
+    await Promise.all([
+      gitCurrentBranch({ path }),
+      getCurrentCommitHash({ path }),
+      isUserVisibleGitStatusClean({ path }),
+      gitGetMergeConflicts({ path }),
+      Promise.all(
+        [
+          "MERGE_HEAD",
+          "rebase-apply",
+          "rebase-merge",
+          "CHERRY_PICK_HEAD",
+          "REVERT_HEAD",
+          "BISECT_START",
+        ].map((marker) => gitInternalPath(path, marker)),
+      ),
+    ]);
+  const [
+    mergeHead,
+    rebaseApply,
+    rebaseMerge,
+    cherryPickHead,
+    revertHead,
+    bisectStart,
+  ] = markerPaths;
+  const operationInProgress: GitOperationInProgress | null = fs.existsSync(
+    mergeHead,
+  )
+    ? "merge"
+    : fs.existsSync(rebaseApply) || fs.existsSync(rebaseMerge)
+      ? "rebase"
+      : fs.existsSync(cherryPickHead)
+        ? "cherry-pick"
+        : fs.existsSync(revertHead)
+          ? "revert"
+          : fs.existsSync(bisectStart)
+            ? "bisect"
+            : null;
+
+  return {
+    branch: branch && branch !== "<no-branch>" ? branch : null,
+    headOid,
+    isClean,
+    unmergedFiles,
+    operationInProgress,
+  };
+}
+
+/**
+ * Whether one path has no staged or unstaged changes (and is not untracked).
+ *
+ * `git status --porcelain -- <path>` prints a line per differing path and
+ * nothing at all when it matches HEAD, so an empty result means clean. Callers
+ * that auto-commit a file they just rewrote use this BEFORE the rewrite: a file
+ * the user was already editing must not have those edits folded into Dyad's
+ * commit, because `git commit -- <path>` records the whole working-tree version
+ * of that path, not just the hunk Dyad changed.
+ *
+ * `--untracked-files=all` is passed explicitly rather than relying on the
+ * default: a user with `status.showUntrackedFiles=no` would otherwise get an
+ * empty result for a wholly untracked file, and "clean" here authorizes a
+ * commit — which would sweep the entire file, all of the user's content in it
+ * included, into a commit labelled as a one-line key swap.
+ */
+export async function isGitPathClean({
+  path,
+  filepath,
+}: GitFileParams): Promise<boolean> {
+  const result = await execGit(
+    [
+      "status",
+      "--porcelain",
+      "--untracked-files=all",
+      "--",
+      normalizePath(filepath),
+    ],
+    path,
+  );
+  if (result.exitCode !== 0) {
+    throw new DyadError(
+      `Failed to get status for ${filepath}: ${result.stderr.trim() || result.stdout.trim()}`,
+      DyadErrorKind.Conflict,
+    );
+  }
+  return result.stdout.trim().length === 0;
 }
 
 export async function hasStagedChanges({
@@ -434,36 +937,50 @@ export async function hasStagedChanges({
 }: {
   path: string;
 }): Promise<boolean> {
-  const settings = readSettings();
-  if (settings.enableNativeGit) {
-    // git diff --cached --quiet exits with 1 if there are staged changes, 0 if none
-    const result = await execGit(["diff", "--cached", "--quiet"], path);
-    if (result.exitCode !== 0 && result.exitCode !== 1) {
-      throw new DyadError(
-        `Failed to check staged changes: ${result.stderr.trim() || result.stdout.trim()}`,
-        DyadErrorKind.Conflict,
-      );
-    }
-    return result.exitCode === 1;
-  } else {
-    const statusMatrix = await git.statusMatrix({ fs, dir: path });
-    // row[1] = HEAD status, row[3] = stage status
-    // If stage differs from HEAD, there are staged changes
-    return statusMatrix.some((row) => row[3] !== row[1]);
+  // git diff --cached --quiet exits with 1 if there are staged changes, 0 if none
+  const result = await execGit(["diff", "--cached", "--quiet"], path);
+  if (result.exitCode !== 0 && result.exitCode !== 1) {
+    throw new DyadError(
+      `Failed to check staged changes: ${result.stderr.trim() || result.stdout.trim()}`,
+      DyadErrorKind.Conflict,
+    );
   }
+  return result.exitCode === 1;
 }
 
 export async function gitCommit({
   path,
   message,
   amend,
+  paths,
 }: GitCommitParams): Promise<string> {
-  const settings = readSettings();
-  if (settings.enableNativeGit) {
-    // Perform the commit using dugite with -c user.name/email config
-    const commitArgs = ["commit", "-m", message];
+  // Perform the commit using dugite with -c user.name/email config
+  // Hook execution is owned by workflows that require explicit verification;
+  // the low-level commit operation must never invoke hooks implicitly.
+  // `--no-verify` only suppresses pre-commit and commit-msg. Git still runs
+  // prepare-commit-msg and post-commit, so point hooksPath at a fresh empty
+  // directory outside the imported repository for the lifetime of this one
+  // commit. A repository-relative path would let the repository supply hooks
+  // at that path and execute code during an automatic checkpoint.
+  const noHooksPath = await fsPromises.mkdtemp(
+    pathModule.join(tmpdir(), "dyad-no-git-hooks-"),
+  );
+  try {
+    const commitArgs = [
+      "-c",
+      `core.hooksPath=${normalizePath(noHooksPath)}`,
+      "commit",
+      "-m",
+      message,
+      "--no-verify",
+    ];
     if (amend) {
       commitArgs.push("--amend");
+    }
+    if (paths?.length) {
+      // `--` scopes the commit to these paths, so unrelated staged changes stay
+      // in the index instead of being swept into this commit.
+      commitArgs.push("--", ...paths.map(normalizePath));
     }
     const args = await withGitAuthor(commitArgs);
     await execOrThrow(args, path, "Failed to create commit");
@@ -476,14 +993,15 @@ export async function gitCommit({
       );
     }
     return result.stdout.trim();
-  } else {
-    return git.commit({
-      fs: fs,
-      dir: path,
-      message,
-      author: await getGitAuthor(),
-      amend: amend,
-    });
+  } finally {
+    try {
+      await fsPromises.rm(noHooksPath, { recursive: true, force: true });
+    } catch (error) {
+      logger.warn("Failed to clean up temporary Git hooks directory", {
+        noHooksPath,
+        error,
+      });
+    }
   }
 }
 
@@ -491,135 +1009,107 @@ export async function gitCheckout({
   path,
   ref,
 }: GitCheckoutParams): Promise<void> {
-  const settings = readSettings();
-  if (settings.enableNativeGit) {
+  try {
     await execOrThrow(
       ["checkout", ref],
       path,
       `Failed to checkout ref '${ref}'`,
     );
-    return;
-  } else {
-    return git.checkout({ fs, dir: path, ref });
+  } catch (error) {
+    throw classifyGitOperationError(error, [
+      GIT_ERROR_CODES.UNCOMMITTED_CHANGES,
+    ]);
   }
+  return;
 }
 
 export async function gitStageToRevert({
   path,
   targetOid,
-}: GitStageToRevertParams): Promise<void> {
-  const settings = readSettings();
-  if (settings.enableNativeGit) {
-    // Get the current HEAD commit hash
-    const currentHeadResult = await execGit(["rev-parse", "HEAD"], path);
-    if (currentHeadResult.exitCode !== 0) {
-      throw new DyadError(
-        `Failed to get current commit: ${currentHeadResult.stderr.trim() || currentHeadResult.stdout.trim()}`,
-        DyadErrorKind.Conflict,
-      );
-    }
-
-    const currentCommit = currentHeadResult.stdout.trim();
-
-    // If we're already at the target commit, nothing to do
-    if (currentCommit === targetOid) {
-      return;
-    }
-
-    // Safety: refuse to run if the work-tree isn't clean.
-    const statusResult = await execGit(["status", "--porcelain"], path);
-    if (statusResult.exitCode !== 0) {
-      throw new DyadError(
-        `Failed to get status: ${statusResult.stderr.trim() || statusResult.stdout.trim()}`,
-        DyadErrorKind.Conflict,
-      );
-    }
-    if (statusResult.stdout.trim() !== "") {
-      throw new DyadError(
-        "Cannot revert: working tree has uncommitted changes.",
-        DyadErrorKind.Conflict,
-      );
-    }
-
-    // Reset the working directory and index to match the target commit state
-    // This effectively undoes all changes since the target commit
-    await execOrThrow(
-      ["reset", "--hard", targetOid],
-      path,
-      `Failed to reset to target commit '${targetOid}'`,
+  onBeforeReset,
+}: GitStageToRevertParams): Promise<boolean> {
+  // Get the current HEAD commit hash
+  const currentHeadResult = await execGit(["rev-parse", "HEAD"], path);
+  if (currentHeadResult.exitCode !== 0) {
+    throw new DyadError(
+      `Failed to get current commit: ${currentHeadResult.stderr.trim() || currentHeadResult.stdout.trim()}`,
+      DyadErrorKind.Conflict,
     );
-
-    // Reset back to the original HEAD but keep the working directory as it is
-    // This stages all the changes needed to revert to the target state
-    await execOrThrow(
-      ["reset", "--soft", currentCommit],
-      path,
-      "Failed to reset back to original HEAD",
-    );
-  } else {
-    // Get status matrix comparing the target commit (previousVersionId as HEAD) with current working directory
-    const matrix = await git.statusMatrix({
-      fs,
-      dir: path,
-      ref: targetOid,
-    });
-
-    // Process each file to revert to the state in previousVersionId
-    for (const [filepath, headStatus, workdirStatus] of matrix) {
-      const fullPath = pathModule.join(path, filepath);
-
-      // If file exists in HEAD (previous version)
-      if (headStatus === 1) {
-        // If file doesn't exist or has changed in working directory, restore it from the target commit
-        if (workdirStatus !== 1) {
-          const { blob } = await git.readBlob({
-            fs,
-            dir: path,
-            oid: targetOid,
-            filepath,
-          });
-          await fsPromises.mkdir(pathModule.dirname(fullPath), {
-            recursive: true,
-          });
-          await fsPromises.writeFile(fullPath, Buffer.from(blob));
-        }
-      }
-      // If file doesn't exist in HEAD but exists in working directory, delete it
-      else if (headStatus === 0 && workdirStatus !== 0) {
-        if (fs.existsSync(fullPath)) {
-          await fsPromises.unlink(fullPath);
-          await git.remove({
-            fs,
-            dir: path,
-            filepath: filepath,
-          });
-        }
-      }
-    }
-
-    // Stage all changes
-    await git.add({
-      fs,
-      dir: path,
-      filepath: ".",
-    });
   }
+
+  const currentCommit = currentHeadResult.stdout.trim();
+
+  // Safety: refuse to run if user-visible files are dirty. Do this before the
+  // currentCommit === targetOid no-op return too; otherwise a no-op restore
+  // with staged manual edits could be committed by the caller as a restore
+  // commit, and untracked runtime files could trigger an empty commit failure.
+  const statusResult = await execGit(["status", "--porcelain"], path);
+  if (statusResult.exitCode !== 0) {
+    throw new DyadError(
+      `Failed to get status: ${statusResult.stderr.trim() || statusResult.stdout.trim()}`,
+      DyadErrorKind.Conflict,
+    );
+  }
+  const userVisibleChanges = statusResult.stdout
+    .split("\n")
+    .filter((line) => line.trim() !== "")
+    // A staged rename shows up as `old -> new`. Examine BOTH sides: a rename
+    // from a managed `.dyad/` file to a user-visible destination must still
+    // count as a user-visible change, otherwise the following `reset --hard`
+    // would silently destroy the destination file. Mirrors the rename
+    // handling in `getGitUncommittedFilesWithStatus`.
+    .flatMap(getPorcelainPaths)
+    .filter(isUserVisibleGitPath);
+  if (userVisibleChanges.length > 0) {
+    throw new DyadError(
+      "Cannot revert: working tree has uncommitted changes.",
+      DyadErrorKind.Conflict,
+    );
+  }
+
+  // If we're already at the target commit, nothing to stage. Managed runtime
+  // files are intentionally ignored by the guard above and must not make the
+  // caller attempt an empty revert commit.
+  if (currentCommit === targetOid) {
+    return false;
+  }
+
+  onBeforeReset?.({
+    preRestoreHead: currentCommit,
+    targetHead: targetOid,
+    nextStep: "hard-reset",
+  });
+  // Reset the working directory and index to match the target commit state
+  // This effectively undoes all changes since the target commit
+  await execOrThrow(
+    ["reset", "--hard", targetOid],
+    path,
+    `Failed to reset to target commit '${targetOid}'`,
+  );
+
+  onBeforeReset?.({
+    preRestoreHead: currentCommit,
+    targetHead: targetOid,
+    nextStep: "soft-reset",
+  });
+  // Reset back to the original HEAD but keep the working directory as it is
+  // This stages all the changes needed to revert to the target state
+  await execOrThrow(
+    ["reset", "--soft", currentCommit],
+    path,
+    "Failed to reset back to original HEAD",
+  );
+  return hasStagedChanges({ path });
 }
 
 export async function gitAddAll({ path }: GitBaseParams): Promise<void> {
-  const settings = readSettings();
-  if (settings.enableNativeGit) {
-    await ensureGitLineEndingPolicy({ path });
-    await execOrThrow(["add", "."], path, "Failed to stage all files");
-    return;
-  } else {
-    return git.add({ fs, dir: path, filepath: "." });
-  }
+  await ensureGitLineEndingPolicy({ path });
+  await execOrThrow(["add", "."], path, "Failed to stage all files");
+  return;
 }
 
 export async function gitAdd({ path, filepath }: GitFileParams): Promise<void> {
   const normalizedFilepath = normalizePath(filepath);
-  const settings = readSettings();
 
   // Check if the file is ignored by .gitignore before attempting to stage.
   // This prevents errors when trying to stage files like .env.local.
@@ -643,20 +1133,12 @@ export async function gitAdd({ path, filepath }: GitFileParams): Promise<void> {
     }
   }
 
-  if (settings.enableNativeGit) {
-    await ensureGitLineEndingPolicy({ path });
-    await execOrThrow(
-      ["add", "--", normalizedFilepath],
-      path,
-      `Failed to stage file '${normalizedFilepath}'`,
-    );
-  } else {
-    await git.add({
-      fs,
-      dir: path,
-      filepath: normalizedFilepath,
-    });
-  }
+  await ensureGitLineEndingPolicy({ path });
+  await execOrThrow(
+    ["add", "--", normalizedFilepath],
+    path,
+    `Failed to stage file '${normalizedFilepath}'`,
+  );
 }
 
 export async function gitResetFile({
@@ -664,274 +1146,489 @@ export async function gitResetFile({
   filepath,
 }: GitFileParams): Promise<void> {
   const normalizedFilepath = normalizePath(filepath);
-  const settings = readSettings();
-  if (settings.enableNativeGit) {
-    await execOrThrow(
-      ["reset", "HEAD", "--", normalizedFilepath],
-      path,
-      `Failed to unstage file '${normalizedFilepath}'`,
-    );
-  } else {
-    await git.resetIndex({
-      fs,
-      dir: path,
-      filepath: normalizedFilepath,
-    });
-  }
+  await execOrThrow(
+    ["reset", "HEAD", "--", normalizedFilepath],
+    path,
+    `Failed to unstage file '${normalizedFilepath}'`,
+  );
 }
 
-export async function gitReset({ path }: GitBaseParams): Promise<void> {
-  const settings = readSettings();
-  if (settings.enableNativeGit) {
-    // Reset the staging area to match HEAD (unstage files but keep working directory changes)
-    await execOrThrow(["reset", "HEAD"], path, "Failed to reset staging area");
-  } else {
-    // For isomorphic-git, resetting the index is complex and not directly supported
-    // This is a fallback - in practice, this should rarely be needed when native git is disabled
-    // If needed, users can manually reset via command line or enable native git
+/**
+ * One index entry for a path, exactly as it is staged right now.
+ *
+ * `stage` is 0 for an ordinary entry. A path in a merge conflict has no stage-0
+ * entry at all — it has stages 1, 2 and 3 (base, ours, theirs) — which is why
+ * this is read and restored as a list: collapsing them to the first blob would
+ * hand the user back a resolved-looking file they never resolved.
+ */
+export interface GitIndexEntry {
+  mode: string;
+  oid: string;
+  stage: number;
+}
+
+/**
+ * Every index entry for one path, exactly as it is staged right now.
+ *
+ * An empty array means the path is not in the index at all. Anything that
+ * stages over a file it may have to put back needs this: restoring the
+ * working-tree bytes and re-adding them rebuilds the index from the *content*,
+ * which silently replaces whatever the user had staged there — including a
+ * staged delete, which has no content to rebuild from.
+ */
+export async function readGitIndexEntries({
+  path,
+  filepath,
+}: GitFileParams): Promise<GitIndexEntry[]> {
+  const normalizedFilepath = normalizePath(filepath);
+  const result = await execGit(
+    ["ls-files", "--stage", "--", normalizedFilepath],
+    path,
+  );
+  if (result.exitCode !== 0) {
     throw new DyadError(
-      "gitReset: Resetting the staging area is not fully supported when native git is disabled. " +
-        "Please enable native git or manually unstage files using 'git reset HEAD'.",
-      DyadErrorKind.Precondition,
+      `Failed to read the index entry for '${normalizedFilepath}'. ${
+        result.stderr.trim() || result.stdout.trim()
+      }`,
+      DyadErrorKind.External,
     );
   }
+  // `<mode> <oid> <stage>\t<path>` per line, empty when the path isn't staged.
+  const entries: GitIndexEntry[] = [];
+  for (const rawLine of result.stdout.split("\n")) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const [mode, oid, stage] = line.split(/\s+/);
+    if (!mode || !oid) continue;
+    entries.push({ mode, oid, stage: Number(stage) || 0 });
+  }
+  return entries;
+}
+
+/**
+ * Put a path's index entries back to exactly what `readGitIndexEntries`
+ * returned, without touching the working tree. An empty list removes the path
+ * from the index.
+ */
+export async function restoreGitIndexEntries({
+  path,
+  filepath,
+  entries,
+}: GitFileParams & { entries: GitIndexEntry[] }): Promise<void> {
+  const normalizedFilepath = normalizePath(filepath);
+  // Unconditionally first: `--index-info` adds stages, so a leftover entry for
+  // this path (a stage-0 one written by the staging this is undoing, say) would
+  // otherwise survive alongside the restored conflict stages.
+  await execOrThrow(
+    ["update-index", "--force-remove", "--", normalizedFilepath],
+    path,
+    `Failed to restore the index entry for '${normalizedFilepath}'`,
+  );
+  if (entries.length === 0) return;
+  // `--index-info` rather than `--cacheinfo`: only this form can write an entry
+  // at a stage other than 0, which is the whole of a conflicted path's state.
+  await execOrThrow(
+    ["update-index", "--index-info"],
+    path,
+    `Failed to restore the index entry for '${normalizedFilepath}'`,
+    DyadErrorKind.External,
+    {
+      stdin: entries
+        .map(
+          (entry) =>
+            `${entry.mode} ${entry.oid} ${entry.stage}\t${normalizedFilepath}\n`,
+        )
+        .join(""),
+    },
+  );
 }
 
 export async function gitDiscardAllChanges({
   path,
 }: GitBaseParams): Promise<void> {
-  const settings = readSettings();
-  if (settings.enableNativeGit) {
-    // Reset all tracked files (index + working tree) to HEAD state
-    await execOrThrow(
-      ["reset", "--hard", "HEAD"],
-      path,
-      "Failed to reset to HEAD",
-    );
-    // Remove untracked files and directories
-    await execOrThrow(
-      ["clean", "-fd"],
-      path,
-      "Failed to remove untracked files",
-    );
-  } else {
-    const matrix = await git.statusMatrix({ fs, dir: path });
-    const removedFileDirs = new Set<string>();
-
-    for (const row of matrix) {
-      const [filepath, headStatus, workdirStatus, stageStatus] = row;
-      const fullPath = pathModule.join(path, filepath);
-
-      if (headStatus === 1) {
-        // Tracked file: restore if changed in workdir or stage
-        if (workdirStatus !== 1 || stageStatus !== 1) {
-          await git.checkout({
-            fs,
-            dir: path,
-            ref: "HEAD",
-            filepaths: [filepath],
-            force: true,
-          });
-        }
-      } else if (stageStatus !== 0) {
-        // Staged new file: remove from index
-        await git.remove({ fs, dir: path, filepath });
-        // Delete from disk if still present
-        if (fs.existsSync(fullPath)) {
-          await fsPromises.rm(fullPath, { recursive: true, force: true });
-          removedFileDirs.add(pathModule.dirname(fullPath));
-        }
-      } else if (workdirStatus !== 0) {
-        // Purely untracked file/directory: just delete from disk
-        if (fs.existsSync(fullPath)) {
-          await fsPromises.rm(fullPath, { recursive: true, force: true });
-          removedFileDirs.add(pathModule.dirname(fullPath));
-        }
-      }
-    }
-
-    // Prune empty directories only where files were actually removed.
-    // Collect each dir and its parent chain up to the repo root, then
-    // sort deepest-first so children are removed before parents.
-    const dirsToCheck = new Set<string>();
-    for (const dir of removedFileDirs) {
-      let current = dir;
-      while (current !== path && current.startsWith(path)) {
-        dirsToCheck.add(current);
-        current = pathModule.dirname(current);
-      }
-    }
-    const sorted = [...dirsToCheck].sort((a, b) => b.length - a.length);
-    for (const dir of sorted) {
-      try {
-        const remaining = await fsPromises.readdir(dir);
-        if (remaining.length === 0) {
-          await fsPromises.rmdir(dir);
-        }
-      } catch {
-        // Ignore errors (broken symlinks, permission issues) so the
-        // discard operation isn't aborted by a single failing directory.
-      }
-    }
-  }
+  // Reset all tracked files (index + working tree) to HEAD state
+  await execOrThrow(
+    ["reset", "--hard", "HEAD"],
+    path,
+    "Failed to reset to HEAD",
+  );
+  // Remove untracked files and directories
+  await execOrThrow(["clean", "-fd"], path, "Failed to remove untracked files");
 }
 
 export async function gitInit({
   path,
   ref = "main",
 }: GitInitParams): Promise<void> {
-  const settings = readSettings();
-  if (settings.enableNativeGit) {
-    await execOrThrow(
-      ["init", "-b", ref],
-      path,
-      `Failed to initialize git repository with branch '${ref}'`,
-    );
-  } else {
-    await git.init({
-      fs,
-      dir: path,
-      defaultBranch: ref,
-    });
-  }
+  await execOrThrow(
+    ["init", "-b", ref],
+    path,
+    `Failed to initialize git repository with branch '${ref}'`,
+  );
 }
 
 export async function gitRemove({
   path,
   filepath,
 }: GitFileParams): Promise<void> {
-  const settings = readSettings();
-  if (settings.enableNativeGit) {
-    await execOrThrow(
-      ["rm", "-f", "--", filepath],
-      path,
-      `Failed to remove file '${filepath}'`,
-    );
-  } else {
-    await git.remove({
-      fs,
-      dir: path,
-      filepath,
-    });
-  }
+  await execOrThrow(
+    ["rm", "-f", "--", filepath],
+    path,
+    `Failed to remove file '${filepath}'`,
+  );
 }
 
 export async function getGitUncommittedFiles({
   path,
 }: GitBaseParams): Promise<string[]> {
-  const settings = readSettings();
-  if (settings.enableNativeGit) {
-    const result = await execGit(["status", "--porcelain"], path);
-    if (result.exitCode !== 0) {
-      throw new DyadError(
-        `Failed to get uncommitted files: ${result.stderr.trim() || result.stdout.trim()}`,
-        DyadErrorKind.Conflict,
-      );
-    }
-    return result.stdout
+  const result = await execGit(["status", "--porcelain"], path);
+  if (result.exitCode !== 0) {
+    throw new DyadError(
+      `Failed to get uncommitted files: ${result.stderr.trim() || result.stdout.trim()}`,
+      DyadErrorKind.Conflict,
+    );
+  }
+  return (
+    result.stdout
       .toString()
       .split("\n")
       .filter((line) => line.trim() !== "")
-      .map((line) => line.slice(3).trim())
-      .filter(isUserVisibleGitPath);
-  } else {
-    const statusMatrix = await git.statusMatrix({ fs, dir: path });
-    return statusMatrix
-      .filter((row) => row[1] !== 1 || row[2] !== 1 || row[3] !== 1)
-      .map((row) => row[0])
-      .filter(isUserVisibleGitPath);
+      // Decode git's C-style path quoting (including `\NNN` octal escapes for
+      // non-ASCII/control bytes) and expand rename entries into both sides, so
+      // non-ASCII paths are returned verbatim and `.dyad/` filtering matches.
+      .flatMap(getPorcelainPaths)
+      .filter(isUserVisibleGitPath)
+  );
+}
+
+function countLines(content: string): number {
+  if (!content) return 0;
+  const lines = content.split("\n");
+  // A single trailing newline terminates the last line rather than starting a
+  // new empty one, so drop it to match how git counts lines.
+  if (lines[lines.length - 1] === "") lines.pop();
+  return lines.length;
+}
+
+function lcsLength(a: string[], b: string[]): number {
+  // `b` is the inner (shorter) dimension to keep the rolling arrays small.
+  const bLen = b.length;
+  let prev: number[] = Array.from({ length: bLen + 1 }, () => 0);
+  let curr: number[] = Array.from({ length: bLen + 1 }, () => 0);
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= bLen; j++) {
+      if (a[i - 1] === b[j - 1]) {
+        curr[j] = prev[j - 1] + 1;
+      } else {
+        curr[j] = curr[j - 1] >= prev[j] ? curr[j - 1] : prev[j];
+      }
+    }
+    const tmp = prev;
+    prev = curr;
+    curr = tmp;
+    curr.fill(0);
   }
+  return prev[bLen];
+}
+
+function approximateLineDiff(
+  oldLines: string[],
+  newLines: string[],
+): { additions: number; deletions: number } {
+  // For very large files, approximate common lines via multiset intersection
+  // instead of a full LCS to avoid quadratic time/memory.
+  const counts = new Map<string, number>();
+  for (const line of oldLines) counts.set(line, (counts.get(line) ?? 0) + 1);
+  let common = 0;
+  for (const line of newLines) {
+    const remaining = counts.get(line);
+    if (remaining && remaining > 0) {
+      counts.set(line, remaining - 1);
+      common++;
+    }
+  }
+  return {
+    additions: newLines.length - common,
+    deletions: oldLines.length - common,
+  };
 }
 
 /**
- * Get uncommitted files with their status (added, modified, deleted, renamed).
+ * Counts added/deleted lines between two versions of a file, matching the
+ * insertions/deletions reported by `git diff --numstat` (both equal the line
+ * count minus the longest common subsequence of lines).
+ */
+export function countChangedLines(
+  oldContent: string,
+  newContent: string,
+): { additions: number; deletions: number } {
+  if (oldContent === newContent) return { additions: 0, deletions: 0 };
+  const oldLines = oldContent ? oldContent.split("\n") : [];
+  const newLines = newContent ? newContent.split("\n") : [];
+  if (oldLines.length && oldLines[oldLines.length - 1] === "") oldLines.pop();
+  if (newLines.length && newLines[newLines.length - 1] === "") newLines.pop();
+
+  const n = oldLines.length;
+  const m = newLines.length;
+  if (n === 0) return { additions: m, deletions: 0 };
+  if (m === 0) return { additions: 0, deletions: n };
+  if (n * m > 4_000_000) return approximateLineDiff(oldLines, newLines);
+
+  const lcs =
+    m <= n ? lcsLength(oldLines, newLines) : lcsLength(newLines, oldLines);
+  const result = { additions: m - lcs, deletions: n - lcs };
+  // A file that differs only by whether it ends in a trailing newline still
+  // counts as one changed line in `git diff --numstat` (the final line is shown
+  // as removed and re-added). The trailing-newline stripping above discards that
+  // distinction, so restore it explicitly when nothing else changed.
+  if (
+    result.additions === 0 &&
+    result.deletions === 0 &&
+    oldContent.endsWith("\n") !== newContent.endsWith("\n")
+  ) {
+    return { additions: 1, deletions: 1 };
+  }
+  return result;
+}
+
+async function readWorkingFileContent(
+  dir: string,
+  filePath: string,
+): Promise<string> {
+  try {
+    // Use safeJoin (rather than a bare path.join) so a path that would escape
+    // the app directory is rejected instead of read, providing defense-in-depth
+    // consistency with the IPC diff handler.
+    return await fsPromises.readFile(safeJoin(dir, filePath), "utf-8");
+  } catch {
+    return "";
+  }
+}
+
+// Skip diffing files larger than this. Line stats are polled every few seconds
+// (see LINE_STATS_CONCURRENCY), so reading big lockfiles, minified bundles, or
+// binary assets into memory on each poll would repeatedly spike memory and
+// stall the main process. Such files still appear in the list; they just report
+// 0/0 instead of exact counts.
+const MAX_STATS_FILE_BYTES = 512 * 1024; // 512 KB
+
+// A decoded file that contains a NUL byte is almost certainly binary; computing
+// a line diff on it is meaningless (and potentially huge), so we skip it.
+function looksBinary(content: string): boolean {
+  return content.includes("\u0000");
+}
+
+async function getFileLineStats({
+  path,
+  file,
+}: {
+  path: string;
+  file: { path: string; status: UncommittedFileStatus; oldPath?: string };
+}): Promise<{ additions: number; deletions: number }> {
+  try {
+    if (file.status === "deleted") {
+      const head = await getFileAtCommit({
+        path,
+        filePath: file.path,
+        commitHash: "HEAD",
+      });
+      if (
+        head == null ||
+        head.length > MAX_STATS_FILE_BYTES ||
+        looksBinary(head)
+      )
+        return { additions: 0, deletions: 0 };
+      return { additions: 0, deletions: countLines(head) };
+    }
+
+    // Guard against reading a very large working-tree file into memory on every
+    // status poll.
+    try {
+      const stat = await fsPromises.stat(safeJoin(path, file.path));
+      if (stat.size > MAX_STATS_FILE_BYTES) {
+        return { additions: 0, deletions: 0 };
+      }
+    } catch {
+      // Can't stat (e.g. deleted between status and here) — fall through; the
+      // read below will handle it.
+    }
+
+    const newContent = await readWorkingFileContent(path, file.path);
+    if (looksBinary(newContent)) return { additions: 0, deletions: 0 };
+
+    // A rename keeps the original content under its old path at HEAD; diff
+    // old→new so a pure rename reports 0/0 rather than all-added. A rename with
+    // no known old path (or any other status) falls back to the current path.
+    const headPath =
+      file.status === "renamed" && file.oldPath ? file.oldPath : file.path;
+    const head = await getFileAtCommit({
+      path,
+      filePath: headPath,
+      commitHash: "HEAD",
+    });
+    if (head == null)
+      return { additions: countLines(newContent), deletions: 0 };
+    if (head.length > MAX_STATS_FILE_BYTES || looksBinary(head))
+      return { additions: 0, deletions: 0 };
+    return countChangedLines(head, newContent);
+  } catch (error) {
+    logger.warn(`Failed to compute line stats for '${file.path}'`, error);
+    return { additions: 0, deletions: 0 };
+  }
+}
+
+// Cap how many files we read/diff at once. This function is polled every few
+// seconds, so an unbounded Promise.all over every uncommitted file could spike
+// CPU/memory or exhaust file descriptors after a large refactor. Processing in
+// bounded batches keeps the main process responsive while still parallelizing.
+const LINE_STATS_CONCURRENCY = 10;
+
+async function attachLineStats({
+  path,
+  files,
+}: {
+  path: string;
+  files: Array<{
+    path: string;
+    status: UncommittedFileStatus;
+    oldPath?: string;
+  }>;
+}): Promise<UncommittedFile[]> {
+  const results: UncommittedFile[] = [];
+  for (let i = 0; i < files.length; i += LINE_STATS_CONCURRENCY) {
+    const batch = files.slice(i, i + LINE_STATS_CONCURRENCY);
+    const batchResults = await Promise.all(
+      batch.map(async (file) => ({
+        ...file,
+        ...(await getFileLineStats({ path, file })),
+      })),
+    );
+    results.push(...batchResults);
+  }
+  return results;
+}
+
+/**
+ * Decodes a path as printed by `git status --porcelain`. Git prints paths
+ * containing "unusual" bytes (spaces are fine, but non-ASCII, control chars,
+ * quotes, or backslashes trigger it) wrapped in double quotes with C-style
+ * escapes — e.g. `café.txt` becomes `"caf\303\251.txt"`. Passing that literal
+ * string to the filesystem would fail to find the file, so decode it back to
+ * the real path. Unquoted paths are returned unchanged.
+ */
+export function unquoteGitPath(raw: string): string {
+  if (raw.length < 2 || !raw.startsWith('"') || !raw.endsWith('"')) {
+    return raw;
+  }
+  const body = raw.slice(1, -1);
+  const bytes: number[] = [];
+  for (let i = 0; i < body.length; i++) {
+    const ch = String.fromCodePoint(body.codePointAt(i)!);
+    if (ch !== "\\") {
+      bytes.push(...Buffer.from(ch, "utf-8"));
+      i += ch.length - 1;
+      continue;
+    }
+    const next = body[i + 1];
+    if (next === undefined) break;
+    if (next >= "0" && next <= "7") {
+      // Octal escape \nnn (1-3 digits) => a single raw byte.
+      let oct = "";
+      let j = i + 1;
+      while (
+        j < body.length &&
+        oct.length < 3 &&
+        body[j] >= "0" &&
+        body[j] <= "7"
+      ) {
+        oct += body[j];
+        j++;
+      }
+      bytes.push(parseInt(oct, 8) & 0xff);
+      i = j - 1;
+      continue;
+    }
+    if (next in PORCELAIN_C_ESCAPES) {
+      bytes.push(PORCELAIN_C_ESCAPES[next]);
+    } else {
+      bytes.push(...Buffer.from(next, "utf-8"));
+    }
+    i += 1;
+  }
+  return Buffer.from(bytes).toString("utf-8");
+}
+
+/**
+ * Parses one line of `git status --porcelain` output into a path + status,
+ * unquoting C-quoted paths and preserving the original path for renames so the
+ * HEAD blob can still be located. Returns null for blank lines.
+ */
+function parsePorcelainStatusLine(line: string): {
+  path: string;
+  status: UncommittedFileStatus;
+  oldPath?: string;
+} | null {
+  if (line.trim() === "") return null;
+  // Git status --porcelain format: "XY path" (X = staged, Y = unstaged status).
+  const statusCode = line.substring(0, 2);
+  const rest = line.slice(3).trim();
+
+  // Renames are printed as "old -> new"; each side may be quoted independently.
+  if (statusCode.startsWith("R")) {
+    const arrowIndex = rest.indexOf(" -> ");
+    if (arrowIndex !== -1) {
+      return {
+        path: unquoteGitPath(rest.slice(arrowIndex + 4).trim()),
+        oldPath: unquoteGitPath(rest.slice(0, arrowIndex).trim()),
+        status: "renamed",
+      };
+    }
+    return { path: unquoteGitPath(rest), status: "renamed" };
+  }
+
+  const path = unquoteGitPath(rest);
+  // Check deleted first: for status code "AD" (added to index, then deleted from
+  // working directory) the file no longer exists, so report it as deleted.
+  let status: UncommittedFileStatus;
+  if (statusCode.includes("D")) {
+    status = "deleted";
+  } else if (statusCode === "??" || statusCode.includes("A")) {
+    status = "added";
+  } else {
+    status = "modified";
+  }
+  return { path, status };
+}
+
+/**
+ * Get uncommitted files with their status (added, modified, deleted, renamed)
+ * along with per-file added/deleted line counts relative to HEAD.
  * This parses git status --porcelain output to determine the file status.
  */
 export async function getGitUncommittedFilesWithStatus({
   path,
 }: GitBaseParams): Promise<UncommittedFile[]> {
-  const settings = readSettings();
-  if (settings.enableNativeGit) {
-    const result = await execGit(["status", "--porcelain"], path);
-    if (result.exitCode !== 0) {
-      throw new DyadError(
-        `Failed to get uncommitted files: ${result.stderr.trim() || result.stdout.trim()}`,
-        DyadErrorKind.Conflict,
-      );
-    }
-    return result.stdout
-      .toString()
-      .split("\n")
-      .filter((line) => line.trim() !== "")
-      .filter((line) => {
-        const filePath = line.slice(3).trim();
-        return isUserVisibleGitPath(
-          filePath.includes(" -> ")
-            ? filePath.substring(filePath.indexOf(" -> ") + 4)
-            : filePath,
-        );
-      })
-      .map((line) => {
-        // Git status --porcelain format: XY filename
-        // X = staged status, Y = unstaged status
-        // Common codes: M=modified, A=added, D=deleted, R=renamed, ??=untracked
-        const statusCode = line.substring(0, 2);
-        let filePath = line.slice(3).trim();
-
-        // Handle renamed files: R  old -> new
-        if (statusCode.startsWith("R")) {
-          const arrowIndex = filePath.indexOf(" -> ");
-          if (arrowIndex !== -1) {
-            filePath = filePath.substring(arrowIndex + 4);
-          }
-          return { path: filePath, status: "renamed" as UncommittedFileStatus };
-        }
-
-        // Determine status based on status codes
-        // Check deleted first: for status code "AD" (added to index, then deleted
-        // from working directory), the file no longer exists so report as deleted
-        let status: UncommittedFileStatus;
-        if (statusCode.includes("D")) {
-          status = "deleted";
-        } else if (statusCode === "??" || statusCode.includes("A")) {
-          status = "added";
-        } else {
-          status = "modified";
-        }
-
-        return { path: filePath, status };
-      });
-  } else {
-    // For isomorphic-git, we use the status matrix
-    // [filepath, HEAD, WORKDIR, STAGE]
-    // HEAD: 0=absent, 1=present
-    // WORKDIR: 0=absent, 1=identical to HEAD, 2=modified
-    // STAGE: 0=absent, 1=identical to HEAD, 2=added, 3=modified
-    const statusMatrix = await git.statusMatrix({ fs, dir: path });
-    return statusMatrix
-      .filter((row) => row[1] !== 1 || row[2] !== 1 || row[3] !== 1)
-      .filter((row) => isUserVisibleGitPath(row[0]))
-      .map((row) => {
-        const filePath = row[0];
-        const head = row[1];
-        const workdir = row[2];
-
-        // Check workdir === 0 first: for a file added to index then deleted from
-        // working directory, the file no longer exists so report as deleted
-        let status: UncommittedFileStatus;
-        if (workdir === 0) {
-          // File deleted from workdir
-          status = "deleted";
-        } else if (head === 0) {
-          // File not in HEAD = new file
-          status = "added";
-        } else {
-          status = "modified";
-        }
-
-        return { path: filePath, status };
-      });
+  const result = await execGit(["status", "--porcelain"], path);
+  if (result.exitCode !== 0) {
+    throw new DyadError(
+      `Failed to get uncommitted files: ${result.stderr.trim() || result.stdout.trim()}`,
+      DyadErrorKind.Conflict,
+    );
   }
+  const files = result.stdout
+    .toString()
+    .split("\n")
+    .map(parsePorcelainStatusLine)
+    .filter(
+      (
+        file,
+      ): file is {
+        path: string;
+        status: UncommittedFileStatus;
+        oldPath?: string;
+      } => file !== null && isUserVisibleGitPath(file.path),
+    );
+  return attachLineStats({ path, files });
 }
 
 export async function getFileAtCommit({
@@ -939,38 +1636,19 @@ export async function getFileAtCommit({
   filePath,
   commitHash,
 }: GitFileAtCommitParams): Promise<string | null> {
-  const settings = readSettings();
-  if (settings.enableNativeGit) {
-    try {
-      const result = await execGit(["show", `${commitHash}:${filePath}`], path);
-      if (result.exitCode !== 0) {
-        // File doesn't exist at this commit or other error
-        return null;
-      }
-      return result.stdout;
-    } catch (error: any) {
-      logger.error(
-        `Error getting file at commit ${commitHash}: ${error.message}`,
-      );
-      // File doesn't exist at this commit
+  try {
+    const result = await execGit(["show", `${commitHash}:${filePath}`], path);
+    if (result.exitCode !== 0) {
+      // File doesn't exist at this commit or other error
       return null;
     }
-  } else {
-    try {
-      const { blob } = await git.readBlob({
-        fs,
-        dir: path,
-        oid: commitHash,
-        filepath: filePath,
-      });
-      return Buffer.from(blob).toString("utf-8");
-    } catch (error: any) {
-      logger.error(
-        `Error getting file at commit ${commitHash}: ${error.message}`,
-      );
-      // File doesn't exist at this commit
-      return null;
-    }
+    return result.stdout;
+  } catch (error: any) {
+    logger.error(
+      `Error getting file at commit ${commitHash}: ${error.message}`,
+    );
+    // File doesn't exist at this commit
+    return null;
   }
 }
 
@@ -982,27 +1660,16 @@ async function getParentCommitOid({
   path,
   commitHash,
 }: GitListChangedFilesParams): Promise<string | null> {
-  const settings = readSettings();
-  if (settings.enableNativeGit) {
-    // Stay on the native backend rather than mixing in isomorphic-git, which
-    // may be unable to read objects in shallow/partial clones that native git
-    // handles fine. `--verify --quiet` exits non-zero (without erroring) for a
-    // root commit, where `<commit>^` does not resolve.
-    const result = await execGit(
-      ["rev-parse", "--verify", "--quiet", `${commitHash}^`],
-      path,
-    );
-    if (result.exitCode !== 0) {
-      return null;
-    }
-    return result.stdout.toString().trim() || null;
+  // `--verify --quiet` exits non-zero (without erroring) for a
+  // root commit, where `<commit>^` does not resolve.
+  const result = await execGit(
+    ["rev-parse", "--verify", "--quiet", `${commitHash}^`],
+    path,
+  );
+  if (result.exitCode !== 0) {
+    return null;
   }
-  const { commit } = await git.readCommit({
-    fs,
-    dir: path,
-    oid: commitHash,
-  });
-  return commit.parent.length > 0 ? commit.parent[0] : null;
+  return result.stdout.toString().trim() || null;
 }
 
 /**
@@ -1010,27 +1677,17 @@ async function getParentCommitOid({
  * i.e. the "before" side of the commit's diff. Returns null when the commit is a
  * root commit (no parent) or the file did not exist in the parent.
  *
- * Note: isomorphic-git does not understand the `^` parent ref syntax, so we
- * resolve the parent oid explicitly for that path.
  */
 export async function getOldFileContent({
   path,
   filePath,
   commitHash,
 }: GitFileAtCommitParams): Promise<string | null> {
-  const settings = readSettings();
-  if (settings.enableNativeGit) {
-    return getFileAtCommit({
-      path,
-      filePath,
-      commitHash: `${commitHash}^`,
-    });
-  }
-  const parentOid = await getParentCommitOid({ path, commitHash });
-  if (!parentOid) {
-    return null;
-  }
-  return getFileAtCommit({ path, filePath, commitHash: parentOid });
+  return getFileAtCommit({
+    path,
+    filePath,
+    commitHash: `${commitHash}^`,
+  });
 }
 
 /**
@@ -1038,126 +1695,53 @@ export async function getOldFileContent({
  * kind of change. Renames are decomposed into a delete + add pair so the result
  * maps cleanly onto per-path content lookups. Filters out files that are not
  * user-visible (e.g. .dyad/, pnpm-workspace.yaml) for parity with the rest of
- * the file. Supports both native git and isomorphic-git.
+ * the file.
  */
 export async function getChangedFilesForCommit({
   path,
   commitHash,
 }: GitListChangedFilesParams): Promise<GitChangedFile[]> {
-  const settings = readSettings();
-
-  if (settings.enableNativeGit) {
-    // Diff the commit explicitly against its FIRST parent so the result matches
-    // the isomorphic-git path below (which walks parent[0]). For merge commits
-    // `-m --first-parent` is NOT sufficient: -m still reports files that merely
-    // differ from the *second* parent even though they were already present on
-    // the first parent, making them appear as spurious additions/modifications.
-    // Diffing the explicit `<parent> <commit>` range avoids that. Root commits
-    // have no parent, so fall back to --root (which shows their files as adds).
-    // --no-renames decomposes renames into D + A pairs.
-    // -z gives NUL-delimited output for robust parsing of paths with spaces.
-    const parentOid = await getParentCommitOid({ path, commitHash });
-    const result = await execGit(
-      [
-        "diff-tree",
-        "--no-commit-id",
-        "--no-renames",
-        "--name-status",
-        "-r",
-        "-z",
-        ...(parentOid ? [parentOid, commitHash] : ["--root", commitHash]),
-      ],
-      path,
+  // Diff the commit explicitly against its FIRST parent so the result matches
+  // the first-parent semantics. For merge commits
+  // `-m --first-parent` is NOT sufficient: -m still reports files that merely
+  // differ from the *second* parent even though they were already present on
+  // the first parent, making them appear as spurious additions/modifications.
+  // Diffing the explicit `<parent> <commit>` range avoids that. Root commits
+  // have no parent, so fall back to --root (which shows their files as adds).
+  // --no-renames decomposes renames into D + A pairs.
+  // -z gives NUL-delimited output for robust parsing of paths with spaces.
+  const parentOid = await getParentCommitOid({ path, commitHash });
+  const result = await execGit(
+    [
+      "diff-tree",
+      "--no-commit-id",
+      "--no-renames",
+      "--name-status",
+      "-r",
+      "-z",
+      ...(parentOid ? [parentOid, commitHash] : ["--root", commitHash]),
+    ],
+    path,
+  );
+  if (result.exitCode !== 0) {
+    throw new DyadError(
+      result.stderr.toString() || result.stdout.toString(),
+      DyadErrorKind.External,
     );
-    if (result.exitCode !== 0) {
-      throw new DyadError(
-        result.stderr.toString() || result.stdout.toString(),
-        DyadErrorKind.External,
-      );
-    }
-
-    // Output is a flat NUL-delimited stream: status, path, status, path, ...
-    const tokens = result.stdout
-      .split("\0")
-      .filter((token) => token.length > 0);
-    const changes: GitChangedFile[] = [];
-    for (let i = 0; i + 1 < tokens.length; i += 2) {
-      const status = tokens[i];
-      const filePath = tokens[i + 1];
-      const type = mapDiffStatusToChangeType(status);
-      if (type && isUserVisibleGitPath(filePath)) {
-        changes.push({ path: filePath, type });
-      }
-    }
-    return changes;
   }
 
-  // isomorphic-git: walk the parent tree and the commit tree side by side.
-  const parentOid = await getParentCommitOid({ path, commitHash });
-  const trees = parentOid
-    ? [git.TREE({ ref: parentOid }), git.TREE({ ref: commitHash })]
-    : [git.TREE({ ref: commitHash })];
-
-  const results = await git.walk({
-    fs,
-    dir: path,
-    trees,
-    map: async (filepath, entries) => {
-      if (filepath === ".") {
-        return undefined;
-      }
-
-      // Root commit: only one walker, everything present is an addition.
-      if (entries.length === 1) {
-        const [current] = entries;
-        if (!current || (await current.type()) === "tree") {
-          return undefined;
-        }
-        return { path: filepath, type: "added" as GitChangedFileType };
-      }
-
-      const [parent, current] = entries;
-      const parentType = parent ? await parent.type() : undefined;
-      const currentType = current ? await current.type() : undefined;
-      if (parentType === "tree" || currentType === "tree") {
-        // One side may be a blob while the other is a directory (a file was
-        // replaced by a directory, or vice versa). The tree side is handled by
-        // walk recursing into its children, but the blob side must be emitted
-        // here as an add/delete, otherwise half of the commit is suppressed.
-        if (currentType === "blob") {
-          return { path: filepath, type: "added" as GitChangedFileType };
-        }
-        if (parentType === "blob") {
-          return { path: filepath, type: "deleted" as GitChangedFileType };
-        }
-        // Pure directory on the relevant side(s): let walk recurse, emit nothing.
-        return undefined;
-      }
-
-      if (!parent && !current) {
-        return undefined;
-      }
-      if (!parent && current) {
-        return { path: filepath, type: "added" as GitChangedFileType };
-      }
-      if (parent && !current) {
-        return { path: filepath, type: "deleted" as GitChangedFileType };
-      }
-
-      const [parentBlobOid, currentBlobOid] = await Promise.all([
-        parent!.oid(),
-        current!.oid(),
-      ]);
-      if (parentBlobOid === currentBlobOid) {
-        return undefined;
-      }
-      return { path: filepath, type: "modified" as GitChangedFileType };
-    },
-  });
-
-  return (results as (GitChangedFile | undefined)[])
-    .filter((entry): entry is GitChangedFile => Boolean(entry))
-    .filter((entry) => isUserVisibleGitPath(entry.path));
+  // Output is a flat NUL-delimited stream: status, path, status, path, ...
+  const tokens = result.stdout.split("\0").filter((token) => token.length > 0);
+  const changes: GitChangedFile[] = [];
+  for (let i = 0; i + 1 < tokens.length; i += 2) {
+    const status = tokens[i];
+    const filePath = tokens[i + 1];
+    const type = mapDiffStatusToChangeType(status);
+    if (type && isUserVisibleGitPath(filePath)) {
+      changes.push({ path: filePath, type });
+    }
+  }
+  return changes;
 }
 
 function mapDiffStatusToChangeType(status: string): GitChangedFileType | null {
@@ -1180,66 +1764,46 @@ function mapDiffStatusToChangeType(status: string): GitChangedFileType | null {
 export async function gitListBranches({
   path,
 }: GitBaseParams): Promise<string[]> {
-  const settings = readSettings();
+  const result = await execGit(["branch", "--list"], path);
 
-  if (settings.enableNativeGit) {
-    const result = await execGit(["branch", "--list"], path);
-
-    if (result.exitCode !== 0) {
-      throw new DyadError(result.stderr.toString(), DyadErrorKind.Conflict);
-    }
-    // Parse output:
-    // e.g. "* main\n  feature/login"
-    return result.stdout
-      .toString()
-      .split("\n")
-      .map((line) => line.replace("*", "").trim())
-      .filter((line) => line.length > 0);
-  } else {
-    return await git.listBranches({
-      fs,
-      dir: path,
-    });
+  if (result.exitCode !== 0) {
+    throw new DyadError(result.stderr.toString(), DyadErrorKind.Conflict);
   }
+  // Parse output:
+  // e.g. "* main\n  feature/login"
+  return result.stdout
+    .toString()
+    .split("\n")
+    .map((line) => line.replace("*", "").trim())
+    .filter((line) => line.length > 0);
 }
 
 export async function gitListRemoteBranches({
   path,
   remote = "origin",
 }: GitBaseParams & { remote?: string }): Promise<string[]> {
-  const settings = readSettings();
+  const result = await execGit(["branch", "-r", "--list"], path);
 
-  if (settings.enableNativeGit) {
-    const result = await execGit(["branch", "-r", "--list"], path);
-
-    if (result.exitCode !== 0) {
-      throw new DyadError(result.stderr.toString(), DyadErrorKind.Conflict);
-    }
-    // Parse output:
-    // e.g. "  origin/main\n  origin/feature/login\n  upstream/develop"
-    // Only return branches from the specified remote
-    return result.stdout
-      .toString()
-      .split("\n")
-      .map((line) => {
-        const trimmed = line.trim();
-        if (trimmed.startsWith(`${remote}/`)) {
-          return trimmed.substring(`${remote}/`.length);
-        }
-        return null;
-      })
-      .filter(
-        (line): line is string =>
-          line !== null && line.length > 0 && !line.includes("HEAD"),
-      );
-  } else {
-    const allBranches = await git.listBranches({
-      fs,
-      dir: path,
-      remote: remote,
-    });
-    return allBranches;
+  if (result.exitCode !== 0) {
+    throw new DyadError(result.stderr.toString(), DyadErrorKind.Conflict);
   }
+  // Parse output:
+  // e.g. "  origin/main\n  origin/feature/login\n  upstream/develop"
+  // Only return branches from the specified remote
+  return result.stdout
+    .toString()
+    .split("\n")
+    .map((line) => {
+      const trimmed = line.trim();
+      if (trimmed.startsWith(`${remote}/`)) {
+        return trimmed.substring(`${remote}/`.length);
+      }
+      return null;
+    })
+    .filter(
+      (line): line is string =>
+        line !== null && line.length > 0 && !line.includes("HEAD"),
+    );
 }
 
 export async function gitRenameBranch({
@@ -1247,258 +1811,191 @@ export async function gitRenameBranch({
   oldBranch,
   newBranch,
 }: GitBranchRenameParams): Promise<void> {
-  const settings = readSettings();
-
-  if (settings.enableNativeGit) {
-    // git branch -m oldBranch newBranch
-    const result = await execGit(["branch", "-m", oldBranch, newBranch], path);
-    if (result.exitCode !== 0) {
-      throw new DyadError(result.stderr.toString(), DyadErrorKind.Conflict);
-    }
-  } else {
-    // isomorphic-git does not have a renameBranch function.
-    // We implement it by resolving the ref, writing a new ref, and deleting the old one.
-
-    // 1. Check if we are currently on the branch being renamed
-    const current = await git.currentBranch({ fs, dir: path });
-
-    // 2. Resolve the commit hash of the old branch
-    const oid = await git.resolveRef({
-      fs,
-      dir: path,
-      ref: oldBranch,
-    });
-
-    // 3. Create the new branch pointing to the same commit
-    await git.writeRef({
-      fs,
-      dir: path,
-      ref: `refs/heads/${newBranch}`,
-      value: oid,
-      force: false,
-    });
-
-    // 4. If we were on the old branch, switch HEAD to the new branch
-    if (current === oldBranch) {
-      await git.checkout({
-        fs,
-        dir: path,
-        ref: newBranch,
-      });
-    }
-
-    // 5. Delete the old branch
-    await git.deleteBranch({
-      fs,
-      dir: path,
-      ref: oldBranch,
-    });
+  // git branch -m oldBranch newBranch
+  const result = await execGit(["branch", "-m", oldBranch, newBranch], path);
+  if (result.exitCode !== 0) {
+    throw new DyadError(result.stderr.toString(), DyadErrorKind.Conflict);
   }
 }
 
 export async function gitClone({
   path,
   url,
-  accessToken,
+  auth,
   singleBranch = true,
   depth,
 }: GitCloneParams): Promise<void> {
-  const settings = readSettings();
-  if (settings.enableNativeGit) {
-    // Dugite version (real Git)
-    // Strip any embedded auth from URL; credentials are injected per-invocation
-    // via environment variables so they never reach .git/config.
-    const cleanUrl = url.replace(/https:\/\/[^@]+@/, "https://");
-    const args = ["clone"];
-    if (depth && depth > 0) {
-      args.push("--depth", String(depth));
-    }
-    if (singleBranch) {
-      args.push("--single-branch");
-    }
-    args.push("--", cleanUrl, path);
-    const result = await execGit(args, ".", {
-      env: getGitNetworkEnv(accessToken),
-    });
+  // Dugite version (real Git)
+  // Strip any embedded auth from URL; credentials are injected per-invocation
+  // via environment variables so they never reach .git/config.
+  const cleanUrl = url.replace(/https:\/\/[^@]+@/, "https://");
+  const args = ["clone"];
+  if (depth && depth > 0) {
+    args.push("--depth", String(depth));
+  }
+  if (singleBranch) {
+    args.push("--single-branch");
+  }
+  args.push("--", cleanUrl, path);
+  const result = await execGit(args, ".", {
+    env: getGitNetworkEnv(auth),
+  });
 
-    if (result.exitCode !== 0) {
-      throw new DyadError(result.stderr.toString(), DyadErrorKind.Conflict);
-    }
-  } else {
-    // isomorphic-git version
-    // Strip any embedded auth from URL since isomorphic-git uses onAuth
-    const cleanUrl = url.replace(/https:\/\/[^@]+@/, "https://");
-    await git.clone({
-      fs,
-      http,
-      dir: path,
-      url: cleanUrl,
-      onAuth: accessToken
-        ? () => ({
-            username: accessToken,
-            password: "x-oauth-basic",
-          })
-        : undefined,
-      singleBranch,
-      depth: depth ?? undefined,
-    });
+  if (result.exitCode !== 0) {
+    throw new DyadError(result.stderr.toString(), DyadErrorKind.Conflict);
   }
 }
 
+/** The refspec `git remote add origin` writes. */
+const STANDARD_ORIGIN_FETCH_REFSPEC = "+refs/heads/*:refs/remotes/origin/*";
+
+/**
+ * Sets `origin` to `remoteUrl`, then makes sure it has a fetch refspec.
+ * Returns what that refspec looked like, for the sync log.
+ */
 export async function gitSetRemoteUrl({
   path,
   remoteUrl,
-}: GitSetRemoteUrlParams): Promise<void> {
-  const settings = readSettings();
+}: GitSetRemoteUrlParams): Promise<FetchRefspecState> {
+  await setOriginUrl({ path, remoteUrl });
+  return ensureOriginFetchRefspec(path);
+}
 
+async function setOriginUrl({
+  path,
+  remoteUrl,
+}: GitSetRemoteUrlParams): Promise<void> {
   // Validate remoteUrl to prevent argument injection attacks
   // URLs starting with "-" could be interpreted as command-line options
   if (remoteUrl.startsWith("-")) {
     throw new DyadError("Invalid remote URL", DyadErrorKind.Validation);
   }
 
-  if (settings.enableNativeGit) {
-    // Dugite version
-    try {
-      // Try to add the remote
-      const result = await execGit(
-        ["remote", "add", "origin", remoteUrl],
+  // Dugite version
+  try {
+    // Try to add the remote
+    const result = await execGit(["remote", "add", "origin", remoteUrl], path);
+
+    // If remote already exists, update it instead
+    if (result.exitCode !== 0 && result.stderr.includes("already exists")) {
+      const updateResult = await execGit(
+        ["remote", "set-url", "origin", remoteUrl],
         path,
       );
 
-      // If remote already exists, update it instead
-      if (result.exitCode !== 0 && result.stderr.includes("already exists")) {
-        const updateResult = await execGit(
-          ["remote", "set-url", "origin", remoteUrl],
-          path,
-        );
-
-        if (updateResult.exitCode !== 0) {
-          throw new DyadError(
-            `Failed to update remote: ${updateResult.stderr}`,
-            DyadErrorKind.Conflict,
-          );
-        }
-      } else if (result.exitCode !== 0) {
-        // Handle other errors
+      if (updateResult.exitCode !== 0) {
         throw new DyadError(
-          `Failed to add remote: ${result.stderr}`,
+          `Failed to update remote: ${updateResult.stderr}`,
           DyadErrorKind.Conflict,
         );
       }
-    } catch (error: any) {
-      logger.error("Error setting up remote:", error);
-      throw error; // or handle as needed
+    } else if (result.exitCode !== 0) {
+      // Handle other errors
+      throw new DyadError(
+        `Failed to add remote: ${result.stderr}`,
+        DyadErrorKind.Conflict,
+      );
     }
-  } else {
-    //isomorphic-git version
-    // Set the remote URL
-    await git.setConfig({
-      fs,
-      dir: path,
-      path: "remote.origin.url",
-      value: remoteUrl,
-    });
-    // Set the fetch refspec (required for isomorphic-git to work with remotes)
-    await git.setConfig({
-      fs,
-      dir: path,
-      path: "remote.origin.fetch",
-      value: "+refs/heads/*:refs/remotes/origin/*",
-    });
+  } catch (error: any) {
+    logger.error("Error setting up remote:", error);
+    throw error; // or handle as needed
+  }
+}
+
+/**
+ * Adds the standard fetch refspec to `origin` when it has none.
+ *
+ * Versions before 0.33 linked repositories by writing only
+ * `remote.origin.url`, and `git remote set-url` never adds a refspec. Without
+ * one, pulls and pushes still work but never update `refs/remotes/origin/*`,
+ * so the push summary compares against a tracking ref that stays frozen and
+ * reports a successful push as not having reached the remote.
+ *
+ * A refspec the user set up is left alone. Never throws: a sync must not fail
+ * over this.
+ */
+async function ensureOriginFetchRefspec(
+  path: string,
+): Promise<FetchRefspecState> {
+  try {
+    // Read only this repository's config, so a global value cannot block the
+    // repair.
+    const read = await execGit(
+      ["config", "--local", "--get-all", "remote.origin.fetch"],
+      path,
+    );
+    // Exit code 1 means the key is not set; anything else is a real failure.
+    if (read.exitCode === 0) {
+      const refspecs = read.stdout.split("\n").map((line) => line.trim());
+      return refspecs.includes(STANDARD_ORIGIN_FETCH_REFSPEC)
+        ? "standard"
+        : "custom";
+    }
+    if (read.exitCode !== 1) {
+      logger.warn("Could not read origin's fetch refspec", read.stderr.trim());
+      return "unknown";
+    }
+    const add = await execGit(
+      ["config", "--add", "remote.origin.fetch", STANDARD_ORIGIN_FETCH_REFSPEC],
+      path,
+    );
+    if (add.exitCode !== 0) {
+      logger.warn("Could not add origin's fetch refspec", add.stderr.trim());
+      return "unknown";
+    }
+    logger.info("Added the missing fetch refspec to origin");
+    return "added";
+  } catch (error) {
+    logger.warn("Could not check origin's fetch refspec", error);
+    return "unknown";
   }
 }
 
 export async function gitPush({
   path,
   branch,
-  accessToken,
+  auth,
   force,
   forceWithLease,
 }: GitPushParams): Promise<void> {
-  const settings = readSettings();
   const targetBranch = branch || "main";
 
-  if (settings.enableNativeGit) {
-    try {
-      const args = ["push", "origin", `${targetBranch}:${targetBranch}`];
-      if (forceWithLease) {
-        args.push("--force-with-lease");
-      } else if (force) {
-        args.push("--force");
-      }
-      const result = await execGit(args, path, {
-        env: getGitNetworkEnv(accessToken),
-      });
-      if (result.exitCode !== 0) {
-        const errorMsg = result.stderr.toString() || result.stdout.toString();
-        throw new DyadError(
-          `Git push failed: ${errorMsg}`,
-          DyadErrorKind.Conflict,
-        );
-      }
-      return;
-    } catch (error: any) {
-      logger.error("Error during git push:", error);
-      throw new DyadError(
-        `Git push failed: ${error.message}`,
-        DyadErrorKind.Conflict,
+  try {
+    const args = ["push", "origin", `${targetBranch}:${targetBranch}`];
+    if (forceWithLease) {
+      args.push("--force-with-lease");
+    } else if (force) {
+      args.push("--force");
+    }
+    const result = await execGit(args, path, {
+      env: getGitNetworkEnv(auth),
+    });
+    if (result.exitCode !== 0) {
+      const errorMsg = result.stderr.toString() || result.stdout.toString();
+      throw classifyGitOperationError(
+        new DyadError(`Git push failed: ${errorMsg}`, DyadErrorKind.Conflict),
+        [GIT_ERROR_CODES.NON_FAST_FORWARD, GIT_ERROR_CODES.DIVERGENT_BRANCHES],
       );
     }
-  }
-
-  // isomorphic-git cannot provide "force-with-lease" safety guarantees.
-  if (forceWithLease) {
-    logger.warn(
-      "gitPush: 'forceWithLease' requested but not supported when native git is disabled. " +
-        "Rejecting push to prevent unsafe force operation.",
-    );
+    return;
+  } catch (error: any) {
+    logger.error("Error during git push:", error);
+    if (isDyadError(error)) throw error;
+    if (typeof error?.code === "string") throw error;
     throw new DyadError(
-      "gitPush: 'forceWithLease' is not supported when native git is disabled. " +
-        "Falling back to plain force could overwrite remote commits. Enable native git.",
-      DyadErrorKind.Precondition,
+      `Git push failed: ${error.message}`,
+      DyadErrorKind.Conflict,
     );
   }
-  await git.push({
-    fs,
-    http,
-    dir: path,
-    remote: "origin",
-    ref: targetBranch,
-    remoteRef: targetBranch,
-    onAuth: accessToken
-      ? () => ({
-          username: accessToken,
-          password: "x-oauth-basic",
-        })
-      : undefined,
-    force: !!force,
-  });
 }
 
 export async function gitRebaseAbort({ path }: GitBaseParams): Promise<void> {
-  const settings = readSettings();
-  if (!settings.enableNativeGit) {
-    throw new DyadError(
-      "Rebase controls require native Git. Enable native Git in settings.",
-      DyadErrorKind.Precondition,
-    );
-  }
-
   await execOrThrow(["rebase", "--abort"], path, "Failed to abort rebase");
 }
 
 export async function gitRebaseContinue({
   path,
 }: GitBaseParams): Promise<void> {
-  const settings = readSettings();
-  if (!settings.enableNativeGit) {
-    throw new DyadError(
-      "Rebase controls require native Git. Enable native Git in settings.",
-      DyadErrorKind.Precondition,
-    );
-  }
-
   // Use withGitAuthor since rebase --continue needs to create commits
   // and requires user.name and user.email
   const args = await withGitAuthor(["rebase", "--continue"]);
@@ -1516,14 +2013,6 @@ export async function gitRebase({
   path: string;
   branch: string;
 }): Promise<void> {
-  const settings = readSettings();
-  if (!settings.enableNativeGit) {
-    throw new DyadError(
-      "Rebase requires native Git. Enable native Git in settings.",
-      DyadErrorKind.Precondition,
-    );
-  }
-
   // Use withGitAuthor since rebase replays commits and needs user.name and user.email
   // to set the committer identity on the rebased commits
   const args = await withGitAuthor(["rebase", `origin/${branch}`]);
@@ -1535,98 +2024,48 @@ export async function gitRebase({
 }
 
 export async function gitMergeAbort({ path }: GitBaseParams): Promise<void> {
-  const settings = readSettings();
-  if (!settings.enableNativeGit) {
-    throw new DyadError(
-      "Merge abort requires native Git. Enable native Git in settings.",
-      DyadErrorKind.Precondition,
-    );
-  }
-
   await execOrThrow(["merge", "--abort"], path, "Failed to abort merge");
 }
 
 export async function gitCurrentBranch({
   path,
 }: GitBaseParams): Promise<string | null> {
-  const settings = readSettings();
-  if (settings.enableNativeGit) {
-    // Dugite version
-    const result = await execGit(["branch", "--show-current"], path);
-    if (result.exitCode !== 0) {
-      throw new DyadError(
-        `Failed to get current branch: ${result.stderr.trim() || result.stdout.trim()}`,
-        DyadErrorKind.Conflict,
-      );
-    }
-    const branch = result.stdout.trim() || null;
-    return branch;
-  } else {
-    // isomorphic-git version returns string | undefined
-    const branch = await git.currentBranch({
-      fs,
-      dir: path,
-      fullname: false,
-    });
-    return branch ?? null;
+  // Dugite version
+  const result = await execGit(["branch", "--show-current"], path);
+  if (result.exitCode !== 0) {
+    throw new DyadError(
+      `Failed to get current branch: ${result.stderr.trim() || result.stdout.trim()}`,
+      DyadErrorKind.Conflict,
+    );
   }
+  const branch = result.stdout.trim() || null;
+  return branch;
 }
 
 export async function gitLog({
   path,
   depth = 100_000,
+  ref = "HEAD",
 }: GitLogParams): Promise<GitCommit[]> {
-  const settings = readSettings();
-
-  if (settings.enableNativeGit) {
-    return await gitLogNative(path, depth);
-  } else {
-    // isomorphic-git fallback: this already returns the same structure
-    return await git.log({
-      fs,
-      dir: path,
-      depth,
-    });
-  }
+  return await gitLogNative(path, depth, ref);
 }
 
 export async function gitIsIgnored({
   path,
   filepath,
 }: GitFileParams): Promise<boolean> {
-  const settings = readSettings();
+  // Dugite version
+  // git check-ignore file
+  const result = await execGit(["check-ignore", "--", filepath], path);
 
-  if (settings.enableNativeGit) {
-    // Dugite version
-    // git check-ignore file
-    const result = await execGit(["check-ignore", "--", filepath], path);
+  // If exitCode == 0 → file is ignored
+  if (result.exitCode === 0) return true;
 
-    // If exitCode == 0 → file is ignored
-    if (result.exitCode === 0) return true;
+  // If exitCode == 1 → not ignored
+  if (result.exitCode === 1) return false;
 
-    // If exitCode == 1 → not ignored
-    if (result.exitCode === 1) return false;
-
-    // Other exit codes are actual errors
-    throw new DyadError(result.stderr.toString(), DyadErrorKind.Conflict);
-  } else {
-    // isomorphic-git version
-    return await gitIsIgnoredIso({ path, filepath });
-  }
-}
-
-/**
- * Check whether a specific file/directory is gitignored using isomorphic-git
- */
-export async function gitIsIgnoredIso({
-  path,
-  filepath,
-}: GitFileParams): Promise<boolean> {
-  return await git.isIgnored({
-    fs,
-    dir: path,
-    filepath,
-  });
+  // Other exit codes are actual errors
+  throw new DyadError(result.stderr.toString(), DyadErrorKind.Conflict);
 }
 
 /**
@@ -1666,6 +2105,7 @@ export async function gitListFilesNative({
 export async function gitLogNative(
   path: string,
   depth = 100_000,
+  ref = "HEAD",
 ): Promise<GitCommit[]> {
   // Use git log with custom format to get all data in a single process
   // Format: %H = commit hash, %at = author timestamp (unix), %B = raw body (message)
@@ -1675,7 +2115,8 @@ export async function gitLogNative(
     "--max-count",
     String(depth),
     "--format=%H%x00%at%x00%B%x00---END-COMMIT---",
-    "HEAD",
+    ref,
+    "--",
   ];
 
   const logResult = await execGit(logArgs, path);
@@ -1717,38 +2158,931 @@ export async function gitLogNative(
   return entries;
 }
 
+const AGENT_GIT_RESULT_LIMIT_BYTES = 64 * 1024;
+const AGENT_GIT_EXEC_BUFFER_BYTES = AGENT_GIT_RESULT_LIMIT_BYTES * 2;
+const AGENT_GIT_SOURCE_FILE_LIMIT_BYTES = 20 * 1024 * 1024;
+const AGENT_GIT_MAX_DIFF_PATHS = 500;
+const AGENT_GIT_MAX_STATUS_PATHS = 500;
+const AGENT_GIT_STATUS_PATH_BUDGET_BYTES = AGENT_GIT_RESULT_LIMIT_BYTES - 4096;
+// Keeps diff pathspec argv well under the ~32 KiB Windows command-line limit.
+const AGENT_GIT_DIFF_PATH_ARGV_BUDGET_BYTES = 24 * 1024;
+const AGENT_GIT_TRUNCATION_NOTICE =
+  "\n\n[Output truncated at 64 KiB. Narrow the request with a path, line range, or smaller commit count.]";
+
+interface AgentGitExecutionResult extends IGitStringResult {
+  truncated: boolean;
+}
+
+function agentGitEnvironment(): Record<string, string> {
+  return {
+    GIT_NO_REPLACE_OBJECTS: "1",
+    GIT_PAGER: "cat",
+    GIT_TERMINAL_PROMPT: "0",
+  };
+}
+
+export async function execAgentGit(
+  args: string[],
+  repoPath: string,
+  options: {
+    maxBuffer?: number;
+    readOnly?: boolean;
+    encoding?: BufferEncoding;
+    stdin?: string | Buffer;
+    allowTruncation?: boolean;
+  } = {},
+): Promise<AgentGitExecutionResult> {
+  const globalArgs = [
+    "--no-pager",
+    "--no-replace-objects",
+    "--literal-pathspecs",
+    ...(options.readOnly === false ? [] : ["--no-optional-locks"]),
+    "-c",
+    "core.fsmonitor=false",
+    ...args,
+  ];
+  try {
+    const result = await execGit(globalArgs, repoPath, {
+      encoding: options.encoding,
+      env: agentGitEnvironment(),
+      maxBuffer: options.maxBuffer ?? AGENT_GIT_EXEC_BUFFER_BYTES,
+      stdin: options.stdin,
+    });
+    return { ...result, truncated: false };
+  } catch (error) {
+    if (
+      error instanceof ExecError &&
+      error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" &&
+      error.message.includes("stdout maxBuffer") &&
+      options.allowTruncation === true
+    ) {
+      return {
+        stdout: String(error.stdout),
+        stderr: String(error.stderr),
+        exitCode: 0,
+        truncated: true,
+      };
+    }
+    throw error;
+  }
+}
+
+function agentGitErrorDetails(result: IGitStringResult): string {
+  return result.stderr.trim() || result.stdout.trim() || "Unknown Git error";
+}
+
+function assertAgentGitSuccess(
+  result: IGitStringResult,
+  message: string,
+  kind: DyadErrorKind = DyadErrorKind.Conflict,
+): void {
+  if (result.exitCode !== 0) {
+    throw new DyadError(`${message}: ${agentGitErrorDetails(result)}`, kind);
+  }
+}
+
+function boundAgentGitContent(
+  content: string,
+  alreadyTruncated = false,
+): AgentGitTextResult {
+  const hadTruncationNotice = content.endsWith(AGENT_GIT_TRUNCATION_NOTICE);
+  const unannotatedContent = hadTruncationNotice
+    ? content.slice(0, -AGENT_GIT_TRUNCATION_NOTICE.length)
+    : content;
+  const contentLimitBytes =
+    AGENT_GIT_RESULT_LIMIT_BYTES -
+    Buffer.byteLength(AGENT_GIT_TRUNCATION_NOTICE, "utf8");
+  const bytes = Buffer.from(unannotatedContent, "utf8");
+  let end = Math.min(bytes.length, contentLimitBytes);
+  while (end > 0 && end < bytes.length && (bytes[end] & 0xc0) === 0x80) {
+    end -= 1;
+  }
+  const boundedContent = bytes.subarray(0, end).toString("utf8");
+  const boundedTruncated = bytes.length > contentLimitBytes;
+  const truncated = alreadyTruncated || hadTruncationNotice || boundedTruncated;
+  return {
+    content: boundedContent + (truncated ? AGENT_GIT_TRUNCATION_NOTICE : ""),
+    truncated,
+  };
+}
+
+function assertAgentGitRevisionInput(revision: string): void {
+  if (
+    revision.length === 0 ||
+    revision.length > 256 ||
+    revision.startsWith("-") ||
+    revision.includes("..") ||
+    /[\0\r\n]/.test(revision)
+  ) {
+    throw new DyadError(
+      `Invalid Git revision: ${JSON.stringify(revision)}`,
+      DyadErrorKind.Validation,
+    );
+  }
+}
+
+export function normalizeAgentGitPath(
+  repoPath: string,
+  filePath: string,
+): string {
+  if (
+    filePath.length === 0 ||
+    filePath.length > 4096 ||
+    /[\0\r\n]/.test(filePath) ||
+    /(^|[\\/])\.\.([\\/]|$)/.test(filePath)
+  ) {
+    throw new DyadError(
+      `Invalid Git path: ${JSON.stringify(filePath)}`,
+      DyadErrorKind.Validation,
+    );
+  }
+  const fullPath = safeJoin(repoPath, filePath);
+  const relativePath = normalizePath(
+    pathModule.relative(
+      pathModule.resolve(repoPath),
+      pathModule.resolve(fullPath),
+    ),
+  ).replace(/^\.\//, "");
+  if (!relativePath || relativePath === ".") {
+    throw new DyadError(
+      "A file or directory path inside the app is required",
+      DyadErrorKind.Validation,
+    );
+  }
+  return relativePath;
+}
+
+function normalizeAgentGitFilterPath(
+  repoPath: string,
+  filePath: string | undefined,
+): string | undefined {
+  return filePath === "."
+    ? undefined
+    : filePath
+      ? normalizeAgentGitPath(repoPath, filePath)
+      : undefined;
+}
+
+export async function resolveAgentGitCommit({
+  path,
+  revision,
+}: GitBaseParams & { revision: string }): Promise<string> {
+  assertAgentGitRevisionInput(revision);
+  const result = await execAgentGit(
+    ["rev-parse", "--verify", "--end-of-options", `${revision}^{commit}`],
+    path,
+  );
+  if (result.exitCode !== 0) {
+    throw new DyadError(
+      `Git revision not found: ${revision}`,
+      DyadErrorKind.NotFound,
+    );
+  }
+  const oid = result.stdout.trim();
+  if (!/^[0-9a-f]{40,64}$/i.test(oid)) {
+    throw new DyadError(
+      `Git returned an invalid commit ID for revision: ${revision}`,
+      DyadErrorKind.External,
+    );
+  }
+  return oid;
+}
+
+function addStatusPath(target: Set<string>, filePath: string): void {
+  const normalized = normalizePath(filePath);
+  if (isUserVisibleGitPath(normalized)) {
+    target.add(normalized);
+  }
+}
+
+export async function getAgentGitStatus({
+  path,
+}: GitBaseParams): Promise<AgentGitStatus> {
+  const result = await execAgentGit(
+    ["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all"],
+    path,
+    { allowTruncation: true },
+  );
+  assertAgentGitSuccess(result, "Failed to inspect Git status");
+
+  let branch: string | null = null;
+  let head: string | null = null;
+  let detached = false;
+  const staged = new Set<string>();
+  const unstaged = new Set<string>();
+  const untracked = new Set<string>();
+  const conflicted = new Set<string>();
+  const rawRecords = result.stdout.split("\0");
+  if (result.truncated && !result.stdout.endsWith("\0")) {
+    rawRecords.pop();
+  }
+  const records = rawRecords.filter(Boolean);
+
+  for (let index = 0; index < records.length; index++) {
+    const record = records[index];
+    if (record.startsWith("# branch.oid ")) {
+      const value = record.slice("# branch.oid ".length);
+      head = value === "(initial)" ? null : value;
+      continue;
+    }
+    if (record.startsWith("# branch.head ")) {
+      const value = record.slice("# branch.head ".length);
+      detached = value === "(detached)";
+      branch = detached ? null : value;
+      continue;
+    }
+    if (record.startsWith("? ")) {
+      addStatusPath(untracked, record.slice(2));
+      continue;
+    }
+    if (record.startsWith("u ")) {
+      addStatusPath(conflicted, record.split(" ").slice(10).join(" "));
+      continue;
+    }
+    if (!record.startsWith("1 ") && !record.startsWith("2 ")) {
+      continue;
+    }
+
+    const fields = record.split(" ");
+    const isRename = record.startsWith("2 ");
+    const statusCode = fields[1] ?? "..";
+    const filePath = fields.slice(isRename ? 9 : 8).join(" ");
+    if (isRename) {
+      index += 1; // The following NUL field is the original path.
+    }
+    if (statusCode[0] !== ".") addStatusPath(staged, filePath);
+    if (statusCode[1] !== ".") addStatusPath(unstaged, filePath);
+  }
+
+  // Share one response budget across categories so the complete structured
+  // result stays bounded. The call order below intentionally prioritizes
+  // conflicts, then staged and unstaged changes, ahead of untracked files.
+  let remainingPaths = AGENT_GIT_MAX_STATUS_PATHS;
+  let remainingBytes = AGENT_GIT_STATUS_PATH_BUDGET_BYTES;
+  let truncated = result.truncated;
+  const sortedAndBounded = (values: Set<string>) => {
+    const output: string[] = [];
+    const sorted = [...values].sort();
+    for (const value of sorted) {
+      const pathBytes = Buffer.byteLength(JSON.stringify(value), "utf8") + 2;
+      if (remainingPaths === 0 || pathBytes > remainingBytes) {
+        truncated = true;
+        continue;
+      }
+      output.push(value);
+      remainingPaths -= 1;
+      remainingBytes -= pathBytes;
+    }
+    return output;
+  };
+  return {
+    branch,
+    head,
+    detached,
+    conflicted: sortedAndBounded(conflicted),
+    staged: sortedAndBounded(staged),
+    unstaged: sortedAndBounded(unstaged),
+    untracked: sortedAndBounded(untracked),
+    truncated,
+  };
+}
+
+interface DiffEntry {
+  status: string;
+  paths: string[];
+}
+
+async function listAgentDiffEntries({
+  path,
+  comparisonArgs,
+  filePath,
+}: {
+  path: string;
+  comparisonArgs: string[];
+  filePath?: string;
+}): Promise<{ entries: DiffEntry[]; truncated: boolean }> {
+  const result = await execAgentGit(
+    [
+      "diff",
+      "--name-status",
+      "-z",
+      "--no-ext-diff",
+      "--no-textconv",
+      ...comparisonArgs,
+    ],
+    path,
+    { maxBuffer: 1024 * 1024, allowTruncation: true },
+  );
+  assertAgentGitSuccess(result, "Failed to list changed Git paths");
+  const rawFields = result.stdout.split("\0");
+  if (result.truncated && !result.stdout.endsWith("\0")) {
+    rawFields.pop();
+  }
+  const fields = rawFields.filter(Boolean);
+  const entries: DiffEntry[] = [];
+  let incomplete = false;
+  for (let index = 0; index < fields.length; ) {
+    const status = fields[index++];
+    const pathCount = status.startsWith("R") || status.startsWith("C") ? 2 : 1;
+    if (fields.length - index < pathCount) {
+      incomplete = true;
+      break;
+    }
+    const paths = fields.slice(index, index + pathCount);
+    index += pathCount;
+    const normalizedPaths = paths.map(normalizePath);
+    if (
+      !filePath ||
+      normalizedPaths.some(
+        (entryPath) =>
+          entryPath === filePath || entryPath.startsWith(`${filePath}/`),
+      )
+    ) {
+      entries.push({ status, paths: normalizedPaths });
+    }
+  }
+  return { entries, truncated: result.truncated || incomplete };
+}
+
+async function renderSafeAgentDiff({
+  path,
+  comparisonArgs,
+  filePath,
+  contextLines,
+}: {
+  path: string;
+  comparisonArgs: string[];
+  filePath?: string;
+  contextLines: number;
+}): Promise<AgentGitTextResult> {
+  const discovery = await listAgentDiffEntries({
+    path,
+    comparisonArgs,
+    filePath,
+  });
+  const sensitive: string[] = [];
+  const allowedPathGroups: string[][] = [];
+  for (const entry of discovery.entries) {
+    if (
+      entry.paths.some(isDotenvFilePath) ||
+      entry.paths.some((entryPath) => !isAgentGitPatchVisiblePath(entryPath))
+    ) {
+      sensitive.push(entry.paths.at(-1) ?? entry.paths[0]);
+      continue;
+    }
+    // Git needs both sides of a rename/copy pathspec to preserve its R/C
+    // classification when rendering the patch.
+    allowedPathGroups.push(entry.paths);
+  }
+
+  const uniquePaths = new Set(allowedPathGroups.flat());
+  const uniqueAllowed: string[] = [];
+  const includedPaths = new Set<string>();
+  let remainingArgvBytes = AGENT_GIT_DIFF_PATH_ARGV_BUDGET_BYTES;
+  for (const pathGroup of allowedPathGroups) {
+    const newPaths = [
+      ...new Set(
+        pathGroup.filter((entryPath) => !includedPaths.has(entryPath)),
+      ),
+    ];
+    const groupBytes = newPaths.reduce(
+      (total, entryPath) => total + Buffer.byteLength(entryPath, "utf8") + 1,
+      0,
+    );
+    if (
+      uniqueAllowed.length + newPaths.length > AGENT_GIT_MAX_DIFF_PATHS ||
+      groupBytes > remainingArgvBytes
+    ) {
+      continue;
+    }
+    uniqueAllowed.push(...newPaths);
+    for (const entryPath of newPaths) includedPaths.add(entryPath);
+    remainingArgvBytes -= groupBytes;
+  }
+  const omittedByCount =
+    discovery.truncated || uniquePaths.size > uniqueAllowed.length;
+  let patch = "";
+  let truncated = omittedByCount;
+  if (uniqueAllowed.length > 0) {
+    const result = await execAgentGit(
+      [
+        "diff",
+        `--unified=${contextLines}`,
+        "--no-ext-diff",
+        "--no-textconv",
+        ...comparisonArgs,
+        "--",
+        ...uniqueAllowed,
+      ],
+      path,
+      { allowTruncation: true },
+    );
+    assertAgentGitSuccess(result, "Failed to render Git diff");
+    patch = result.stdout;
+    truncated ||= result.truncated;
+  }
+
+  const notices: string[] = [];
+  if (sensitive.length > 0) {
+    notices.push(
+      `[Diff omitted for sensitive or Dyad-managed paths: ${[...new Set(sensitive)].join(", ")}]`,
+    );
+  }
+  if (omittedByCount) {
+    notices.push(
+      `[Changed-path discovery was truncated or limited to ${AGENT_GIT_MAX_DIFF_PATHS} paths. Narrow the request with path.]`,
+    );
+  }
+  return boundAgentGitContent(
+    [notices.join("\n"), patch].filter(Boolean).join("\n\n"),
+    truncated,
+  );
+}
+
+async function hasAgentGitHead(path: string): Promise<boolean> {
+  const result = await execAgentGit(
+    ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+    path,
+  );
+  return result.exitCode === 0;
+}
+
+export async function getAgentGitDiff({
+  path,
+  scope = "all",
+  filePath,
+  contextLines = 3,
+}: GitBaseParams & {
+  scope?: AgentGitDiffScope;
+  filePath?: string;
+  contextLines?: number;
+}): Promise<AgentGitTextResult> {
+  const normalizedPath = normalizeAgentGitFilterPath(path, filePath);
+  const hasHead = await hasAgentGitHead(path);
+  if (scope === "unstaged") {
+    return renderSafeAgentDiff({
+      path,
+      comparisonArgs: [],
+      filePath: normalizedPath,
+      contextLines,
+    });
+  }
+  if (scope === "staged") {
+    return renderSafeAgentDiff({
+      path,
+      comparisonArgs: ["--cached"],
+      filePath: normalizedPath,
+      contextLines,
+    });
+  }
+  if (hasHead) {
+    return renderSafeAgentDiff({
+      path,
+      comparisonArgs: ["HEAD"],
+      filePath: normalizedPath,
+      contextLines,
+    });
+  }
+
+  const [stagedResult, unstagedResult] = await Promise.all([
+    renderSafeAgentDiff({
+      path,
+      comparisonArgs: ["--cached"],
+      filePath: normalizedPath,
+      contextLines,
+    }),
+    renderSafeAgentDiff({
+      path,
+      comparisonArgs: [],
+      filePath: normalizedPath,
+      contextLines,
+    }),
+  ]);
+  return boundAgentGitContent(
+    [
+      stagedResult.content ? `## Staged\n\n${stagedResult.content}` : "",
+      unstagedResult.content ? `## Unstaged\n\n${unstagedResult.content}` : "",
+    ]
+      .filter(Boolean)
+      .join("\n\n"),
+    stagedResult.truncated || unstagedResult.truncated,
+  );
+}
+
+export async function getAgentGitLog({
+  path,
+  revision = "HEAD",
+  maxCount = 20,
+  filePath,
+}: GitBaseParams & {
+  revision?: string;
+  maxCount?: number;
+  filePath?: string;
+}): Promise<AgentGitTextResult> {
+  const oid = await resolveAgentGitCommit({ path, revision });
+  const normalizedPath = normalizeAgentGitFilterPath(path, filePath);
+  const result = await execAgentGit(
+    [
+      "log",
+      `--max-count=${maxCount}`,
+      "--no-show-signature",
+      // NUL-terminated records: git forbids NUL in commit messages, while
+      // %x1e could legally appear inside %B and split a commit in two.
+      "--format=%H%x1f%an%x1f%ae%x1f%aI%x1f%B%x00",
+      "--end-of-options",
+      oid,
+      ...(normalizedPath ? ["--", normalizedPath] : []),
+    ],
+    path,
+    { allowTruncation: true },
+  );
+  assertAgentGitSuccess(result, "Failed to read Git log");
+  const rawRecords = result.stdout.split("\0");
+  if (result.truncated && !result.stdout.endsWith("\0")) {
+    rawRecords.pop();
+  }
+  const commits = rawRecords
+    .map((chunk) => chunk.trim())
+    .filter(Boolean)
+    .map((chunk) => {
+      const [hash, authorName, authorEmail, authoredAt, ...messageParts] =
+        chunk.split("\x1f");
+      return [
+        `commit ${hash}`,
+        `Author: ${authorName} <${authorEmail}>`,
+        `Date: ${authoredAt}`,
+        "",
+        messageParts.join("\x1f").trim(),
+      ].join("\n");
+    });
+  return boundAgentGitContent(commits.join("\n\n"), result.truncated);
+}
+
+async function getAgentGitParent({
+  path,
+  oid,
+}: {
+  path: string;
+  oid: string;
+}): Promise<string | null> {
+  const result = await execAgentGit(
+    ["rev-list", "--parents", "-n", "1", "--end-of-options", oid],
+    path,
+  );
+  assertAgentGitSuccess(result, "Failed to inspect commit parents");
+  return result.stdout.trim().split(/\s+/)[1] ?? null;
+}
+
+async function getAgentGitEmptyTree(path: string): Promise<string> {
+  const result = await execAgentGit(
+    ["hash-object", "-t", "tree", "--stdin"],
+    path,
+    { stdin: "" },
+  );
+  assertAgentGitSuccess(result, "Failed to calculate the empty Git tree");
+  return result.stdout.trim();
+}
+
+export async function getAgentGitCommit({
+  path,
+  revision,
+  filePath,
+}: GitBaseParams & {
+  revision: string;
+  filePath?: string;
+}): Promise<AgentGitTextResult & { patch: string }> {
+  const oid = await resolveAgentGitCommit({ path, revision });
+  const normalizedPath = normalizeAgentGitFilterPath(path, filePath);
+  const metadataResult = await execAgentGit(
+    [
+      "show",
+      "-s",
+      "--no-show-signature",
+      "--format=commit %H%nAuthor: %an <%ae>%nDate: %aI%n%n%B",
+      "--end-of-options",
+      oid,
+    ],
+    path,
+    { allowTruncation: true },
+  );
+  assertAgentGitSuccess(metadataResult, "Failed to read Git commit metadata");
+  const parent = await getAgentGitParent({ path, oid });
+  const base = parent ?? (await getAgentGitEmptyTree(path));
+  const diff = await renderSafeAgentDiff({
+    path,
+    comparisonArgs: [base, oid],
+    filePath: normalizedPath,
+    contextLines: 3,
+  });
+  return {
+    ...boundAgentGitContent(
+      [metadataResult.stdout.trim(), diff.content].filter(Boolean).join("\n\n"),
+      metadataResult.truncated || diff.truncated,
+    ),
+    patch: diff.content,
+  };
+}
+
+interface AgentGitTreeEntry {
+  mode: string;
+  type: string;
+  oid: string;
+  path: string;
+}
+
+async function getAgentGitTreeEntry({
+  path,
+  oid,
+  filePath,
+}: {
+  path: string;
+  oid: string;
+  filePath: string;
+}): Promise<AgentGitTreeEntry> {
+  const result = await execAgentGit(
+    ["ls-tree", "-z", "--end-of-options", oid, "--", filePath],
+    path,
+  );
+  assertAgentGitSuccess(result, "Failed to inspect historical Git path");
+  const record = result.stdout.split("\0").find(Boolean);
+  if (!record) {
+    throw new DyadError(
+      `File does not exist at commit ${oid}: ${filePath}`,
+      DyadErrorKind.NotFound,
+    );
+  }
+  const match = /^(\d+) ([^ ]+) ([0-9a-f]+)\t([\s\S]+)$/.exec(record);
+  if (!match || normalizePath(match[4]) !== filePath) {
+    throw new DyadError(
+      `Historical Git path is not an exact file match: ${filePath}`,
+      DyadErrorKind.Validation,
+    );
+  }
+  return { mode: match[1], type: match[2], oid: match[3], path: match[4] };
+}
+
+function decodeAgentGitText(bytes: Buffer, displayPath: string): string {
+  if (bytes.includes(0)) {
+    throw new DyadError(
+      `Cannot display binary file from Git history: ${displayPath}`,
+      DyadErrorKind.Validation,
+    );
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new DyadError(
+      `Cannot display non-UTF-8 file from Git history: ${displayPath}`,
+      DyadErrorKind.Validation,
+    );
+  }
+}
+
+export async function getAgentGitFile({
+  path,
+  revision,
+  filePath,
+  startLine,
+  endLineInclusive,
+}: GitBaseParams & {
+  revision: string;
+  filePath: string;
+  startLine?: number;
+  endLineInclusive?: number;
+}): Promise<AgentGitTextResult> {
+  const oid = await resolveAgentGitCommit({ path, revision });
+  const normalizedPath = normalizeAgentGitPath(path, filePath);
+  const entry = await getAgentGitTreeEntry({
+    path,
+    oid,
+    filePath: normalizedPath,
+  });
+  if (entry.type !== "blob") {
+    throw new DyadError(
+      `Historical Git path is not a file: ${normalizedPath}`,
+      DyadErrorKind.Validation,
+    );
+  }
+  const sizeResult = await execAgentGit(["cat-file", "-s", entry.oid], path);
+  assertAgentGitSuccess(sizeResult, "Failed to inspect historical file size");
+  const size = Number(sizeResult.stdout.trim());
+  if (!Number.isSafeInteger(size) || size < 0) {
+    throw new DyadError(
+      `Git returned an invalid size for historical file: ${normalizedPath}`,
+      DyadErrorKind.External,
+    );
+  }
+  if (size > AGENT_GIT_SOURCE_FILE_LIMIT_BYTES) {
+    throw new DyadError(
+      `Historical file is too large to read safely: ${normalizedPath} (${size} bytes; ${AGENT_GIT_SOURCE_FILE_LIMIT_BYTES} byte limit)`,
+      DyadErrorKind.Validation,
+    );
+  }
+  const contentResult = await execAgentGit(
+    ["cat-file", "blob", entry.oid],
+    path,
+    {
+      encoding: "latin1",
+      maxBuffer: AGENT_GIT_SOURCE_FILE_LIMIT_BYTES + 1024,
+    },
+  );
+  assertAgentGitSuccess(contentResult, "Failed to read historical Git file");
+  let content = decodeAgentGitText(
+    Buffer.from(contentResult.stdout, "latin1"),
+    normalizedPath,
+  );
+  if (isDotenvFilePath(normalizedPath)) {
+    content = redactDotenvValues(content);
+  }
+  const selected = selectTextLineRange(content, startLine, endLineInclusive);
+  return boundAgentGitContent(selected, contentResult.truncated);
+}
+
+export async function restoreAgentGitFile({
+  path,
+  revision,
+  filePath,
+}: GitBaseParams & {
+  revision: string;
+  filePath: string;
+}): Promise<{ oid: string; mode: string; path: string }> {
+  const oid = await resolveAgentGitCommit({ path, revision });
+  const normalizedPath = normalizeAgentGitPath(path, filePath);
+  const entry = await getAgentGitTreeEntry({
+    path,
+    oid,
+    filePath: normalizedPath,
+  });
+  if (
+    entry.type !== "blob" ||
+    (entry.mode !== "100644" && entry.mode !== "100755")
+  ) {
+    throw new DyadError(
+      `Only regular files can be restored: ${normalizedPath}`,
+      DyadErrorKind.Validation,
+    );
+  }
+  const sizeResult = await execAgentGit(["cat-file", "-s", entry.oid], path);
+  assertAgentGitSuccess(sizeResult, "Failed to inspect historical file size");
+  const size = Number(sizeResult.stdout.trim());
+  if (!Number.isSafeInteger(size) || size < 0) {
+    throw new DyadError(
+      `Git returned an invalid size for historical file: ${normalizedPath}`,
+      DyadErrorKind.External,
+    );
+  }
+  if (size > AGENT_GIT_SOURCE_FILE_LIMIT_BYTES) {
+    throw new DyadError(
+      `Historical file is too large to restore safely: ${normalizedPath} (${size} bytes; ${AGENT_GIT_SOURCE_FILE_LIMIT_BYTES} byte limit)`,
+      DyadErrorKind.Validation,
+    );
+  }
+  const contentResult = await execAgentGit(
+    ["cat-file", "blob", entry.oid],
+    path,
+    {
+      encoding: "latin1",
+      maxBuffer: AGENT_GIT_SOURCE_FILE_LIMIT_BYTES + 1024,
+    },
+  );
+  assertAgentGitSuccess(contentResult, `Failed to read ${normalizedPath}`);
+  const destination = safeJoin(path, normalizedPath);
+  const parent = pathModule.dirname(destination);
+  await fsPromises.mkdir(parent, { recursive: true });
+  const temporaryDirectory = await fsPromises.mkdtemp(
+    pathModule.join(parent, ".dyad-git-restore-"),
+  );
+  const temporaryFile = pathModule.join(temporaryDirectory, "file");
+  try {
+    await fsPromises.writeFile(
+      temporaryFile,
+      Buffer.from(contentResult.stdout, "latin1"),
+      { mode: entry.mode === "100755" ? 0o755 : 0o644 },
+    );
+    await fsPromises.chmod(
+      temporaryFile,
+      entry.mode === "100755" ? 0o755 : 0o644,
+    );
+    const existing = await fsPromises.lstat(destination).catch((error) => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    });
+    if (existing?.isDirectory()) {
+      throw new DyadError(
+        `Cannot restore a file over a directory: ${normalizedPath}`,
+        DyadErrorKind.Validation,
+      );
+    }
+    await fsPromises.rm(destination, { force: true });
+    await fsPromises.rename(temporaryFile, destination);
+  } finally {
+    await fsPromises.rm(temporaryDirectory, { recursive: true, force: true });
+  }
+  return { oid, mode: entry.mode, path: normalizedPath };
+}
+
 export async function gitFetch({
   path,
   remote = "origin",
-  accessToken,
+  auth,
+  prune,
 }: GitFetchParams): Promise<void> {
-  const settings = readSettings();
-  if (settings.enableNativeGit) {
-    await execOrThrow(
-      ["fetch", remote],
-      path,
-      "Failed to fetch from remote",
-      undefined,
-      { env: getGitNetworkEnv(accessToken) },
-    );
-  } else {
-    await git.fetch({
-      fs,
-      http,
-      dir: path,
-      remote,
-      onAuth: accessToken
-        ? () => ({
-            username: accessToken,
-            password: "x-oauth-basic",
-          })
-        : undefined,
-    });
+  await execOrThrow(
+    ["fetch", ...(prune ? ["--prune"] : []), remote],
+    path,
+    "Failed to fetch from remote",
+    undefined,
+    { env: getGitNetworkEnv(auth) },
+  );
+}
+
+class CodedGitError extends DyadError {
+  readonly code: GitErrorCode;
+
+  constructor(
+    message: string,
+    code: GitErrorCode,
+    kind: DyadErrorKind,
+    name: string,
+  ) {
+    super(message, kind);
+    this.name = name;
+    this.code = code;
   }
+}
+
+function getGitErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function matchesUncommittedChanges(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes("local changes") ||
+    normalized.includes("would be overwritten") ||
+    normalized.includes("please commit or stash") ||
+    normalized.includes("working tree has uncommitted changes")
+  );
+}
+
+/** Convert native git output into the stable codes consumed across IPC. */
+export function classifyGitOperationError(
+  error: unknown,
+  expectedCodes: readonly GitErrorCode[],
+): Error {
+  if (
+    error instanceof Error &&
+    typeof (error as Error & { code?: unknown }).code === "string"
+  ) {
+    return error;
+  }
+
+  const message = getGitErrorMessage(error);
+  const normalized = message.toLowerCase();
+
+  if (
+    expectedCodes.includes(GIT_ERROR_CODES.UNCOMMITTED_CHANGES) &&
+    matchesUncommittedChanges(message)
+  ) {
+    return new CodedGitError(
+      message,
+      GIT_ERROR_CODES.UNCOMMITTED_CHANGES,
+      DyadErrorKind.Conflict,
+      "GitStateError",
+    );
+  }
+  if (
+    expectedCodes.includes(GIT_ERROR_CODES.NON_FAST_FORWARD) &&
+    (normalized.includes("non-fast-forward") ||
+      normalized.includes("fetch first") ||
+      normalized.includes("tip of your current branch is behind"))
+  ) {
+    return new CodedGitError(
+      message,
+      GIT_ERROR_CODES.NON_FAST_FORWARD,
+      DyadErrorKind.Conflict,
+      "GitStateError",
+    );
+  }
+  if (
+    expectedCodes.includes(GIT_ERROR_CODES.DIVERGENT_BRANCHES) &&
+    normalized.includes("divergent branches")
+  ) {
+    return new CodedGitError(
+      message,
+      GIT_ERROR_CODES.DIVERGENT_BRANCHES,
+      DyadErrorKind.Conflict,
+      "GitStateError",
+    );
+  }
+
+  return error instanceof Error ? error : new Error(message);
 }
 
 /** Merge/pull conflicts — `name` kept for UI checks (e.g. GitHubConnector). */
 class GitConflictErrorImpl extends DyadError {
+  readonly code = GIT_ERROR_CODES.MERGE_CONFLICT;
+
   constructor(message: string) {
     super(message, DyadErrorKind.Conflict);
     this.name = "GitConflictError";
@@ -1760,24 +3094,31 @@ export function GitConflictError(message: string): Error {
 }
 
 /** Blocked git operation due to repo state (merge/rebase in progress, etc.). */
-class GitStateErrorImpl extends DyadError {
-  readonly code: string;
-  constructor(message: string, code: string) {
-    super(message, DyadErrorKind.Precondition);
-    this.name = "GitStateError";
-    this.code = code;
-  }
+export function GitStateError(message: string, code: GitErrorCode): Error {
+  return new CodedGitError(
+    message,
+    code,
+    DyadErrorKind.Precondition,
+    "GitStateError",
+  );
 }
 
-export function GitStateError(message: string, code: string): Error {
-  return new GitStateErrorImpl(message, code);
+/** Native git's missing-ref variants, centralized for pull callers. */
+export function isMissingRemoteBranchError(error: unknown): boolean {
+  const candidate = error as { code?: unknown; message?: unknown };
+  const code = candidate?.code;
+  const message =
+    typeof candidate?.message === "string" ? candidate.message : "";
+  return (
+    code === "MissingRefError" ||
+    (code === "NotFoundError" &&
+      (message.includes("remote ref") || message.includes("remote branch"))) ||
+    message.includes("couldn't find remote ref") ||
+    // Legacy empty-remote failure retained until all supported Git versions
+    // return a stable missing-ref message.
+    message.includes("Cannot read properties of null")
+  );
 }
-
-// Error codes for git state errors
-export const GIT_ERROR_CODES = {
-  MERGE_IN_PROGRESS: "MERGE_IN_PROGRESS",
-  REBASE_IN_PROGRESS: "REBASE_IN_PROGRESS",
-} as const;
 
 function hasGitConflictState({ path }: GitBaseParams): boolean {
   return isGitMergeOrRebaseInProgress({ path });
@@ -1787,60 +3128,20 @@ export async function gitPull({
   path,
   remote = "origin",
   branch = "main",
-  accessToken,
-  author,
+  auth,
 }: GitPullParams): Promise<void> {
-  const settings = readSettings();
-  if (settings.enableNativeGit) {
-    // Use withGitAuthor since pull may need to create merge commits
-    // and requires user.name and user.email
-    const pullArgs = await withGitAuthor([
-      "pull",
-      "--rebase=false",
-      remote,
-      branch,
-    ]);
-    try {
-      await execOrThrow(
-        pullArgs,
-        path,
-        "Failed to pull from remote",
-        undefined,
-        { env: getGitNetworkEnv(accessToken) },
-      );
-    } catch (error: any) {
-      // Check git state files to detect conflicts instead of parsing error messages
-      if (hasGitConflictState({ path })) {
-        throw GitConflictError(
-          `Merge conflict detected during pull. Please resolve conflicts before proceeding.`,
-        );
-      }
-      throw error;
-    }
-    return;
-  }
+  // Use withGitAuthor since pull may need to create merge commits
+  // and requires user.name and user.email
+  const pullArgs = await withGitAuthor([
+    "pull",
+    "--rebase=false",
+    remote,
+    branch,
+  ]);
   try {
-    await git.pull({
-      fs,
-      http,
-      dir: path,
-      remote,
-      ref: branch,
-      singleBranch: true,
-      author: author || (await getGitAuthor()),
-      onAuth: accessToken
-        ? () => ({
-            username: accessToken,
-            password: "x-oauth-basic",
-          })
-        : undefined,
+    await execOrThrow(pullArgs, path, "Failed to pull from remote", undefined, {
+      env: getGitNetworkEnv(auth),
     });
-    // Check for conflicts even if pull succeeded (isomorphic-git may not throw on conflicts)
-    if (hasGitConflictState({ path })) {
-      throw GitConflictError(
-        `Merge conflict detected during pull. Please resolve conflicts before proceeding.`,
-      );
-    }
   } catch (error: any) {
     // Check git state files to detect conflicts instead of parsing error messages
     if (hasGitConflictState({ path })) {
@@ -1848,47 +3149,22 @@ export async function gitPull({
         `Merge conflict detected during pull. Please resolve conflicts before proceeding.`,
       );
     }
-    throw error;
+    throw classifyGitOperationError(error, [
+      GIT_ERROR_CODES.DIVERGENT_BRANCHES,
+    ]);
   }
+  return;
 }
 
 export async function gitMerge({
   path,
   branch,
-  author,
 }: GitMergeParams): Promise<void> {
-  const settings = readSettings();
-  if (settings.enableNativeGit) {
-    // Use withGitAuthor since merge may need to create merge commits
-    // and requires user.name and user.email
-    const args = await withGitAuthor(["merge", branch]);
-    try {
-      await execOrThrow(args, path, `Failed to merge branch ${branch}`);
-    } catch (error: any) {
-      // Check git state files to detect conflicts instead of parsing error messages
-      if (hasGitConflictState({ path })) {
-        throw GitConflictError(
-          `Merge conflict detected during merge. Please resolve conflicts before proceeding.`,
-        );
-      }
-      throw error;
-    }
-    return;
-  }
+  // Use withGitAuthor since merge may need to create merge commits
+  // and requires user.name and user.email
+  const args = await withGitAuthor(["merge", branch]);
   try {
-    await git.merge({
-      fs,
-      dir: path,
-      ours: "HEAD",
-      theirs: branch,
-      author: author || (await getGitAuthor()),
-    });
-    // Check for conflicts even if merge succeeded (isomorphic-git may not throw on conflicts)
-    if (hasGitConflictState({ path })) {
-      throw GitConflictError(
-        `Merge conflict detected during merge. Please resolve conflicts before proceeding.`,
-      );
-    }
+    await execOrThrow(args, path, `Failed to merge branch ${branch}`);
   } catch (error: any) {
     // Check git state files to detect conflicts instead of parsing error messages
     if (hasGitConflictState({ path })) {
@@ -1896,8 +3172,11 @@ export async function gitMerge({
         `Merge conflict detected during merge. Please resolve conflicts before proceeding.`,
       );
     }
-    throw error;
+    throw classifyGitOperationError(error, [
+      GIT_ERROR_CODES.UNCOMMITTED_CHANGES,
+    ]);
   }
+  return;
 }
 
 export async function gitCreateBranch({
@@ -1905,83 +3184,48 @@ export async function gitCreateBranch({
   branch,
   from = "HEAD",
 }: GitCreateBranchParams): Promise<void> {
-  const settings = readSettings();
-  if (settings.enableNativeGit) {
-    await execOrThrow(
-      ["branch", branch, from],
-      path,
-      `Failed to create branch ${branch}`,
-    );
-    return;
-  }
-  // isomorphic-git: branch creation uses the current HEAD; it does not honor "from"
-  // in the same way as native `git branch <name> <from>`.
-  if (from !== "HEAD") {
-    throw new DyadError(
-      `gitCreateBranch: 'from' is not supported when native git is disabled (from=${from}). ` +
-        `Branches would be created from HEAD instead.`,
-      DyadErrorKind.Precondition,
-    );
-  }
-  await git.branch({
-    fs,
-    dir: path,
-    ref: branch,
-    checkout: false,
-  });
+  await execOrThrow(
+    ["branch", branch, from],
+    path,
+    `Failed to create branch ${branch}`,
+  );
+  return;
 }
 
 export async function gitDeleteBranch({
   path,
   branch,
 }: GitDeleteBranchParams): Promise<void> {
-  const settings = readSettings();
-  if (settings.enableNativeGit) {
-    await execOrThrow(
-      ["branch", "-D", branch],
-      path,
-      `Failed to delete branch ${branch}`,
-    );
-  } else {
-    await git.deleteBranch({
-      fs,
-      dir: path,
-      ref: branch,
-    });
-  }
+  await execOrThrow(
+    ["branch", "-D", branch],
+    path,
+    `Failed to delete branch ${branch}`,
+  );
 }
 
 export async function gitGetMergeConflicts({
   path,
 }: GitBaseParams): Promise<string[]> {
-  const settings = readSettings();
-  if (settings.enableNativeGit) {
-    // git diff --name-only --diff-filter=U
-    const result = (await execGit(
-      ["diff", "--name-only", "--diff-filter=U"],
-      path,
-    )) as unknown as {
-      stdout: string;
-      stderr: string;
-      exitCode: number;
-    };
-    if (result.exitCode !== 0) {
-      throw new DyadError(
-        `Failed to get merge conflicts: ${result.stderr}`,
-        DyadErrorKind.Conflict,
-      );
-    }
-    return result.stdout
-      .toString()
-      .split("\n")
-      .map((s) => s.trim())
-      .filter((s) => s.length > 0);
+  // git diff --name-only --diff-filter=U
+  const result = (await execGit(
+    ["diff", "--name-only", "--diff-filter=U"],
+    path,
+  )) as unknown as {
+    stdout: string;
+    stderr: string;
+    exitCode: number;
+  };
+  if (result.exitCode !== 0) {
+    throw new DyadError(
+      `Failed to get merge conflicts: ${result.stderr}`,
+      DyadErrorKind.Conflict,
+    );
   }
-  //throw error("gitGetMergeConflicts requires native Git. Enable native Git in settings.");
-  throw new DyadError(
-    "Git conflict detection requires native Git. Enable native Git in settings.",
-    DyadErrorKind.Precondition,
-  );
+  return result.stdout
+    .toString()
+    .split("\n")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
 }
 
 /**

@@ -65,6 +65,28 @@ describe("getNeonAvailableSystemPrompt", () => {
       ).toMatchSnapshot();
     });
 
+    it.each([true, false, undefined])(
+      "renders preview cookie guidance for enableAppPreviewDomains=%s",
+      (enableAppPreviewDomains) => {
+        const prompt = getNeonAvailableSystemPrompt(
+          NEON_CLIENT_CODE,
+          "vite-nitro",
+          { enableAppPreviewDomains },
+        );
+
+        expect(prompt.includes("app-<numeric app ID>.localhost")).toBe(
+          enableAppPreviewDomains === true,
+        );
+        expect(prompt.includes("shared cookies across ports")).toBe(
+          enableAppPreviewDomains !== true,
+        );
+        expect(prompt).not.toContain("[[PREVIEW_COOKIE_GUIDANCE]]");
+        expect(prompt).toContain("MUST be discarded unconditionally");
+        expect(prompt).toContain("forward at most the first occurrence");
+        expect(prompt).toContain("Never set a shared `Domain=localhost`");
+      },
+    );
+
     it("local agent mode", () => {
       expect(
         getNeonAvailableSystemPrompt(NEON_CLIENT_CODE, "vite-nitro", {
@@ -72,6 +94,45 @@ describe("getNeonAvailableSystemPrompt", () => {
         }),
       ).toMatchSnapshot();
     });
+
+    it.each(["\n", "\r\n"])(
+      "orders and constrains preview cookie normalization with %j newlines",
+      (newline) => {
+        const guide = filterGuideByFramework(
+          addAuthenticationGuide.replace(/\r?\n/g, newline),
+          "vite-nitro",
+        ).replace(/\r\n/g, "\n");
+        const allowlistIndex = guide.indexOf(
+          "const forwardedHeaders = new Headers();",
+        );
+        const allowlistLoopEndIndex = guide.indexOf(
+          "    forwardedHeaders.set(headerName, value);\n  }",
+        );
+        const normalizationIndex = guide.indexOf(
+          'const cookieHeader = forwardedHeaders.get("cookie");',
+        );
+        const nullCheckIndex = guide.indexOf("if (!cookieHeader) return null;");
+        const sessionNormalizationIndex = guide.indexOf(
+          "const cookie = normalizeAuthCookieHeader(cookieHeader, isHttp);",
+        );
+
+        expect(allowlistIndex).toBeGreaterThan(-1);
+        expect(allowlistLoopEndIndex).toBeGreaterThan(allowlistIndex);
+        expect(normalizationIndex).toBeGreaterThan(allowlistLoopEndIndex);
+        expect(nullCheckIndex).toBeGreaterThan(-1);
+        expect(sessionNormalizationIndex).toBeGreaterThan(nullCheckIndex);
+        expect(guide).toContain(
+          'name.startsWith("__Secure-") || name.startsWith("__Host-")',
+        );
+        expect(guide).toContain("seenPreviewCookieNames.has(restoredName)");
+        expect(guide).not.toContain("NEON_AUTH_COOKIE_MODE");
+        expect(guide).toContain("if (isHttp)");
+        expect(guide).toContain("isHttp: boolean");
+        expect(guide).toContain(
+          "getSessionFromCookie(cookie, getRequestURL(event).protocol === 'http:')",
+        );
+      },
+    );
   });
 
   it("plain vite falls back to the generic framework path", () => {

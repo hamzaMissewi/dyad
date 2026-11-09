@@ -17,7 +17,7 @@ import { cn } from "@/lib/utils";
 interface QueuedMessagesListProps {
   messages: QueuedMessageItem[];
   onEdit: (id: string) => void;
-  onDelete: (id: string) => void;
+  onDelete: (id: string) => void | Promise<void>;
   onMoveUp: (id: string) => void;
   onMoveDown: (id: string) => void;
   isStreaming: boolean;
@@ -32,7 +32,7 @@ interface QueuedMessageItemRowProps {
   index: number;
   total: number;
   onEdit: () => void;
-  onDelete: () => void;
+  onDelete: () => void | Promise<void>;
   onMoveUp: () => void;
   onMoveDown: () => void;
 }
@@ -46,6 +46,10 @@ function QueuedMessageItemRow({
   onMoveUp,
   onMoveDown,
 }: QueuedMessageItemRowProps) {
+  const editable = message.editable ?? true;
+  const removable = message.removable ?? true;
+  const isRejectableMachineEntry = !editable && removable;
+
   return (
     <li className="flex items-center gap-2 text-sm py-1.5 px-2 bg-muted/50 rounded group">
       {/* Message preview */}
@@ -58,46 +62,54 @@ function QueuedMessageItemRow({
 
       {/* Action buttons - visible on hover */}
       <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
-        <button
-          type="button"
-          onClick={onEdit}
-          className="p-1 hover:bg-muted rounded cursor-pointer"
-          title="Edit"
-        >
-          <Pencil size={14} className="text-muted-foreground" />
-        </button>
-        <button
-          type="button"
-          onClick={onMoveUp}
-          disabled={index === 0}
-          className={cn(
-            "p-1 hover:bg-muted rounded cursor-pointer",
-            index === 0 && "opacity-30 cursor-not-allowed",
-          )}
-          title="Move up"
-        >
-          <ArrowUp size={14} className="text-muted-foreground" />
-        </button>
-        <button
-          type="button"
-          onClick={onMoveDown}
-          disabled={index === total - 1}
-          className={cn(
-            "p-1 hover:bg-muted rounded cursor-pointer",
-            index === total - 1 && "opacity-30 cursor-not-allowed",
-          )}
-          title="Move down"
-        >
-          <ArrowDown size={14} className="text-muted-foreground" />
-        </button>
-        <button
-          type="button"
-          onClick={onDelete}
-          className="p-1 hover:bg-muted rounded cursor-pointer"
-          title="Delete"
-        >
-          <Trash2 size={14} className="text-red-500" />
-        </button>
+        {editable && (
+          <button
+            type="button"
+            onClick={onEdit}
+            className="p-1 hover:bg-muted rounded cursor-pointer"
+            title="Edit"
+          >
+            <Pencil size={14} className="text-muted-foreground" />
+          </button>
+        )}
+        {editable && (
+          <>
+            <button
+              type="button"
+              onClick={onMoveUp}
+              disabled={index === 0}
+              className={cn(
+                "p-1 hover:bg-muted rounded cursor-pointer",
+                index === 0 && "opacity-30 cursor-not-allowed",
+              )}
+              title="Move up"
+            >
+              <ArrowUp size={14} className="text-muted-foreground" />
+            </button>
+            <button
+              type="button"
+              onClick={onMoveDown}
+              disabled={index === total - 1}
+              className={cn(
+                "p-1 hover:bg-muted rounded cursor-pointer",
+                index === total - 1 && "opacity-30 cursor-not-allowed",
+              )}
+              title="Move down"
+            >
+              <ArrowDown size={14} className="text-muted-foreground" />
+            </button>
+          </>
+        )}
+        {removable && (
+          <button
+            type="button"
+            onClick={() => void onDelete()}
+            className="p-1 hover:bg-muted rounded cursor-pointer"
+            title={isRejectableMachineEntry ? "Reject and delete" : "Delete"}
+          >
+            <Trash2 size={14} className="text-red-500" />
+          </button>
+        )}
       </div>
     </li>
   );

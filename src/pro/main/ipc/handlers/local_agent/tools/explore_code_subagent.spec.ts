@@ -4,14 +4,18 @@ import type { ModelMessage } from "ai";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { SMALL_MODEL_NAME } from "@/ipc/shared/language_model_constants";
 
+import { appOperationCoordinator } from "@/ipc/services/app_operation_coordinator";
 import { runExploreCodeSubagent } from "./explore_code_subagent";
 import {
   candidatesFromReadFileResult,
+  formatCandidateRef,
   formatObservationResult,
   MAX_TOTAL_OBSERVATION_CHARS,
 } from "./explore_code_subagent_candidates";
 import type { AgentContext } from "./types";
+import { submitReportSchema } from "./explore_code_subagent_report";
 
 vi.mock("electron-log", () => ({
   default: {
@@ -38,7 +42,13 @@ const mocks = vi.hoisted(() => ({
   getProviderOptions: vi.fn(),
   cancelOrphanedBaseStream: vi.fn(),
   runRawExploreCode: vi.fn(),
+  findApp: vi.fn(),
 }));
+
+vi.mock("@/db", () => ({
+  db: { query: { apps: { findFirst: mocks.findApp } } },
+}));
+vi.mock("@/paths/paths", () => ({ getDyadAppPath: (value: string) => value }));
 
 vi.mock("ai", async () => {
   const actual = await vi.importActual<typeof import("ai")>("ai");
@@ -54,6 +64,13 @@ vi.mock("@/main/settings", () => ({
 
 vi.mock("@/ipc/utils/get_model_client", () => ({
   getModelClient: mocks.getModelClient,
+}));
+
+vi.mock("@/ipc/utils/model_effort", () => ({
+  resolveModelSelection: vi.fn(async ({ model }) => ({
+    ...model,
+    effortLevel: "medium",
+  })),
 }));
 
 vi.mock("@/ipc/utils/token_utils", () => ({
@@ -115,6 +132,90 @@ describe("runExploreCodeSubagent", () => {
     }));
   });
 
+  it("finishes referenced-app exploration before a queued rename without nested read claims", async () => {
+    const ctx = createMockContext();
+    ctx.referencedApps = new Map([["other", "/tmp/other"]]);
+    ctx.referencedAppIds = new Map([["other", 987655]]);
+    mocks.findApp.mockResolvedValue({ id: 987655, path: "/tmp/other" });
+    let rename: Promise<unknown> | undefined;
+    let renamed = false;
+    mocks.runRawExploreCode.mockImplementationOnce(async () => {
+      rename = appOperationCoordinator.run(
+        { appId: 987655, operation: "rename", resources: ["app-path"] },
+        async () => {
+          renamed = true;
+        },
+      );
+      await Promise.resolve();
+      expect(renamed).toBe(false);
+      return buildRawExploreResult();
+    });
+    mocks.streamText.mockImplementationOnce((options: any) => ({
+      fullStream: createToolStream(async () => {
+        await options.tools.explore_code.execute({
+          query: "find save",
+          intent: "locate",
+          app_name: "other",
+        });
+      }),
+      textStream: createTextStream([]),
+    }));
+    await runExploreCodeSubagent({
+      args: { query: "find save", intent: "locate", app_name: "other" },
+      ctx,
+    });
+    expect(mocks.runRawExploreCode).toHaveBeenCalled();
+    await rename;
+    expect(renamed).toBe(true);
+    expect(appOperationCoordinator.isBusy(987655, ["app-path"])).toBe(false);
+  });
+
+  it("uses the engine helper model with BYO for code exploration and its token limits", async () => {
+    const ctx = createMockContext();
+    ctx.inferenceSettings = {
+      ...mocks.readSettings(),
+      proModelUsage: "api-key",
+      selectedModel: { provider: "anthropic", name: "chosen-model" },
+    };
+    await runExploreCodeSubagent({
+      args: { query: "find save", intent: "locate" },
+      ctx,
+    });
+    expect(mocks.getModelClient).toHaveBeenCalledWith(
+      { provider: "openai", name: SMALL_MODEL_NAME },
+      expect.objectContaining({ proModelUsage: "pro" }),
+      expect.objectContaining({ provider: "openai", name: SMALL_MODEL_NAME }),
+    );
+    expect(mocks.getMaxTokens).toHaveBeenCalledWith({
+      provider: "openai",
+      name: SMALL_MODEL_NAME,
+    });
+  });
+  it.each(["build", "ask", "plan", "local-agent"] as const)(
+    "inherits accepted %s billing settings instead of the live default",
+    async (selectedChatMode) => {
+      const ctx = createMockContext();
+      ctx.inferenceSettings = { ...mocks.readSettings(), selectedChatMode };
+      mocks.readSettings.mockReturnValue({
+        ...ctx.inferenceSettings,
+        selectedChatMode:
+          selectedChatMode === "local-agent" ? "build" : "local-agent",
+      });
+      await runExploreCodeSubagent({
+        args: { query: "find the save handler", intent: "locate" },
+        ctx,
+      });
+      expect(mocks.getModelClient).toHaveBeenCalledWith(
+        expect.any(Object),
+        expect.objectContaining({
+          selectedChatMode,
+          providerSettings: ctx.inferenceSettings?.providerSettings,
+        }),
+        expect.any(Object),
+      );
+    },
+  );
+
   it("runs one conversation that forces explore_code first and accepts a candidate-ID report", async () => {
     mocks.streamText.mockImplementationOnce((options: any) => ({
       fullStream: createToolStream(async () => {
@@ -133,6 +234,8 @@ describe("runExploreCodeSubagent", () => {
         // With evidence observed and nothing forced, the model is free to act.
         expect(options.prepareStep(createPrepareStepOptions())).toBeUndefined();
         const accepted = await options.tools.submit_report.execute({
+          summary:
+            "Widget saves are validated locally before the API persists them.",
           primaryCandidateIds: ["c1"],
           flow: [
             {
@@ -152,6 +255,21 @@ describe("runExploreCodeSubagent", () => {
       ctx: createMockContext(),
     });
 
+    expect(mocks.getModelClient).toHaveBeenCalledWith(
+      { provider: "openai", name: SMALL_MODEL_NAME },
+      expect.objectContaining({
+        selectedModel: {
+          provider: "openai",
+          name: SMALL_MODEL_NAME,
+          effortLevel: "medium",
+        },
+      }),
+      {
+        provider: "openai",
+        name: SMALL_MODEL_NAME,
+        effortLevel: "medium",
+      },
+    );
     const options = vi.mocked(streamText).mock.calls[0][0] as any;
     expect(Object.keys(options.tools).sort()).toEqual([
       "explore_code",
@@ -165,13 +283,72 @@ describe("runExploreCodeSubagent", () => {
     // edit intent + ranged flow derives read_targets at high confidence.
     expect(report).toContain("Confidence: high | Action: read_targets");
     expect(report).toContain(
+      "Summary:\nWidget saves are validated locally before the API persists them.",
+    );
+    expect(report).toContain(
       "src/widget/saveWidget.ts:1-4 (handler) - saveWidget handles the submitted value.",
     );
     // The quote is excerpted from observed source; the model never supplied it.
     expect(report).toContain(
       "> export async function saveWidget(input: WidgetInput) {",
     );
-    expect(report).toContain('"path":"src/widget/saveWidget.ts"');
+    expect(report).not.toContain("```json");
+  });
+
+  it("drains usage promises before cancelling the orphaned base stream", async () => {
+    let resolveUsage!: (value: {
+      inputTokens: number;
+      outputTokens: number;
+    }) => void;
+    let resolveSteps!: (value: Array<{ toolCalls: never[] }>) => void;
+    const totalUsage = new Promise<{
+      inputTokens: number;
+      outputTokens: number;
+    }>((resolve) => {
+      resolveUsage = resolve;
+    });
+    const steps = new Promise<Array<{ toolCalls: never[] }>>((resolve) => {
+      resolveSteps = resolve;
+    });
+    let streamDrained = false;
+    mocks.streamText.mockImplementationOnce(() => ({
+      fullStream: createToolStream(async () => {
+        streamDrained = true;
+      }),
+      textStream: createTextStream([]),
+      totalUsage,
+      steps,
+    }));
+
+    const run = runExploreCodeSubagent({
+      args: { query: "widget save flow", intent: "locate" },
+      ctx: createMockContext(),
+    });
+    await vi.waitFor(() => expect(streamDrained).toBe(true));
+    expect(mocks.cancelOrphanedBaseStream).not.toHaveBeenCalled();
+
+    resolveUsage({ inputTokens: 10, outputTokens: 5 });
+    resolveSteps([{ toolCalls: [] }]);
+    await run;
+
+    expect(mocks.cancelOrphanedBaseStream).toHaveBeenCalledOnce();
+  });
+
+  it("preserves Code Explorer fallback warnings in the final report", async () => {
+    mocks.runRawExploreCode.mockResolvedValue({
+      ...buildRawExploreResult(),
+      notes: [
+        "Warning: Code Explorer used bundled TypeScript 6.0.3 because the app-local compiler API was incompatible. Results are best-effort.",
+      ],
+    });
+
+    const report = await runExploreCodeSubagent({
+      args: { query: "widget save flow", intent: "locate" },
+      ctx: createMockContext(),
+    });
+
+    expect(report).toContain("Warnings:");
+    expect(report).toContain("used bundled TypeScript 6.0.3");
   });
 
   it("uses a domain-neutral system prompt with no benchmark vocabulary", async () => {
@@ -201,6 +378,8 @@ describe("runExploreCodeSubagent", () => {
       fullStream: createToolStream(async () => {
         await options.tools.explore_code.execute({ query: "widget save flow" });
         await options.tools.submit_report.execute({
+          summary:
+            "The save implementation was found, but its callers remain untraced.",
           primaryCandidateIds: ["c1"],
           flow: [
             {
@@ -295,6 +474,40 @@ describe("runExploreCodeSubagent", () => {
     expect(report).toContain("where the saved widget is rendered");
   });
 
+  it("preserves all schema-valid missing coverage entries", async () => {
+    const missingCoverage = [
+      `callers: ${"a".repeat(170)}`,
+      `persistence: ${"b".repeat(166)}`,
+      `rendering: ${"c".repeat(168)}`,
+    ];
+    mocks.streamText.mockImplementationOnce((options: any) => ({
+      fullStream: createToolStream(async () => {
+        await options.tools.explore_code.execute({ query: "widget save flow" });
+        await options.tools.submit_report.execute({
+          summary:
+            "The save handler is observed, but adjacent coverage remains.",
+          primaryCandidateIds: ["c1"],
+          flow: [
+            {
+              candidateId: "c1",
+              role: "handler",
+              fact: "saveWidget persists the input.",
+            },
+          ],
+          missingCoverage,
+        });
+      }),
+      textStream: createTextStream([]),
+    }));
+
+    const report = await runExploreCodeSubagent({
+      args: { query: "widget save flow", intent: "explain" },
+      ctx: createMockContext(),
+    });
+
+    expect(report).toContain(`Missing: ${missingCoverage.join("; ")}`);
+  });
+
   it("drops unknown candidate IDs and falls back instead of rendering fabricated paths", async () => {
     mocks.streamText.mockImplementationOnce((options: any) => ({
       fullStream: createToolStream(async () => {
@@ -377,6 +590,99 @@ describe("runExploreCodeSubagent", () => {
     expect(report).toContain("src/widget/saveWidget.ts");
   });
 
+  it("reconstructs a grounded fallback report from the durable explore_code result", async () => {
+    const durableExplore = vi.fn(async () => ({
+      type: "text" as const,
+      value: [
+        "## Code exploration: widget save flow",
+        "",
+        "Found 1 symbols across 1 files.",
+        "Indexed 20 files in 2ms; searched in 1ms.",
+        "",
+        "#### src/widget/saveWidget.ts - saveWidget (function:42)",
+        "",
+        "Lines 42-45:",
+        "```ts",
+        "export async function saveWidget(input: WidgetInput) {",
+        "  validateWidget(input);",
+        "  return api.widgets.save(input);",
+        "}",
+        "```",
+      ].join("\n"),
+    }));
+    const finalized = vi.fn();
+    mocks.streamText.mockImplementationOnce((options: any) => ({
+      fullStream: createToolStream(async () => {
+        const result = await options.tools.explore_code.execute(
+          { query: "widget save flow" },
+          { toolCallId: "durable-explore-1", messages: [] },
+        );
+        expect(result.value).toContain("Observed candidate IDs:");
+        expect(result.value).toContain("c1 src/widget/saveWidget.ts:42-45");
+      }),
+      textStream: createTextStream([]),
+      totalUsage: Promise.resolve({ inputTokens: 10, outputTokens: 5 }),
+      steps: Promise.resolve([{ toolCalls: [{ toolName: "explore_code" }] }]),
+    }));
+
+    const report = await runExploreCodeSubagent({
+      args: { query: "widget save flow", intent: "explain" },
+      ctx: createMockContext(),
+      tools: {
+        explore_code: {
+          description: "Durable compiler explorer",
+          inputSchema: {} as any,
+          execute: durableExplore,
+        },
+      },
+      onFinalized: finalized,
+    });
+
+    expect(durableExplore).toHaveBeenCalledOnce();
+    expect(report).toContain("src/widget/saveWidget.ts:42-45");
+    expect(report).toContain(
+      "> export async function saveWidget(input: WidgetInput) {",
+    );
+    expect(finalized).toHaveBeenCalledWith({
+      usedFallback: true,
+      observationCount: 1,
+    });
+    expect(mocks.runRawExploreCode).not.toHaveBeenCalled();
+  });
+
+  it("allows durable code_search when compiler-backed exploration is unavailable", async () => {
+    const durableCodeSearch = vi.fn(async () => ({
+      type: "text" as const,
+      value: "Found 1 relevant file(s):\n - src/widget/saveWidget.ts",
+    }));
+    mocks.streamText.mockImplementationOnce((options: any) => ({
+      fullStream: createToolStream(async () => {
+        expect(options.prepareStep(createPrepareStepOptions())).toBeUndefined();
+        const result = await options.tools.code_search.execute(
+          { query: "widget save flow" },
+          { toolCallId: "durable-search-1", messages: [] },
+        );
+        expect(result.value).toContain("c1 src/widget/saveWidget.ts");
+      }),
+      textStream: createTextStream([]),
+    }));
+
+    const report = await runExploreCodeSubagent({
+      args: { query: "widget save flow", intent: "locate" },
+      ctx: createMockContext(),
+      tools: {
+        code_search: {
+          description: "Semantic fallback",
+          inputSchema: {} as any,
+          execute: durableCodeSearch,
+        },
+      },
+    });
+
+    expect(report).toContain("src/widget/saveWidget.ts");
+    expect(mocks.runRawExploreCode).not.toHaveBeenCalled();
+  });
+
   it("renders skip_explore_result when the model finds nothing relevant", async () => {
     mocks.streamText.mockImplementationOnce((options: any) => ({
       fullStream: createToolStream(async () => {
@@ -403,6 +709,8 @@ describe("runExploreCodeSubagent", () => {
       fullStream: createToolStream(async () => {
         await options.tools.explore_code.execute({ query: "widget save flow" });
         await options.tools.submit_report.execute({
+          summary:
+            "The save implementation was found, but its callers remain untraced.",
           primaryCandidateIds: ["c1"],
           flow: [],
           missingCoverage: ["where saveWidget is invoked"],
@@ -420,6 +728,9 @@ describe("runExploreCodeSubagent", () => {
     });
 
     expect(report).toContain("Action: targeted_gap_search");
+    expect(report).toContain(
+      "The save implementation was found, but its callers remain untraced.",
+    );
     expect(report).toContain(
       'Search targets:\nquery="saveWidget" include="src/**/*.{ts,tsx}" literal=true',
     );
@@ -491,7 +802,7 @@ describe("runExploreCodeSubagent", () => {
     expect(report).toContain("## explore_code report");
   });
 
-  it("renders each flow path at most once outside the JSON block", async () => {
+  it("renders each flow path at most once", async () => {
     mocks.runRawExploreCode.mockResolvedValue(
       buildSameFileMultiRangeRawExploreResult(),
     );
@@ -522,12 +833,58 @@ describe("runExploreCodeSubagent", () => {
       ctx: createMockContext(),
     });
 
-    const beforeJson = report.split("```json")[0];
-    const occurrences =
-      beforeJson.match(/src\/widget\/saveWidget\.ts:1-4/g) ?? [];
+    const occurrences = report.match(/src\/widget\/saveWidget\.ts:1-4/g) ?? [];
     // The second range on the same file is rendered as "same file:...".
     expect(occurrences.length).toBe(1);
-    expect(beforeJson).toContain("same file:20-23");
+    expect(report).toContain("same file:20-23");
+  });
+
+  it("renders all twelve accepted flow steps", async () => {
+    mocks.runRawExploreCode.mockResolvedValue(
+      buildTwelveFileRawExploreResult(),
+    );
+    mocks.streamText.mockImplementationOnce((options: any) => ({
+      fullStream: createToolStream(async () => {
+        await options.tools.explore_code.execute({ query: "widget flow" });
+        await options.tools.submit_report.execute({
+          summary: "The flow crosses twelve observed implementation stages.",
+          primaryCandidateIds: ["c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8"],
+          flow: Array.from({ length: 12 }, (_value, index) => ({
+            candidateId: `c${index + 1}`,
+            role: `stage ${index + 1}`,
+            fact: `Observed implementation stage ${index + 1}.`,
+          })),
+        });
+      }),
+      textStream: createTextStream([]),
+    }));
+
+    const report = await runExploreCodeSubagent({
+      args: { query: "widget flow", intent: "explain" },
+      ctx: createMockContext(),
+    });
+
+    expect(report).toContain(
+      "12. src/widget/stage12.ts:1-3 (stage 12) - Observed implementation stage 12.",
+    );
+  });
+
+  it("accepts the expanded narrative field limits", () => {
+    expect(
+      submitReportSchema.safeParse({
+        summary: "Grounded summary",
+        primaryCandidateIds: ["c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8"],
+        flow: [
+          {
+            candidateId: "c1",
+            role: "handler",
+            fact: "f".repeat(400),
+          },
+        ],
+        readTargets: [{ candidateId: "c1", purpose: "p".repeat(120) }],
+        missingCoverage: Array.from({ length: 3 }, () => "m".repeat(300)),
+      }).success,
+    ).toBe(true);
   });
 
   it("caps accumulated raw observations from a single tool call", async () => {
@@ -602,7 +959,7 @@ describe("runExploreCodeSubagent", () => {
       ctx: createMockContext(),
     });
 
-    expect(report.length).toBeLessThanOrEqual(8_000);
+    expect(report.length).toBeLessThanOrEqual(16_000);
   });
 
   it("forces submit_report on the final allowed step when nothing is accepted", async () => {
@@ -829,6 +1186,15 @@ describe("runExploreCodeSubagent", () => {
 });
 
 describe("explore_code subagent observation helpers", () => {
+  it("omits unknown ranges from whole-file candidate references", () => {
+    const [candidate] = candidatesFromReadFileResult("first\nsecond\n", {
+      path: "src/file.ts",
+    });
+
+    expect(candidate.range).toBeNull();
+    expect(formatCandidateRef(candidate)).toBe("src/file.ts");
+  });
+
   it("does not extend read_file candidate ranges for a trailing newline", () => {
     const [candidate] = candidatesFromReadFileResult("alpha\nbeta\n", {
       path: "src/file.ts",
@@ -855,6 +1221,10 @@ describe("explore_code subagent observation helpers", () => {
 
 function createMockContext(appPath = "/tmp/app"): AgentContext {
   return {
+    inferenceSettings: {
+      ...mocks.readSettings(),
+      selectedChatMode: "local-agent",
+    },
     appId: 1,
     chatId: 2,
     appPath,
@@ -972,6 +1342,33 @@ function buildSameFileMultiRangeRawExploreResult() {
         ],
       },
     ],
+  };
+}
+
+function buildTwelveFileRawExploreResult() {
+  return {
+    ...buildRawExploreResult(),
+    query: "widget flow",
+    totalSymbols: 12,
+    totalFiles: 12,
+    files: Array.from({ length: 12 }, (_value, index) => {
+      const stage = index + 1;
+      return {
+        path: `src/widget/stage${stage}.ts`,
+        symbols: [{ name: `stage${stage}`, kind: "function", line: 1 }],
+        windows: [
+          {
+            startLine: 1,
+            endLine: 3,
+            lines: [
+              `export function stage${stage}() {`,
+              `  return ${stage};`,
+              "}",
+            ],
+          },
+        ],
+      };
+    }),
   };
 }
 

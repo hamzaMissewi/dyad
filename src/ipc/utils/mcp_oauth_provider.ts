@@ -1,5 +1,7 @@
-import { shell, safeStorage } from "electron";
+import { shell } from "electron";
 import log from "electron-log";
+import { z } from "zod";
+import { DyadError, DyadErrorKind } from "@/errors/dyad_error";
 import { eq } from "drizzle-orm";
 import type {
   OAuthClientInformation,
@@ -10,6 +12,13 @@ import type {
 import { db } from "../../db";
 import { mcpServers } from "../../db/schema";
 import { DEFAULT_OAUTH_CALLBACK_PORT } from "../types/mcp";
+import {
+  encryptToString,
+  decryptFromString,
+  PLAINTEXT_PREFIX,
+} from "./secret_storage";
+
+export { encryptToString, decryptFromString } from "./secret_storage";
 
 const logger = log.scope("mcp_oauth_provider");
 
@@ -18,6 +27,48 @@ const logger = log.scope("mcp_oauth_provider");
 interface StoredOAuthState {
   tokens?: OAuthTokens;
   clientInformation?: OAuthClientInformation;
+}
+
+// Validate the structures we use before any read-modify-write. Passthrough
+// preserves SDK metadata (expiry, scopes, registration endpoints, etc.).
+const StoredOAuthStateSchema = z
+  .object({
+    tokens: z
+      .object({
+        access_token: z.string().min(1),
+        token_type: z.string().default("Bearer"),
+        refresh_token: z.string().optional(),
+        id_token: z.string().optional(),
+        expires_in: z.number().optional(),
+        scope: z.string().optional(),
+        authorization_server: z.string().optional(),
+        token_endpoint: z.string().optional(),
+      })
+      .passthrough()
+      .optional(),
+    clientInformation: z
+      .object({
+        client_id: z.string().min(1),
+        client_secret: z.string().optional(),
+        client_id_issued_at: z.number().optional(),
+        client_secret_expires_at: z.number().optional(),
+        authorization_server: z.string().optional(),
+        token_endpoint: z.string().optional(),
+      })
+      .passthrough()
+      .optional(),
+  })
+  .passthrough();
+
+function parseStoredState(raw: string): StoredOAuthState {
+  try {
+    return StoredOAuthStateSchema.parse(JSON.parse(decryptFromString(raw)));
+  } catch {
+    throw new DyadError(
+      "Saved MCP OAuth credentials could not be opened. Unlock or restore your OS keyring and retry, or disconnect OAuth to replace them.",
+      DyadErrorKind.Precondition,
+    );
+  }
 }
 
 // PKCE code verifiers live on the provider instance so a superseded
@@ -37,67 +88,28 @@ function formUrlEncode(s: string): string {
     .replace(/%20/g, "+");
 }
 
-// Tags plaintext-fallback blobs so they stay readable if the OS
-// keyring becomes available later.
-const PLAINTEXT_PREFIX = "plain:";
-
-export function encryptToString(plaintext: string): string {
-  if (!safeStorage.isEncryptionAvailable()) {
-    // No keyring (e.g. Linux without libsecret): store plaintext
-    // rather than blocking OAuth on those hosts.
-    logger.warn(
-      "safeStorage encryption unavailable; OAuth state written as plaintext",
-    );
-    return PLAINTEXT_PREFIX + Buffer.from(plaintext, "utf8").toString("base64");
-  }
-  return safeStorage.encryptString(plaintext).toString("base64");
-}
-
-export function decryptFromString(stored: string): string {
-  if (stored.startsWith(PLAINTEXT_PREFIX)) {
-    return Buffer.from(
-      stored.slice(PLAINTEXT_PREFIX.length),
-      "base64",
-    ).toString("utf8");
-  }
-  const buf = Buffer.from(stored, "base64");
-  if (!safeStorage.isEncryptionAvailable()) {
-    // Untagged blob without a keyring: best-effort UTF-8. Garbage
-    // bytes fall through JSON.parse upstream as empty state. Log so a
-    // keyring that disappeared after an encrypted write is diagnosable.
-    logger.warn(
-      "safeStorage encryption unavailable while reading OAuth state; treating stored blob as plaintext",
-    );
-    return buf.toString("utf8");
-  }
-  try {
-    return safeStorage.decryptString(buf);
-  } catch (err) {
-    // Either untagged plaintext from a no-keyring write
-    // (recoverable) or undecryptable ciphertext (yields garbage that
-    // JSON.parse upstream drops as empty state). Return bytes either
-    // way and let the caller decide.
-    logger.warn(
-      "safeStorage.decryptString rejected OAuth state; treating as plaintext",
-      err,
-    );
-    return buf.toString("utf8");
-  }
-}
-
 // True only if the stored OAuth state has an access token. A
 // non-empty `oauth_state` isn't enough -- it can hold just a
 // registered client ID with no tokens yet. Drives the
 // "OAuth: connected" badge.
 export function oauthStateHasTokens(stored: string | null): boolean {
-  if (!stored) return false;
-  const json = decryptFromString(stored);
-  if (!json) return false;
+  return getOAuthStateStatus(stored).oauthConnected;
+}
+
+/** Expose recovery actions without sending stored credentials to the renderer. */
+export function getOAuthStateStatus(stored: string | null): {
+  oauthConnected: boolean;
+  oauthUnreadable: boolean;
+} {
+  if (!stored) return { oauthConnected: false, oauthUnreadable: false };
   try {
-    const parsed = JSON.parse(json) as StoredOAuthState;
-    return Boolean(parsed.tokens?.access_token);
+    const parsed = parseStoredState(stored);
+    return {
+      oauthConnected: Boolean(parsed.tokens?.access_token),
+      oauthUnreadable: false,
+    };
   } catch {
-    return false;
+    return { oauthConnected: false, oauthUnreadable: true };
   }
 }
 
@@ -108,13 +120,7 @@ async function readState(serverId: number): Promise<StoredOAuthState> {
     .where(eq(mcpServers.id, serverId));
   const raw = rows[0]?.oauthState;
   if (!raw) return {};
-  const json = decryptFromString(raw);
-  if (!json) return {};
-  try {
-    return JSON.parse(json) as StoredOAuthState;
-  } catch {
-    return {};
-  }
+  return parseStoredState(raw);
 }
 
 async function writeState(
@@ -125,6 +131,27 @@ async function writeState(
   // empty object, so the column clearly means "nothing stored".
   const isEmpty = !state.tokens && !state.clientInformation;
   const blob = isEmpty ? null : encryptToString(JSON.stringify(state));
+  // Inspect the actual output, not an availability precheck: the keyring can
+  // disappear between two calls. Never replace encrypted state with plaintext.
+  if (blob?.startsWith(PLAINTEXT_PREFIX)) {
+    const [current] = await db
+      .select({ oauthState: mcpServers.oauthState })
+      .from(mcpServers)
+      .where(eq(mcpServers.id, serverId));
+    if (
+      current?.oauthState &&
+      /^v\d\d$/.test(
+        Buffer.from(current.oauthState, "base64")
+          .subarray(0, 3)
+          .toString("ascii"),
+      )
+    ) {
+      throw new DyadError(
+        "Secure storage is unavailable. Unlock your OS keyring before updating saved MCP OAuth credentials.",
+        DyadErrorKind.Precondition,
+      );
+    }
+  }
   await db
     .update(mcpServers)
     .set({ oauthState: blob })
@@ -136,6 +163,35 @@ async function writeState(
 // Electron app means an in-memory chain is enough; SQLite doesn't give
 // us row-level locking.
 const stateLocks = new Map<number, Promise<unknown>>();
+const writeAuthorityGenerations = new Map<number, number>();
+
+export interface McpOAuthWriteAuthority {
+  serverId: number;
+  generation: number;
+}
+
+/**
+ * Replaces the server's prior OAuth write authority synchronously. Providers
+ * still re-check the generation inside the per-server write lock, so queued
+ * work from a cancelled flow cannot commit after a row mutation.
+ */
+export function issueMcpOAuthWriteAuthority(
+  serverId: number,
+): McpOAuthWriteAuthority {
+  const generation = (writeAuthorityGenerations.get(serverId) ?? 0) + 1;
+  writeAuthorityGenerations.set(serverId, generation);
+  return { serverId, generation };
+}
+
+/** Captures the current epoch without replacing another provider's authority. */
+export function captureMcpOAuthWriteAuthority(
+  serverId: number,
+): McpOAuthWriteAuthority {
+  return {
+    serverId,
+    generation: writeAuthorityGenerations.get(serverId) ?? 0,
+  };
+}
 
 async function withStateLock<T>(
   serverId: number,
@@ -149,6 +205,68 @@ async function withStateLock<T>(
     next.catch(() => undefined),
   );
   return next;
+}
+
+/** The client the stored state will hand back, shadowing the row's columns. */
+export async function readStoredOAuthClient(
+  serverId: number,
+): Promise<OAuthClientInformation | undefined> {
+  return withStateLock(
+    serverId,
+    async () => (await readState(serverId)).clientInformation,
+  );
+}
+
+/**
+ * Applies a changed OAuth client to the stored state, which otherwise keeps
+ * returning the client it was seeded with and shadows the row's columns.
+ * A new secret for the same client leaves the tokens in place. A different
+ * client id drops them along with the stored client, since they belong to the
+ * client being replaced; `clientIdChanged` says so from the caller, which
+ * knows it even when the state holds no client to compare against.
+ */
+export async function applyOAuthClientChange(
+  serverId: number,
+  client: {
+    clientId: string;
+    clientSecret: string | null;
+    clientIdChanged: boolean;
+  },
+): Promise<void> {
+  await withStateLock(serverId, async () => {
+    const state = await readState(serverId);
+    const replacesClient =
+      client.clientIdChanged ||
+      (state.clientInformation !== undefined &&
+        state.clientInformation.client_id !== client.clientId);
+    if (replacesClient) {
+      if (state.tokens || state.clientInformation) {
+        await writeState(serverId, {});
+      }
+      return;
+    }
+    // Nothing stored to bring in line; the columns carry the new secret.
+    if (!state.clientInformation) return;
+    await writeState(serverId, {
+      ...state,
+      clientInformation: {
+        client_id: client.clientId,
+        ...(client.clientSecret ? { client_secret: client.clientSecret } : {}),
+      },
+    });
+  });
+}
+
+export async function revokeMcpOAuthWriteAuthority(
+  serverId: number,
+): Promise<void> {
+  writeAuthorityGenerations.set(
+    serverId,
+    (writeAuthorityGenerations.get(serverId) ?? 0) + 1,
+  );
+  // Join the per-server queue so every write that began under the revoked
+  // authority has either committed before this barrier or observed staleness.
+  await withStateLock(serverId, async () => undefined);
 }
 
 interface ProviderConfig {
@@ -171,6 +289,7 @@ interface ProviderConfig {
   // of opening a browser, since no listener is running to catch the
   // redirect.
   allowInteractive?: boolean;
+  writeAuthority?: McpOAuthWriteAuthority;
 }
 
 export class DyadOAuthClientProvider implements OAuthClientProvider {
@@ -181,6 +300,7 @@ export class DyadOAuthClientProvider implements OAuthClientProvider {
   private readonly preregisteredClientSecret: string | undefined;
   private readonly flowState: string | undefined;
   private readonly allowInteractive: boolean;
+  private readonly writeAuthority: McpOAuthWriteAuthority | undefined;
   // Client info kept in memory. The SDK calls `addClientAuthentication`
   // without awaiting it, so that method can't do an async DB read --
   // it uses this instead. Set by `clientInformation()` and
@@ -204,6 +324,17 @@ export class DyadOAuthClientProvider implements OAuthClientProvider {
     this.preregisteredClientSecret = config.preregisteredClientSecret;
     this.flowState = config.flowState;
     this.allowInteractive = config.allowInteractive ?? false;
+    this.writeAuthority =
+      config.writeAuthority ?? captureMcpOAuthWriteAuthority(config.serverId);
+  }
+
+  private canWrite(): boolean {
+    return (
+      !this.aborted &&
+      this.writeAuthority?.serverId === this.serverId &&
+      (writeAuthorityGenerations.get(this.serverId) ?? 0) ===
+        this.writeAuthority.generation
+    );
   }
 
   // Marks this provider's flow as superseded. After this returns, the
@@ -245,9 +376,9 @@ export class DyadOAuthClientProvider implements OAuthClientProvider {
   }
 
   async saveTokens(tokens: OAuthTokens): Promise<void> {
-    if (this.aborted) return;
+    if (!this.canWrite()) return;
     await withStateLock(this.serverId, async () => {
-      if (this.aborted) return;
+      if (!this.canWrite()) return;
       const state = await readState(this.serverId);
       // Servers that don't rotate refresh tokens omit `refresh_token`
       // from the response; carry the previous one forward so the SDK
@@ -280,7 +411,7 @@ export class DyadOAuthClientProvider implements OAuthClientProvider {
         };
         // Skip the seed write if this flow has been superseded; a
         // fresh flow will reseed on its own first read.
-        if (!this.aborted) {
+        if (this.canWrite()) {
           await writeState(this.serverId, {
             ...state,
             clientInformation: seeded,
@@ -305,9 +436,9 @@ export class DyadOAuthClientProvider implements OAuthClientProvider {
     // can't overwrite an in-flight Connect's client_id between
     // /authorize and /token.
     if (!this.allowInteractive) return;
-    if (this.aborted) return;
+    if (!this.canWrite()) return;
     await withStateLock(this.serverId, async () => {
-      if (this.aborted) return;
+      if (!this.canWrite()) return;
       const state = await readState(this.serverId);
       state.clientInformation = clientInformation;
       await writeState(this.serverId, state);
@@ -467,9 +598,9 @@ export class DyadOAuthClientProvider implements OAuthClientProvider {
     // only so a background path can't drop DCR client info on the
     // floor.
     if (scope === "all" && !this.allowInteractive) return;
-    if (this.aborted) return;
+    if (!this.canWrite()) return;
     await withStateLock(this.serverId, async () => {
-      if (this.aborted) return;
+      if (!this.canWrite()) return;
       const state = await readState(this.serverId);
       delete state.tokens;
       if (scope === "all") {
@@ -478,6 +609,17 @@ export class DyadOAuthClientProvider implements OAuthClientProvider {
         this.cachedClientInformation = undefined;
       }
       await writeState(this.serverId, state);
+    });
+  }
+
+  /** Only the user's explicit Disconnect action may discard unreadable state. */
+  async disconnect(): Promise<void> {
+    if (!this.allowInteractive || !this.canWrite()) return;
+    await withStateLock(this.serverId, async () => {
+      if (!this.canWrite()) return;
+      await writeState(this.serverId, {});
+      this.codeVerifierBuf = undefined;
+      this.cachedClientInformation = undefined;
     });
   }
 }

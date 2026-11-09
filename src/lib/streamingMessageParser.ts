@@ -31,10 +31,12 @@ const DYAD_CUSTOM_TAG_NAMES = [
   "dyad-execute-sql",
   "dyad-read-logs",
   "dyad-add-integration",
+  "dyad-suggest-plugin",
   "dyad-enable-nitro",
   "dyad-output",
   "dyad-problem-report",
   "dyad-chat-summary",
+  "dyad-suggested-prompts",
   "dyad-edit",
   "dyad-grep",
   "dyad-explore-code",
@@ -47,6 +49,7 @@ const DYAD_CUSTOM_TAG_NAMES = [
   "dyad-code-search-result",
   "dyad-code-search",
   "dyad-read",
+  "dyad-git",
   "think",
   "dyad-command",
   "dyad-mcp-tool-call",
@@ -62,6 +65,7 @@ const DYAD_CUSTOM_TAG_NAMES = [
   "dyad-neon-table-schema",
   "dyad-read-guide",
   "dyad-status",
+  "dyad-claude-tool",
   "dyad-compaction",
   "dyad-copy",
   "dyad-image-generation",
@@ -72,8 +76,64 @@ const DYAD_CUSTOM_TAG_NAMES = [
   "dyad-script",
   "dyad-app-blueprint",
   "dyad-security-finding",
+  "dyad-test-assertions",
+  // Legacy: no longer emitted (test writing moved to the agent's write_file /
+  // run_tests tools), but historical chats still contain it and must render as
+  // a file-write card rather than raw markup.
+  "dyad-generate-test",
+  "dyad-search-chats",
+  "dyad-read-chat",
+  "dyad-explore-chat-history",
+  "dyad-subagent",
 ];
 const DYAD_CUSTOM_TAG_SET = new Set(DYAD_CUSTOM_TAG_NAMES);
+
+/** Whether the parser treats `name` as a Dyad tag rather than plain text. */
+export function isDyadCustomTagName(name: string): boolean {
+  return DYAD_CUSTOM_TAG_SET.has(name);
+}
+
+const SUGGESTED_PROMPTS_OPEN_TAG = /<dyad-suggested-prompts(?:\s[^>]*)?>/g;
+const SUGGESTED_PROMPTS_CLOSE_TAG = "</dyad-suggested-prompts>";
+const ANY_OPEN_TAG = /<([A-Za-z0-9-]+)(?=[\s>])/g;
+
+function nextDyadTagIndex(content: string, from: number): number {
+  ANY_OPEN_TAG.lastIndex = from;
+  for (
+    let match = ANY_OPEN_TAG.exec(content);
+    match;
+    match = ANY_OPEN_TAG.exec(content)
+  ) {
+    if (isDyadCustomTagName(match[1])) return match.index;
+  }
+  return -1;
+}
+
+/**
+ * Closes every unclosed suggestions tag where this parser would end it: right
+ * before the next recognized Dyad tag, or at the end of the content. Text
+ * consumers such as Copy and the cancel notice use it to agree with the chat.
+ */
+export function closeUnclosedSuggestedPrompts(content: string): string {
+  let result = content;
+  let from = 0;
+  for (;;) {
+    SUGGESTED_PROMPTS_OPEN_TAG.lastIndex = from;
+    const open = SUGGESTED_PROMPTS_OPEN_TAG.exec(result);
+    if (!open) return result;
+    const bodyStart = open.index + open[0].length;
+    const close = result.indexOf(SUGGESTED_PROMPTS_CLOSE_TAG, bodyStart);
+    const next = nextDyadTagIndex(result, bodyStart);
+    if (close >= 0 && (next < 0 || close < next)) {
+      from = close + SUGGESTED_PROMPTS_CLOSE_TAG.length;
+      continue;
+    }
+    if (next < 0) return result + SUGGESTED_PROMPTS_CLOSE_TAG;
+    result =
+      result.slice(0, next) + SUGGESTED_PROMPTS_CLOSE_TAG + result.slice(next);
+    from = next + SUGGESTED_PROMPTS_CLOSE_TAG.length;
+  }
+}
 
 export type Block =
   | {
@@ -99,7 +159,8 @@ type Mode =
   | "tag-attrs" // saw "<NAME ", reading attributes until ">"
   | "tag-content" // inside a tag's content
   | "tag-close-start" // saw "<" inside tag content
-  | "tag-close-name"; // saw "</", reading closing name until ">"
+  | "tag-close-name" // saw "</", reading closing name until ">"
+  | "tag-nested-open"; // saw "<NAME" inside a suggestions block
 
 interface OpenTag {
   tag: string;
@@ -154,6 +215,19 @@ export function initialParserState(): ParserState {
 }
 
 const NAME_CHAR = /[A-Za-z0-9-]/;
+
+// V8 may represent a slice as a view into its parent string. Closed blocks are
+// cached for the life of the message, so a view would keep that whole version
+// of the message alive. Slicing a concatenation makes V8 copy the text into a
+// new string first, so blocks retain only their own text.
+function detachedSlice(content: string, start: number, end: number): string {
+  return (" " + content.slice(start, end)).slice(1);
+}
+
+// Renders as nothing, so it must not swallow later tags if it is never
+// closed, for example when a reply is cut off. Another Dyad tag inside it
+// ends the block as incomplete and is parsed normally.
+const SUGGESTED_PROMPTS_TAG = "dyad-suggested-prompts";
 
 function parseAttributes(attrsStr: string): Record<string, string> {
   const out: Record<string, string> = {};
@@ -251,7 +325,7 @@ export function advanceParser(prev: ParserState, content: string): ParserState {
         // Fast-forward over a run of non-'<' chars; cheaper than per-char append.
         let j = i + 1;
         while (j < len && content[j] !== "<") j++;
-        appendToMarkdownOpen(state, content.slice(i, j));
+        appendToMarkdownOpen(state, detachedSlice(content, i, j));
         i = j;
       }
       continue;
@@ -315,7 +389,7 @@ export function advanceParser(prev: ParserState, content: string): ParserState {
       // Fast-forward attribute bytes.
       let j = i;
       while (j < len && content[j] !== ">") j++;
-      state.pendingAttrs += content.slice(i, j);
+      state.pendingAttrs += detachedSlice(content, i, j);
       i = j;
       continue;
     }
@@ -330,7 +404,7 @@ export function advanceParser(prev: ParserState, content: string): ParserState {
       // Fast-forward run of non-'<' content into rawContent.
       let j = i + 1;
       while (j < len && content[j] !== "<") j++;
-      const chunk = content.slice(i, j);
+      const chunk = detachedSlice(content, i, j);
       if (state.currentTag) {
         state.currentTag.rawContent += chunk;
         const open = state.openBlock;
@@ -351,6 +425,13 @@ export function advanceParser(prev: ParserState, content: string): ParserState {
         state.pendingCloseName = "";
         state.mode = "tag-close-name";
         i++;
+        continue;
+      }
+      if (
+        state.currentTag?.tag === SUGGESTED_PROMPTS_TAG &&
+        NAME_CHAR.test(ch)
+      ) {
+        state.mode = "tag-nested-open";
         continue;
       }
       // Not a closing tag — '<' was content. Push pending into rawContent and resume.
@@ -439,6 +520,50 @@ export function advanceParser(prev: ParserState, content: string): ParserState {
       // Reprocess this char as content.
       continue;
     }
+
+    if (state.mode === "tag-nested-open") {
+      if (NAME_CHAR.test(ch)) {
+        state.pending += ch;
+        i++;
+        continue;
+      }
+      const name = state.pending.slice(1);
+      if (
+        DYAD_CUSTOM_TAG_SET.has(name) &&
+        (ch === " " || ch === "\t" || ch === "\n" || ch === "\r" || ch === ">")
+      ) {
+        // End the suggestions block as incomplete, then parse this tag.
+        const open = state.openBlock;
+        if (open && open.kind === "custom-tag") {
+          state.blocks = [
+            ...state.blocks,
+            { ...open, complete: false, inProgress: false },
+          ];
+        }
+        state.openBlock = null;
+        state.currentTag = null;
+        state.tagStartOffset = i - state.pending.length;
+        state.pendingTagName = name;
+        state.pendingAttrs = "";
+        state.pending = "";
+        state.mode = "tag-attrs";
+        continue;
+      }
+      // Not a Dyad tag, such as "<Footer>": keep it as content.
+      if (state.currentTag) {
+        state.currentTag.rawContent += state.pending;
+        const open = state.openBlock;
+        if (open && open.kind === "custom-tag") {
+          state.openBlock = {
+            ...open,
+            content: unescapeXmlContent(state.currentTag.rawContent),
+          };
+        }
+      }
+      state.pending = "";
+      state.mode = "tag-content";
+      continue;
+    }
   }
 
   state.cursor = len;
@@ -461,7 +586,8 @@ export function getOpenBlock(state: ParserState): Block | null {
     synthesizedMarkdown = "<" + state.pendingTagName + state.pendingAttrs;
   } else if (
     state.mode === "tag-close-start" ||
-    state.mode === "tag-close-name"
+    state.mode === "tag-close-name" ||
+    state.mode === "tag-nested-open"
   ) {
     // Bytes buffered mid-closing-tag ("<", "</", "</NAME") — surface them in
     // the open custom-tag's visible content so they stream and aren't lost

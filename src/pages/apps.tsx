@@ -8,7 +8,7 @@ import {
   Search,
   Trash2,
 } from "lucide-react";
-import { useAtom, useSetAtom } from "jotai";
+import { useAtom } from "jotai";
 import { Button } from "@/components/ui/button";
 import { BackButton } from "@/components/ui/back-button";
 import {
@@ -27,7 +27,6 @@ import { useAppThumbnails } from "@/hooks/useAppThumbnails";
 import { sortAppsForShowcase } from "@/lib/sortApps";
 import { ipc } from "@/ipc/types";
 import { selectedAppIdAtom } from "@/atoms/appAtoms";
-import { clearPreviewRuntimeForAppAtom } from "@/atoms/previewRuntimeAtoms";
 import { showError } from "@/lib/toast";
 import { AppsViewTabs, type AppsView } from "@/components/AppsViewTabs";
 import {
@@ -75,7 +74,6 @@ export default function AppsPage() {
     if (!q) return collections;
     return collections.filter((c) => c.name.toLowerCase().includes(q));
   }, [collections, searchQuery]);
-  const clearPreviewRuntimeForApp = useSetAtom(clearPreviewRuntimeForAppAtom);
 
   const filteredApps = useMemo(() => {
     const sorted = sortAppsForShowcase(apps);
@@ -152,9 +150,6 @@ export default function AppsPage() {
       // so app-details and the sidebar don't render against a stale id.
       if (selectedAppId != null && succeededIds.has(selectedAppId)) {
         setSelectedAppId(null);
-      }
-      for (const appId of succeededIds) {
-        clearPreviewRuntimeForApp(appId);
       }
       if (failed.length > 0) {
         const failedNames = failed

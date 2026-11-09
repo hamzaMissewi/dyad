@@ -1,5 +1,12 @@
-import React, { useEffect, useState } from "react";
-import { ChevronRight, Loader2, CircleX, CheckCircle2 } from "lucide-react";
+import React, { createContext, useContext, useEffect, useState } from "react";
+import {
+  AlertTriangle,
+  ChevronRight,
+  Loader2,
+  CircleX,
+  CheckCircle2,
+} from "lucide-react";
+import { ANNOTATION_IGNORE_ATTRIBUTE } from "@/lib/annotationDom";
 import { CustomTagState } from "./stateTypes";
 
 /**
@@ -18,6 +25,10 @@ export type DyadAccentColor =
   | "sky"
   | "indigo"
   | "slate";
+
+export const DyadCardPresentationContext = createContext<
+  "standalone" | "embedded"
+>("standalone");
 
 const ACCENT_BORDER: Record<DyadAccentColor, string> = {
   blue: "border-l-blue-500",
@@ -106,6 +117,7 @@ export function DyadCard({
   className = "",
   ...props
 }: DyadCardProps) {
+  const presentation = useContext(DyadCardPresentationContext);
   const isPending = state === "pending";
   const isAborted = state === "aborted";
 
@@ -114,10 +126,12 @@ export function DyadCard({
     ? `border-l-[3px] ${isAborted ? "border-l-red-500" : ACCENT_BORDER[accentColor]}`
     : "";
 
+  const effectiveVariant =
+    presentation === "embedded" && variant === "default" ? "ghost" : variant;
   const variantClasses =
-    variant === "ghost"
+    effectiveVariant === "ghost"
       ? "hover:bg-(--background-lightest) rounded-lg"
-      : `bg-(--background-lightest) hover:bg-(--background-lighter) rounded-xl border border-border/60 ${leftBorder}`;
+      : `bg-(--background-lightest) hover:bg-(--background-lighter) dark:bg-(--background-lighter) dark:hover:bg-muted/50 rounded-xl border border-border/60 ${leftBorder}`;
 
   return (
     <div
@@ -128,6 +142,10 @@ export function DyadCard({
         ${onClick ? "cursor-pointer" : ""}
         ${className}
       `}
+      // Card bodies expand and collapse independently of the message content,
+      // so their text stays out of the annotation offset space - otherwise
+      // toggling a card shifts the offsets of every annotation after it.
+      {...{ [ANNOTATION_IGNORE_ATTRIBUTE]: true }}
       onClick={onClick}
       role={onClick ? "button" : undefined}
       tabIndex={onClick ? 0 : undefined}
@@ -227,18 +245,21 @@ export function DyadExpandIcon({ isExpanded }: DyadExpandIconProps) {
 interface DyadStateIndicatorProps {
   state: CustomTagState;
   pendingLabel?: string;
+  warningLabel?: string;
   abortedLabel?: string;
   errorLabel?: string;
   finishedLabel?: string;
 }
 
 /**
- * Renders a spinner (pending), X icon (aborted), or checkmark (finished).
+ * Renders a spinner (pending), warning triangle, X icon (aborted/error), or
+ * checkmark (finished).
  * Includes an optional text label for each state.
  */
 export function DyadStateIndicator({
   state,
   pendingLabel,
+  warningLabel,
   abortedLabel,
   errorLabel,
   finishedLabel,
@@ -248,6 +269,15 @@ export function DyadStateIndicator({
       <span className="inline-flex items-center gap-1 text-amber-600 dark:text-amber-400 text-xs shrink-0">
         <Loader2 size={14} className="animate-spin" />
         {pendingLabel && <span>{pendingLabel}</span>}
+      </span>
+    );
+  }
+
+  if (state === "warning") {
+    return (
+      <span className="inline-flex items-center gap-1 text-amber-600 dark:text-amber-400 text-xs shrink-0">
+        <AlertTriangle size={14} />
+        {warningLabel && <span>{warningLabel}</span>}
       </span>
     );
   }

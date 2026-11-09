@@ -4,7 +4,7 @@ import { testSkipIfWindows, Timeout } from "./helpers/test_helper";
 testSkipIfWindows("select component", async ({ po }) => {
   await po.setUp();
   await po.sendPrompt("tc=basic");
-  await po.previewPanel.clickTogglePreviewPanel();
+  await po.previewPanel.ensurePreviewPanelOpen();
   await po.previewPanel.clickPreviewPickElement();
 
   await po.previewPanel
@@ -21,6 +21,11 @@ testSkipIfWindows("select component", async ({ po }) => {
   await expect(
     po.previewPanel.getSelectedComponentsDisplay(),
   ).not.toBeVisible();
+  await expect(po.previewPanel.getPreviewPickElementButton()).toBeEnabled();
+  await expect(po.previewPanel.getPreviewPickElementButton()).toHaveAttribute(
+    "aria-pressed",
+    "false",
+  );
 
   await po.snapshotServerDump("all-messages");
 
@@ -32,7 +37,7 @@ testSkipIfWindows("select component", async ({ po }) => {
 testSkipIfWindows("select multiple components", async ({ po }) => {
   await po.setUp();
   await po.sendPrompt("tc=basic");
-  await po.previewPanel.clickTogglePreviewPanel();
+  await po.previewPanel.ensurePreviewPanelOpen();
   await po.previewPanel.clickPreviewPickElement();
 
   await po.previewPanel
@@ -55,6 +60,11 @@ testSkipIfWindows("select multiple components", async ({ po }) => {
   await expect(
     po.previewPanel.getSelectedComponentsDisplay(),
   ).not.toBeVisible();
+  await expect(po.previewPanel.getPreviewPickElementButton()).toBeEnabled();
+  await expect(po.previewPanel.getPreviewPickElementButton()).toHaveAttribute(
+    "aria-pressed",
+    "false",
+  );
 
   await po.snapshotServerDump("last-message");
 });
@@ -62,7 +72,7 @@ testSkipIfWindows("select multiple components", async ({ po }) => {
 testSkipIfWindows("deselect component", async ({ po }) => {
   await po.setUp();
   await po.sendPrompt("tc=basic");
-  await po.previewPanel.clickTogglePreviewPanel();
+  await po.previewPanel.ensurePreviewPanelOpen();
   await po.previewPanel.clickPreviewPickElement();
 
   await po.previewPanel
@@ -92,7 +102,7 @@ testSkipIfWindows(
   async ({ po }) => {
     await po.setUp();
     await po.sendPrompt("tc=basic");
-    await po.previewPanel.clickTogglePreviewPanel();
+    await po.previewPanel.ensurePreviewPanelOpen();
     await po.previewPanel.clickPreviewPickElement();
 
     await po.previewPanel
@@ -130,8 +140,20 @@ testSkipIfWindows("upgrade app to select component", async ({ po }) => {
   });
   await po.snapshotAppFiles({ name: "app-upgraded" });
   await po.appManagement.clickOpenInChatButton();
-  // There should be another version from the upgrade being committed.
-  await expect(po.page.getByText("Version 2")).toBeVisible();
+  // The upgrade commit should be reflected in the current version. Runtime
+  // file commits can advance the exact version number.
+  const versionButton = po.page.getByRole("button", {
+    name: /^Version \d+$/,
+  });
+  await expect
+    .poll(
+      async () => {
+        const label = await versionButton.textContent();
+        return Number(label?.match(/^Version (\d+)$/)?.[1] ?? 0);
+      },
+      { timeout: Timeout.MEDIUM },
+    )
+    .toBeGreaterThanOrEqual(2);
   await po.clickRestart();
 
   await po.previewPanel.clickPreviewPickElement();
@@ -147,13 +169,13 @@ testSkipIfWindows("upgrade app to select component", async ({ po }) => {
 });
 
 testSkipIfWindows("select component next.js", async ({ po }) => {
-  await po.setUp();
+  await po.setUp({ autoApprove: true });
 
-  await po.navigation.goToHubAndSelectTemplate("Next.js Template");
+  await po.navigation.goToTemplatesAndSelectTemplate("Next.js Template");
   await po.chatActions.selectChatMode("build");
   // Next.js apps take longer to build on the first prompt, use LONG timeout
   await po.sendPrompt("tc=basic", { timeout: Timeout.LONG });
-  await po.previewPanel.clickTogglePreviewPanel();
+  await po.previewPanel.ensurePreviewPanelOpen();
 
   // Wait for the preview iframe to be visible before interacting
   // Next.js apps take longer to compile and start the dev server

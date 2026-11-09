@@ -2,10 +2,14 @@ import { useCallback, useEffect, useRef } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { ipc } from "@/ipc/types";
 import { type UserSettings, hasDyadProKey } from "@/lib/schemas";
-import { getInitialLoadTelemetryProperties } from "@/lib/posthogTelemetry";
+import {
+  getInitialLoadTelemetryProperties,
+  getSettingsPersonTelemetryProperties,
+} from "@/lib/posthogTelemetry";
 import { usePostHog } from "posthog-js/react";
 import { useAppVersion } from "./useAppVersion";
 import { queryKeys } from "@/lib/queryKeys";
+import { useSubscriptionAccount } from "./useSubscriptionAccount";
 
 const TELEMETRY_CONSENT_KEY = "dyadTelemetryConsent";
 const TELEMETRY_USER_ID_KEY = "dyadTelemetryUserId";
@@ -29,6 +33,7 @@ export function useSettings() {
   const posthog = usePostHog();
   const appVersion = useAppVersion();
   const queryClient = useQueryClient();
+  const subscriptionQuery = useSubscriptionAccount();
 
   const settingsQuery = useQuery({
     queryKey: queryKeys.settings.user,
@@ -65,8 +70,9 @@ export function useSettings() {
     }
 
     processSettingsForTelemetry(settingsQuery.data);
-    const isPro = hasDyadProKey(settingsQuery.data);
-    posthog?.people?.set({ isPro });
+    posthog?.people?.set(
+      getSettingsPersonTelemetryProperties(settingsQuery.data),
+    );
 
     if (
       initialLoadTelemetryState !== "idle" ||
@@ -74,7 +80,8 @@ export function useSettings() {
       !posthog ||
       isPlatformLoading ||
       isInitialLoadTelemetryContextLoading ||
-      !initialLoadTelemetryContext
+      !initialLoadTelemetryContext ||
+      subscriptionQuery.isPending
     ) {
       return;
     }
@@ -90,9 +97,13 @@ export function useSettings() {
       "app:initial-load",
       getInitialLoadTelemetryProperties({
         settings: settingsQuery.data,
+        codexSubscriptionEnabled: subscriptionQuery.data?.connected ?? null,
         appVersion,
         platform: platform ?? null,
         isFirstSession: initialLoadTelemetryContext.isFirstSession,
+        previousSessionAppSize:
+          initialLoadTelemetryContext.previousSessionAppSize,
+        pagefile: initialLoadTelemetryContext.pagefile,
       }),
     );
     initialLoadTelemetryState = "sent";
@@ -105,6 +116,8 @@ export function useSettings() {
     platform,
     platformError,
     initialLoadTelemetryContext,
+    subscriptionQuery.isPending,
+    subscriptionQuery.data?.connected,
   ]);
 
   const updateSettingsMutation = useMutation({
@@ -114,7 +127,9 @@ export function useSettings() {
     onSuccess: (updatedSettings) => {
       queryClient.setQueryData(queryKeys.settings.user, updatedSettings);
       processSettingsForTelemetry(updatedSettings);
-      posthog?.people?.set({ isPro: hasDyadProKey(updatedSettings) });
+      posthog?.people?.set(
+        getSettingsPersonTelemetryProperties(updatedSettings),
+      );
     },
     meta: { showErrorToast: true },
   });
@@ -128,10 +143,13 @@ export function useSettings() {
     [],
   );
 
-  const refreshSettings = useCallback(() => {
-    return queryClient.invalidateQueries({
+  const refreshSettings = useCallback(async () => {
+    await queryClient.invalidateQueries({
       queryKey: queryKeys.settings.all,
     });
+    return (
+      queryClient.getQueryData<UserSettings>(queryKeys.settings.user) ?? null
+    );
   }, [queryClient]);
 
   const loading = settingsQuery.isLoading || envVarsQuery.isLoading;
@@ -141,6 +159,12 @@ export function useSettings() {
     settings: settingsQuery.data ?? null,
     envVars: envVarsQuery.data ?? {},
     loading,
+    /**
+     * Just the user settings, without the env-vars query `loading` also
+     * covers. A caller that only reads a settings flag should not be held
+     * up by an unrelated request.
+     */
+    settingsLoading: settingsQuery.isLoading,
     error,
     updateSettings,
     refreshSettings,

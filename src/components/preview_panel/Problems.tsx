@@ -9,6 +9,7 @@ import {
   Wrench,
   RefreshCw,
   Check,
+  Info,
 } from "lucide-react";
 import { Problem, ProblemReport } from "@/ipc/types";
 import { Button } from "@/components/ui/button";
@@ -16,6 +17,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 
 import { useStreamChat } from "@/hooks/useStreamChat";
 import { useCheckProblems } from "@/hooks/useCheckProblems";
+import { useChatMode } from "@/hooks/useChatMode";
 import { createProblemFixPrompt } from "@/shared/problem_prompt";
 import { showError } from "@/lib/toast";
 import { useTranslation } from "react-i18next";
@@ -23,10 +25,16 @@ import { useTranslation } from "react-i18next";
 interface ProblemItemProps {
   problem: Problem;
   checked: boolean;
+  isIncomplete?: boolean;
   onToggle: () => void;
 }
 
-const ProblemItem = ({ problem, checked, onToggle }: ProblemItemProps) => {
+const ProblemItem = ({
+  problem,
+  checked,
+  isIncomplete,
+  onToggle,
+}: ProblemItemProps) => {
   const { t } = useTranslation(["home", "common"]);
   return (
     <div
@@ -44,7 +52,11 @@ const ProblemItem = ({ problem, checked, onToggle }: ProblemItemProps) => {
         aria-label={t("home:preview.problems_panel.selectProblem")}
       />
       <div className="flex-shrink-0 mt-0.5">
-        <XCircle size={16} className="text-red-500" />
+        {isIncomplete ? (
+          <AlertTriangle size={16} className="text-amber-500" />
+        ) : (
+          <XCircle size={16} className="text-red-500" />
+        )}
       </div>
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2 mb-1">
@@ -145,10 +157,11 @@ const ProblemsSummary = ({
   const { t } = useTranslation(["home", "common"]);
   const { problems } = problemReport;
   const totalErrors = problems.length;
+  const isIncomplete = problemReport.outcome === "incomplete";
 
   // Keep stream hook mounted; actual fix action is provided via onFixSelected
 
-  if (problems.length === 0) {
+  if (problems.length === 0 && !isIncomplete) {
     return (
       <div className="flex flex-col items-center justify-center h-32 text-center">
         <p className="mt-6 text-sm font-medium text-muted-foreground mb-3">
@@ -166,14 +179,21 @@ const ProblemsSummary = ({
   return (
     <div className="flex items-center justify-between px-4 py-3 bg-[var(--background-darkest)] border-b border-border">
       <div className="flex items-center gap-4">
-        {totalErrors > 0 && (
+        {isIncomplete ? (
+          <div className="flex items-center gap-2">
+            <AlertTriangle size={16} className="text-amber-500" />
+            <span className="text-sm font-medium">
+              {t("home:preview.problems_panel.typeCheckIncomplete")}
+            </span>
+          </div>
+        ) : totalErrors > 0 ? (
           <div className="flex items-center gap-2">
             <XCircle size={16} className="text-red-500" />
             <span className="text-sm font-medium">
               {t("home:preview.problems_panel.error", { count: totalErrors })}
             </span>
           </div>
-        )}
+        ) : null}
       </div>
       <div className="flex items-center gap-2">
         <RecheckButton appId={appId} onBeforeRecheck={onClearAll} />
@@ -225,12 +245,14 @@ export function Problems() {
 export function _Problems() {
   const { t } = useTranslation(["home", "common"]);
   const selectedAppId = useAtomValue(selectedAppIdAtom);
-  const { problemReport } = useCheckProblems(selectedAppId);
+  const { problemReport, error } = useCheckProblems(selectedAppId);
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set());
   const problemKey = (p: Problem) =>
     `${p.file}:${p.line}:${p.column}:${p.code}`;
   const { streamMessage } = useStreamChat();
   const [selectedChatId] = useAtom(selectedChatIdAtom);
+  const { selectedMode } = useChatMode(selectedChatId);
+  const isLocalAgentMode = selectedMode === "local-agent";
 
   // Whenever the problems pane is shown or the report updates, select all problems
   useEffect(() => {
@@ -257,6 +279,26 @@ export function _Problems() {
     );
   }
 
+  if (error) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full text-center p-8">
+        <div className="w-16 h-16 rounded-full bg-[var(--background-darkest)] flex items-center justify-center mb-4">
+          <AlertTriangle size={24} className="text-muted-foreground" />
+        </div>
+        <h3 className="text-lg font-medium mb-2">
+          {t("home:preview.problems_panel.noProblemsReportTitle")}
+        </h3>
+        <p className="text-sm text-muted-foreground max-w-md mb-4">
+          {error.message}
+        </p>
+        <RecheckButton
+          appId={selectedAppId}
+          onBeforeRecheck={() => setSelectedKeys(new Set())}
+        />
+      </div>
+    );
+  }
+
   if (!problemReport) {
     return (
       <div className="flex flex-col items-center justify-center h-full text-center p-8">
@@ -279,6 +321,15 @@ export function _Problems() {
 
   return (
     <div className="flex flex-col h-full">
+      {isLocalAgentMode && (
+        <div
+          className="flex items-start gap-2 px-4 py-2 text-xs text-muted-foreground border-b border-border"
+          data-testid="problems-agent-mode-notice"
+        >
+          <Info size={14} className="mt-0.5 flex-shrink-0" />
+          <span>{t("home:preview.problems_panel.agentModeNotice")}</span>
+        </div>
+      )}
       <ProblemsSummary
         problemReport={problemReport}
         appId={selectedAppId}
@@ -314,6 +365,7 @@ export function _Problems() {
               key={selKey}
               problem={problem}
               checked={checked}
+              isIncomplete={problemReport.outcome === "incomplete"}
               onToggle={() => {
                 setSelectedKeys((prev) => {
                   const next = new Set(prev);

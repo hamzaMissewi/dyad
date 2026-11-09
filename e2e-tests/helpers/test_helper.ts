@@ -28,9 +28,8 @@ export {
 // Re-export page objects
 export {
   PageObject,
-  ContextFilesPickerDialog,
-  ProModesDialog,
   GitHubConnector,
+  GitLabConnector,
   ChatActions,
   PreviewPanel,
   CodeEditor,

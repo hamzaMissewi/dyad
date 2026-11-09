@@ -1,5 +1,6 @@
-import { expect, type TestInfo } from "@playwright/test";
+import { expect } from "@playwright/test";
 import { execFileSync } from "node:child_process";
+import { existsSync, rmSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import {
@@ -24,14 +25,19 @@ const SOCKET_FIREWALL_TEST_TIMEOUT = process.env.CI
   ? 360_000
   : Timeout.EXTRA_LONG * 2;
 
-async function configurePackageManagerCache(userDataDir: string) {
+async function configurePackageManagerCache(
+  userDataDir: string,
+  { isolateNpmCache = true }: { isolateNpmCache?: boolean } = {},
+) {
   const npmCacheDir = path.join(userDataDir, "npm-cache");
   const pnpmStoreDir = path.join(userDataDir, "pnpm-store");
 
-  await fs.mkdir(npmCacheDir, { recursive: true });
+  if (isolateNpmCache) {
+    await fs.mkdir(npmCacheDir, { recursive: true });
+    process.env.npm_config_cache = npmCacheDir;
+  }
   await fs.mkdir(pnpmStoreDir, { recursive: true });
 
-  process.env.npm_config_cache = npmCacheDir;
   process.env.npm_config_store_dir = pnpmStoreDir;
   process.env.pnpm_config_store_dir = pnpmStoreDir;
 }
@@ -48,10 +54,12 @@ async function createOldPnpmShim(userDataDir: string) {
     pnpmPath,
     [
       "#!/bin/sh",
-      'if [ "$1" = "--version" ]; then',
-      '  echo "10.15.0"',
-      "  exit 0",
-      "fi",
+      'for arg in "$@"; do',
+      '  if [ "$arg" = "--version" ]; then',
+      '    echo "10.15.0"',
+      "    exit 0",
+      "  fi",
+      "done",
       `exec "${systemPnpmPath}" "$@"`,
       "",
     ].join("\n"),
@@ -72,10 +80,12 @@ async function createUpgradeablePnpmShim(userDataDir: string) {
     pnpmPath,
     [
       "#!/bin/sh",
-      'if [ "$1" = "--version" ]; then',
-      '  echo "${DYAD_TEST_PNPM_VERSION:-10.15.0}"',
-      "  exit 0",
-      "fi",
+      'for arg in "$@"; do',
+      '  if [ "$arg" = "--version" ]; then',
+      '    echo "${DYAD_TEST_PNPM_VERSION:-10.15.0}"',
+      "    exit 0",
+      "  fi",
+      "done",
       `exec "${systemPnpmPath}" "$@"`,
       "",
     ].join("\n"),
@@ -92,6 +102,8 @@ async function createSupportedPnpmShim(userDataDir: string) {
   }).trim();
 
   await fs.mkdir(fakeBinDir, { recursive: true });
+  // reload-env-path accepts customNodePath only when it contains usable Node.
+  await fs.symlink(process.execPath, path.join(fakeBinDir, "node"));
   await fs.writeFile(
     pnpmPath,
     ["#!/bin/sh", `exec "${systemPnpmPath}" "$@"`, ""].join("\n"),
@@ -100,12 +112,55 @@ async function createSupportedPnpmShim(userDataDir: string) {
   process.env.PATH = `${fakeBinDir}${path.delimiter}${process.env.PATH ?? ""}`;
 }
 
-function warmSocketFirewallCache() {
+async function createBlockedFirewallShim(userDataDir: string) {
+  const systemNpxPath = execFileSync("which", ["npx"], {
+    encoding: "utf8",
+  }).trim();
+  const shimPath = path.join(userDataDir, "supported-pnpm-bin", "npx");
+  const markerPath = path.join(userDataDir, "blocked-firewall-invocation.json");
+  // Live verdicts change: axois@0.0.1-security is now allowed by sfw. Exercise
+  // Dyad's blocked-command handling without depending on that external policy.
+  await fs.writeFile(
+    shimPath,
+    [
+      `#!${process.execPath}`,
+      'const { spawnSync } = require("node:child_process");',
+      'const fs = require("node:fs");',
+      "const args = process.argv.slice(2);",
+      'if (args.includes("sfw@2.0.4")) {',
+      '  if (args.includes("--help")) process.exit(0);',
+      '  if (args.includes("pnpm") && args.includes("add") && args.includes("axois")) {',
+      `    fs.writeFileSync(${JSON.stringify(markerPath)}, JSON.stringify(args));`,
+      '    console.error(" - blocked npm package: name: axois; version: 0.0.1-security; reason: malware (critical)");',
+      "    process.exit(1);",
+      "  }",
+      "}",
+      `const result = spawnSync(${JSON.stringify(systemNpxPath)}, args, { stdio: "inherit" });`,
+      "process.exit(result.status ?? 1);",
+      "",
+    ].join("\n"),
+  );
+  await fs.chmod(shimPath, 0o755);
+}
+
+function warmSocketFirewallCache(authMarkerPath: string) {
   const maxAttempts = process.env.CI ? 8 : 5;
+  rmSync(authMarkerPath, { force: true });
   const warmupEnv = {
     ...process.env,
     npm_config_store_dir: undefined,
     pnpm_config_store_dir: undefined,
+    ...(process.env.SFW_GITHUB_TOKEN
+      ? {
+          NODE_OPTIONS: [
+            process.env.NODE_OPTIONS,
+            `--require=${path.resolve("e2e-tests/helpers/github_api_auth_preload.cjs")}`,
+          ]
+            .filter(Boolean)
+            .join(" "),
+          SFW_GITHUB_AUTH_MARKER: authMarkerPath,
+        }
+      : {}),
   };
   let lastError: unknown;
 
@@ -135,6 +190,12 @@ function warmSocketFirewallCache() {
     }
   }
 
+  if (process.env.SFW_GITHUB_TOKEN && !existsSync(authMarkerPath)) {
+    throw new Error(
+      "Socket Firewall warmup failed without authenticating its GitHub API request",
+      { cause: lastError },
+    );
+  }
   throw lastError;
 }
 
@@ -184,12 +245,27 @@ async function restorePackageManagerCache() {
 }
 
 const testSkipIfWindows = testWithConfigSkipIfWindows({
+  testTimeout: SOCKET_FIREWALL_TEST_TIMEOUT,
   preLaunchHook: async ({ userDataDir, fakeLlmPort }) => {
-    await configurePackageManagerCache(userDataDir);
+    await configurePackageManagerCache(userDataDir, { isolateNpmCache: false });
     await createSupportedPnpmShim(userDataDir);
     process.env.DYAD_TEST_PNPM_VERSION = "11.1.2";
     process.env.DYAD_DEFAULT_APPROVE_BUILDS_URL = `http://localhost:${fakeLlmPort}/api/default-approve-builds.txt`;
-    warmSocketFirewallCache();
+    warmSocketFirewallCache(path.join(userDataDir, "sfw-github-authenticated"));
+  },
+  postLaunchHook: restorePackageManagerCache,
+});
+
+const blockedFirewallTestSkipIfWindows = testWithConfigSkipIfWindows({
+  testTimeout: SOCKET_FIREWALL_TEST_TIMEOUT,
+  preLaunchHook: async ({ userDataDir, fakeLlmPort }) => {
+    await configurePackageManagerCache(userDataDir, { isolateNpmCache: false });
+    await createSupportedPnpmShim(userDataDir);
+    // Warm the real fallback before the shim can short-circuit sfw --help.
+    warmSocketFirewallCache(path.join(userDataDir, "sfw-github-authenticated"));
+    await createBlockedFirewallShim(userDataDir);
+    process.env.DYAD_TEST_PNPM_VERSION = "11.1.2";
+    process.env.DYAD_DEFAULT_APPROVE_BUILDS_URL = `http://localhost:${fakeLlmPort}/api/default-approve-builds.txt`;
   },
   postLaunchHook: restorePackageManagerCache,
 });
@@ -217,8 +293,17 @@ const upgradePnpmTestSkipIfWindows = testWithConfigSkipIfWindows({
   postLaunchHook: restorePackageManagerCache,
 });
 
+const realPnpmStrictBuildsTestSkipIfWindows = testWithConfigSkipIfWindows({
+  preLaunchHook: async ({ userDataDir, fakeLlmPort }) => {
+    execFileSync("pnpm", ["--version"], { encoding: "utf8" });
+    await configurePackageManagerCache(userDataDir);
+    process.env.DYAD_DEFAULT_APPROVE_BUILDS_URL = `http://localhost:${fakeLlmPort}/api/default-approve-builds.txt`;
+  },
+  postLaunchHook: restorePackageManagerCache,
+});
+
 async function openMinimalBuildChat(po: PageObject) {
-  await po.setUp();
+  await po.setUp({ autoApprove: true });
   await po.page.evaluate(
     async (nodeBinDir) => {
       await (window as any).electron.ipcRenderer.invoke("set-user-settings", {
@@ -252,34 +337,74 @@ async function openMinimalBuildChat(po: PageObject) {
   };
 }
 
-function extendSocketFirewallTestTimeout(testInfo: TestInfo) {
-  testInfo.setTimeout(SOCKET_FIREWALL_TEST_TIMEOUT);
+async function getCurrentAppId(po: PageObject): Promise<number> {
+  const appPath = await po.appManagement.getCurrentAppPath();
+  const currentAppName = await po.appManagement.getCurrentAppName();
+  const apps = await po.page.evaluate(async () => {
+    return (window as any).electron.ipcRenderer.invoke("list-apps", undefined);
+  });
+  const matchingApp = apps.apps.find(
+    (app: { id: number; name: string; resolvedPath?: string }) =>
+      app.resolvedPath === appPath || app.name === currentAppName,
+  );
+  if (!matchingApp) {
+    throw new Error(`Could not find current app ${currentAppName}`);
+  }
+  return matchingApp.id;
 }
 
-async function clickApproveProposal(po: PageObject) {
-  const approveButton = po.page.getByTestId("approve-proposal-button").last();
-  await expect(approveButton).toBeEnabled({ timeout: Timeout.MEDIUM });
-  await approveButton.click();
-  await expect(approveButton).toBeDisabled({ timeout: Timeout.MEDIUM });
+async function addLocalDependencyWithIgnoredBuild(appPath: string) {
+  const dependencyDir = path.join(appPath, "packages", "fake-build-dep");
+  await fs.mkdir(dependencyDir, { recursive: true });
+  await fs.writeFile(
+    path.join(dependencyDir, "package.json"),
+    `${JSON.stringify(
+      {
+        name: "fake-build-dep",
+        version: "1.0.0",
+        scripts: {
+          postinstall: "node postinstall.js",
+        },
+      },
+      null,
+      2,
+    )}\n`,
+  );
+  await fs.writeFile(
+    path.join(dependencyDir, "postinstall.js"),
+    [
+      'require("node:fs").writeFileSync(',
+      '  require("node:path").join(__dirname, "postinstall-ran.txt"),',
+      '  "yes",',
+      ");",
+      "",
+    ].join("\n"),
+  );
+
+  const packageJsonPath = path.join(appPath, "package.json");
+  const packageJson = JSON.parse(await fs.readFile(packageJsonPath, "utf8"));
+  packageJson.dependencies = {
+    ...packageJson.dependencies,
+    "fake-build-dep": "file:./packages/fake-build-dep",
+  };
+  await fs.writeFile(
+    packageJsonPath,
+    `${JSON.stringify(packageJson, null, 2)}\n`,
+  );
 }
 
 testSkipIfWindows(
   "build mode - safe npm package installs through the real socket firewall path",
-  async ({ po }, testInfo) => {
-    extendSocketFirewallTestTimeout(testInfo);
-
+  async ({ po }) => {
     const { packageJsonPath, pnpmLockPath, pnpmWorkspacePath } =
       await openMinimalBuildChat(po);
     const initialPackageJson = await fs.readFile(packageJsonPath, "utf8");
     const initialPnpmLock = await fs.readFile(pnpmLockPath, "utf8");
     await fs.rm(pnpmWorkspacePath, { force: true });
 
-    await po.sendPrompt("tc=add-safe-dependency");
-    await expect(po.page.getByTestId("approve-proposal-button")).toBeVisible({
-      timeout: Timeout.LONG,
+    await po.sendPrompt("tc=add-safe-dependency", {
+      timeout: Timeout.EXTRA_LONG,
     });
-
-    await clickApproveProposal(po);
     await expect(async () => {
       const packageJson = JSON.parse(
         await fs.readFile(packageJsonPath, "utf8"),
@@ -313,24 +438,19 @@ testSkipIfWindows(
   },
 );
 
-testSkipIfWindows(
-  "build mode - blocked unsafe npm package shows the real socket verdict and preserves app files",
-  async ({ po }, testInfo) => {
-    extendSocketFirewallTestTimeout(testInfo);
-
+blockedFirewallTestSkipIfWindows(
+  "build mode - blocked unsafe npm package shows the socket verdict and preserves app files",
+  async ({ po }) => {
     const { packageJsonPath, pnpmLockPath } = await openMinimalBuildChat(po);
     const initialPackageJson = await fs.readFile(packageJsonPath, "utf8");
     const initialPnpmLock = await fs.readFile(pnpmLockPath, "utf8");
 
-    await po.sendPrompt("tc=add-unsafe-dependency");
-    await expect(po.page.getByTestId("approve-proposal-button")).toBeVisible({
-      timeout: Timeout.LONG,
+    await po.sendPrompt("tc=add-unsafe-dependency", {
+      timeout: Timeout.EXTRA_LONG,
     });
 
-    await clickApproveProposal(po);
-
     const errorCard = po.page.getByRole("button", {
-      name: /Failed to add dependencies: axois\./i,
+      name: /Tool 'add_dependency' failed:.*blocked npm package.*axois/i,
     });
     await expect(errorCard).toBeVisible({
       timeout: SOCKET_FIREWALL_VERDICT_TIMEOUT,
@@ -346,6 +466,16 @@ testSkipIfWindows(
     await expect(errorCard).toContainText(/malware/i, {
       timeout: Timeout.MEDIUM,
     });
+
+    const invocation = JSON.parse(
+      await fs.readFile(
+        path.join(po.userDataDir, "blocked-firewall-invocation.json"),
+        "utf8",
+      ),
+    );
+    expect(invocation).toEqual(
+      expect.arrayContaining(["sfw@2.0.4", "pnpm", "add", "axois"]),
+    );
 
     expect(await fs.readFile(packageJsonPath, "utf8")).toBe(initialPackageJson);
     expect(await fs.readFile(pnpmLockPath, "utf8")).toBe(initialPnpmLock);
@@ -474,5 +604,128 @@ upgradePnpmTestSkipIfWindows(
     });
     await po.previewPanel.expectPreviewIframeIsVisible(Timeout.EXTRA_LONG);
     await expect(warningBanner).toBeHidden({ timeout: Timeout.MEDIUM });
+  },
+);
+
+realPnpmStrictBuildsTestSkipIfWindows(
+  "custom pnpm install auto-denies ignored builds and recovers preview",
+  async ({ po }, testInfo) => {
+    testInfo.setTimeout(SOCKET_FIREWALL_TEST_TIMEOUT);
+
+    await po.setUp();
+    await po.importApp("minimal");
+    await po.previewPanel.expectPreviewIframeIsVisible(
+      SOCKET_FIREWALL_TEST_TIMEOUT,
+    );
+
+    const appPath = await po.appManagement.getCurrentAppPath();
+    const appId = await getCurrentAppId(po);
+    await addLocalDependencyWithIgnoredBuild(appPath);
+
+    await po.page.evaluate(
+      async ({ appId }) => {
+        await (window as any).electron.ipcRenderer.invoke(
+          "update-app-commands",
+          {
+            appId,
+            installCommand:
+              "pnpm --config.strictDepBuilds=true install --no-frozen-lockfile",
+            startCommand: "pnpm run dev -- --host 127.0.0.1",
+          },
+        );
+      },
+      { appId },
+    );
+
+    await po.previewPanel.clickRebuild();
+    await expect(po.previewPanel.locateLoadingAppPreview()).toBeVisible({
+      timeout: Timeout.MEDIUM,
+    });
+    await po.previewPanel.expectPreviewIframeIsVisible(
+      SOCKET_FIREWALL_TEST_TIMEOUT,
+    );
+
+    const pnpmWorkspaceConfig = await fs.readFile(
+      path.join(appPath, "pnpm-workspace.yaml"),
+      "utf8",
+    );
+    expect(pnpmWorkspaceConfig).toContain(
+      "fake-build-dep: false # dyad-auto-denied",
+    );
+    await expect(async () => {
+      const modulesConfig = await fs.readFile(
+        path.join(appPath, "node_modules", ".modules.yaml"),
+        "utf8",
+      );
+      expect(modulesConfig).not.toContain(
+        "fake-build-dep@file:packages/fake-build-dep",
+      );
+    }).toPass({ timeout: Timeout.EXTRA_LONG });
+  },
+);
+
+realPnpmStrictBuildsTestSkipIfWindows(
+  "pnpm version migration upgrade updates the pin and lockfile together",
+  async ({ po }, testInfo) => {
+    testInfo.setTimeout(SOCKET_FIREWALL_TEST_TIMEOUT);
+
+    await po.setUp();
+    await po.importApp("minimal");
+    await po.previewPanel.expectPreviewIframeIsVisible(
+      SOCKET_FIREWALL_TEST_TIMEOUT,
+    );
+
+    const appPath = await po.appManagement.getCurrentAppPath();
+    const packageJsonPath = path.join(appPath, "package.json");
+    const packageJson = JSON.parse(await fs.readFile(packageJsonPath, "utf8"));
+    // An old pin contradicts the managed pnpm: CI/deploys following it cannot
+    // read the 9.0 lockfile Dyad writes. This is the migration trigger.
+    packageJson.packageManager = "pnpm@8.15.9";
+    await fs.writeFile(
+      packageJsonPath,
+      `${JSON.stringify(packageJson, null, 2)}\n`,
+    );
+
+    await po.clickRestart();
+    await expect(po.previewPanel.locateLoadingAppPreview()).toBeVisible({
+      timeout: Timeout.MEDIUM,
+    });
+
+    const warningBanner = po.page.getByTestId("package-manager-warning-banner");
+    await expect(warningBanner).toContainText("This app pins an older pnpm", {
+      timeout: Timeout.EXTRA_LONG,
+    });
+    await warningBanner
+      .getByTestId("package-manager-warning-run-upgrade")
+      .click();
+    await expect(po.previewPanel.locateLoadingAppPreview()).toBeVisible({
+      timeout: Timeout.MEDIUM,
+    });
+    await po.previewPanel.expectPreviewIframeIsVisible(
+      SOCKET_FIREWALL_TEST_TIMEOUT,
+    );
+    await expect(
+      po.page.getByTestId("package-manager-warning-banner"),
+    ).toBeHidden({
+      timeout: Timeout.MEDIUM,
+    });
+
+    const migratedPackageJson = JSON.parse(
+      await fs.readFile(packageJsonPath, "utf8"),
+    );
+    expect(migratedPackageJson.packageManager).toMatch(/^pnpm@(9|\d{2,})\./);
+
+    const lockfile = await fs.readFile(
+      path.join(appPath, "pnpm-lock.yaml"),
+      "utf8",
+    );
+    expect(lockfile).toContain("lockfileVersion: '9.0'");
+
+    const lastCommitSubject = execFileSync(
+      "git",
+      ["log", "-1", "--format=%s"],
+      { cwd: appPath, encoding: "utf8" },
+    ).trim();
+    expect(lastCommitSubject).toContain("migrate to pnpm");
   },
 );

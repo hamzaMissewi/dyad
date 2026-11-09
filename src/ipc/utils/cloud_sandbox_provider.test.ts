@@ -3,11 +3,9 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-const { commitPnpmAllowBuildsConfigIfChangedMock, gitIsIgnoredIsoMock } =
-  vi.hoisted(() => ({
-    commitPnpmAllowBuildsConfigIfChangedMock: vi.fn(),
-    gitIsIgnoredIsoMock: vi.fn(),
-  }));
+const { commitPnpmAllowBuildsConfigIfChangedMock } = vi.hoisted(() => ({
+  commitPnpmAllowBuildsConfigIfChangedMock: vi.fn(),
+}));
 
 vi.mock("@/main/settings", () => ({
   readSettings: () => ({
@@ -23,10 +21,6 @@ vi.mock("@/main/settings", () => ({
 
 vi.mock("./test_utils", () => ({
   IS_TEST_BUILD: true,
-}));
-
-vi.mock("./git_utils", () => ({
-  gitIsIgnoredIso: gitIsIgnoredIsoMock,
 }));
 
 vi.mock("@/ipc/utils/socket_firewall", async () => {
@@ -112,8 +106,6 @@ describe("cloud_sandbox_provider incremental sync", () => {
 
   beforeEach(async () => {
     vi.useFakeTimers();
-    gitIsIgnoredIsoMock.mockReset();
-    gitIsIgnoredIsoMock.mockResolvedValue(false);
     appPath = await fs.mkdtemp(path.join(os.tmpdir(), "dyad-cloud-sync-"));
     fetchMock = vi.fn(async () => {
       return new Response(
@@ -275,18 +267,15 @@ describe("cloud_sandbox_provider incremental sync", () => {
       path.join(appPath, "symlink-target.ts"),
       path.join(appPath, "linked.ts"),
     );
-
-    gitIsIgnoredIsoMock.mockImplementation(async ({ filepath }) => {
-      return (
-        filepath === ".env" ||
-        filepath === ".env.local" ||
-        filepath === "ignored.ts" ||
-        filepath === "ignored-dir" ||
-        filepath === "nested/.env.local"
-      );
-    });
+    await fs.writeFile(
+      path.join(appPath, ".gitignore"),
+      ".env\n.env.local\nignored.ts\nignored-dir/\nnested/.env.local\n",
+    );
 
     await expect(buildCloudSandboxFileMap(appPath)).resolves.toEqual({
+      ".gitignore": Buffer.from(
+        ".env\n.env.local\nignored.ts\nignored-dir/\nnested/.env.local\n",
+      ),
       ".env": Buffer.from("ROOT_ENV=1"),
       ".env.local": Buffer.from("ROOT_ENV_LOCAL=1"),
       "symlink-target.ts": Buffer.from("outside"),
@@ -298,19 +287,34 @@ describe("cloud_sandbox_provider incremental sync", () => {
     await fs.writeFile(path.join(appPath, "changed.ts"), "updated");
     await fs.writeFile(path.join(appPath, ".env.local"), "SAFE_ENV=1");
     await fs.writeFile(path.join(appPath, "ignored.ts"), "ignored");
+    await fs.mkdir(path.join(appPath, "private"));
+    await fs.writeFile(
+      path.join(appPath, "private", ".gitignore"),
+      "!credentials.ts\n",
+    );
+    await fs.writeFile(
+      path.join(appPath, "private", "credentials.ts"),
+      "secret",
+    );
     await fs.writeFile(path.join(appPath, "symlink-target.ts"), "target");
     await fs.symlink(
       path.join(appPath, "symlink-target.ts"),
       path.join(appPath, "linked.ts"),
     );
-
-    gitIsIgnoredIsoMock.mockImplementation(async ({ filepath }) => {
-      return filepath === ".env.local" || filepath === "ignored.ts";
-    });
+    await fs.writeFile(
+      path.join(appPath, ".gitignore"),
+      ".env.local\nignored.ts\nprivate/\n",
+    );
 
     await syncCloudSandboxDirtyPaths({
       appId: 1,
-      changedPaths: ["changed.ts", ".env.local", "ignored.ts", "linked.ts"],
+      changedPaths: [
+        "changed.ts",
+        ".env.local",
+        "ignored.ts",
+        "private/credentials.ts",
+        "linked.ts",
+      ],
     });
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
@@ -318,7 +322,7 @@ describe("cloud_sandbox_provider incremental sync", () => {
     const upload = await parseMultipartUpload(init);
     expect(upload.manifest).toEqual({
       replaceAll: false,
-      deletedFiles: ["ignored.ts", "linked.ts"],
+      deletedFiles: ["ignored.ts", "linked.ts", "private/credentials.ts"],
       files: [
         {
           path: ".env.local",
@@ -429,9 +433,12 @@ describe("cloud_sandbox_provider incremental sync", () => {
       appId: 1,
       changedPaths: ["first.ts"],
     });
-    await new Promise((resolve) => setTimeout(resolve, 350));
-
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.waitFor(
+      () => {
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+      },
+      { timeout: 2_000 },
+    );
 
     queueCloudSandboxSnapshotSync({
       appId: 1,
@@ -439,9 +446,12 @@ describe("cloud_sandbox_provider incremental sync", () => {
     });
 
     resolveFirstUpload?.(makeUploadResponse());
-    await new Promise((resolve) => setTimeout(resolve, 350));
-
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await vi.waitFor(
+      () => {
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+      },
+      { timeout: 2_000 },
+    );
 
     const [, secondInit] = fetchMock.mock.calls[1];
     const upload = await parseMultipartUpload(secondInit);
@@ -474,24 +484,30 @@ describe("cloud_sandbox_provider incremental sync", () => {
       changedPaths: ["src.ts"],
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 350));
-
-    expect(syncUpdateListener).toHaveBeenCalledWith({
-      appId: 1,
-      errorMessage: "Cloud sandbox sync failed: network down",
-    });
+    await vi.waitFor(
+      () => {
+        expect(syncUpdateListener).toHaveBeenCalledWith({
+          appId: 1,
+          errorMessage: "Cloud sandbox sync failed: network down",
+        });
+      },
+      { timeout: 2_000 },
+    );
 
     queueCloudSandboxSnapshotSync({
       appId: 1,
       changedPaths: ["src.ts"],
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 350));
-
-    expect(syncUpdateListener).toHaveBeenLastCalledWith({
-      appId: 1,
-      errorMessage: null,
-    });
+    await vi.waitFor(
+      () => {
+        expect(syncUpdateListener).toHaveBeenLastCalledWith({
+          appId: 1,
+          errorMessage: null,
+        });
+      },
+      { timeout: 2_000 },
+    );
   });
 });
 
@@ -501,6 +517,9 @@ describe("cloud_sandbox_provider sandbox creation", () => {
 
   beforeEach(() => {
     commitPnpmAllowBuildsConfigIfChangedMock.mockReset();
+    commitPnpmAllowBuildsConfigIfChangedMock.mockResolvedValue({
+      promotedPackages: [],
+    });
     fetchMock = vi.fn(async () => {
       return new Response(
         JSON.stringify({
@@ -541,6 +560,28 @@ describe("cloud_sandbox_provider sandbox creation", () => {
     expect(commitPnpmAllowBuildsConfigIfChangedMock).toHaveBeenCalledWith(
       "/tmp/app",
     );
+  });
+
+  it("rebuilds promoted pnpm builds in the default install command", async () => {
+    commitPnpmAllowBuildsConfigIfChangedMock.mockResolvedValue({
+      promotedPackages: ["core-js", "@scope/native"],
+    });
+
+    await createCloudSandbox({
+      appId: 42,
+      appPath: "/tmp/app",
+      installCommand: null,
+      startCommand: undefined,
+    });
+
+    const [, init] = fetchMock.mock.calls[0];
+    expect(JSON.parse(String(init?.body))).toEqual({
+      appId: 42,
+      appPath: "/tmp/app",
+      installCommand:
+        "pnpm --config.pm-on-fail=ignore --config.confirmModulesPurge=false --config.strictDepBuilds=false install && (pnpm rebuild core-js @scope/native || echo pnpm rebuild skipped)",
+      startCommand: "pnpm --config.pm-on-fail=ignore run dev",
+    });
   });
 
   it("preserves explicit custom commands after trimming", async () => {

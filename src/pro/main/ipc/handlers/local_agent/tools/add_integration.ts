@@ -1,9 +1,8 @@
 import { z } from "zod";
-import crypto from "node:crypto";
 import log from "electron-log";
 import { ToolDefinition, AgentContext, escapeXmlAttr } from "./types";
-import { safeSend } from "@/ipc/utils/safe_sender";
-import { integrationResolver } from "../userInputResolvers";
+import { userInputRegistry } from "@/user_input/main";
+import { getGitStateFingerprint } from "@/ipc/utils/git_utils";
 
 const logger = log.scope("add_integration");
 
@@ -21,7 +20,7 @@ export const addIntegrationTool: ToolDefinition<
 > = {
   name: "add_integration",
   description:
-    "Prompt the user to choose and set up a database provider for the app. Do NOT set the provider parameter unless the user explicitly names a specific provider (e.g. 'Supabase' or 'Neon') in their message. The tool blocks until the user finishes the setup inside the chat and clicks Continue, then returns; you should then proceed with the next step.",
+    "Prompt the user to choose and set up a database provider for the app. Do NOT set the provider parameter unless the user explicitly names a specific provider (e.g. 'Supabase' or 'Neon') in their message. The tool blocks until the user finishes the setup and clicks Continue or chooses to skip it, then returns; you should then proceed with the next step.",
   inputSchema: addIntegrationSchema,
   defaultConsent: "always",
   modifiesState: true,
@@ -29,38 +28,106 @@ export const addIntegrationTool: ToolDefinition<
 
   getConsentPreview: () => "Add database integration",
 
+  shouldTrackMutation: (_args, result) =>
+    !result.startsWith("The user dismissed the integration setup") &&
+    (!result.startsWith("The user skipped the integration setup") ||
+      result.includes("Git-visible workspace")),
+  shouldTrackFileMutation: (_args, result) =>
+    result.includes("Git-visible workspace files changed during setup.") ||
+    result.includes(
+      "Git-visible workspace file state could not be determined during setup.",
+    ),
+
   buildXml: (args, _isComplete) => {
+    // Persist the interactive card before execute() parks so reloads and
+    // cross-window tab transfers can reconstruct the pending request. A
+    // terminal outcome is appended after settlement; the renderer hides this
+    // pending card once its request is no longer live.
     if (args.provider && args.provider !== "none") {
-      return `<dyad-add-integration provider="${escapeXmlAttr(args.provider)}"></dyad-add-integration>`;
+      return `<dyad-add-integration provider="${escapeXmlAttr(args.provider)}" outcome="pending"></dyad-add-integration>`;
     }
-    return `<dyad-add-integration></dyad-add-integration>`;
+    return `<dyad-add-integration outcome="pending"></dyad-add-integration>`;
   },
 
   execute: async (args, ctx: AgentContext) => {
-    const requestId = `integration:${crypto.randomUUID()}`;
+    let beforeFingerprint: string | undefined;
+    let fingerprintUnknown = false;
+    try {
+      beforeFingerprint = await getGitStateFingerprint(
+        ctx.appPath,
+        ctx.abortSignal,
+      );
+    } catch (error) {
+      fingerprintUnknown = true;
+      logger.warn(
+        "Could not fingerprint Git state before integration setup:",
+        error,
+      );
+    }
     const provider =
       args.provider && args.provider !== "none" ? args.provider : undefined;
+    const requestId = userInputRegistry.request({
+      kind: "integration",
+      chatId: ctx.chatId,
+      provider,
+      classifier: "none",
+      followUpPrompt: `Continue. I have completed the ${provider ?? "database"} integration.`,
+    });
 
     logger.log(
       `Presenting integration setup (provider: ${provider ?? "user-choice"}), requestId: ${requestId}`,
     );
 
-    safeSend(ctx.event.sender, "integration:prompt", {
-      chatId: ctx.chatId,
-      requestId,
-      provider,
-    });
+    const result = await userInputRegistry.park(requestId, ctx.abortSignal);
 
-    const result = await integrationResolver.wait(
-      requestId,
-      ctx.chatId,
-      ctx.abortSignal,
-    );
-
-    if (!result) {
+    if (
+      result?.kind !== "integration" ||
+      (result.completed && !result.provider)
+    ) {
+      ctx.onXmlComplete(
+        `<dyad-add-integration outcome="dismissed"></dyad-add-integration>`,
+      );
       return "The user dismissed the integration setup without completing it. Ask them how they'd like to proceed.";
     }
 
-    return `User completed the ${result.provider} integration. You can now continue with the next step.`;
+    let afterFingerprint: string | undefined;
+    try {
+      afterFingerprint = await getGitStateFingerprint(
+        ctx.appPath,
+        ctx.abortSignal,
+      );
+    } catch (error) {
+      fingerprintUnknown = true;
+      logger.warn(
+        "Could not fingerprint Git state after integration setup:",
+        error,
+      );
+    }
+    const gitVisibleFilesChanged =
+      beforeFingerprint !== undefined &&
+      afterFingerprint !== undefined &&
+      beforeFingerprint !== afterFingerprint;
+
+    const mutationNote = fingerprintUnknown
+      ? " Git-visible workspace file state could not be determined during setup."
+      : gitVisibleFilesChanged
+        ? " Git-visible workspace files changed during setup."
+        : "";
+    if (!result.completed && result.provider === null) {
+      ctx.onXmlComplete(
+        `<dyad-add-integration outcome="skipped"></dyad-add-integration>`,
+      );
+      return `The user skipped the integration setup.${mutationNote} Continue the original task without Supabase or Neon, and do not prompt for a database integration again in this continuation.`;
+    }
+    if (!result.completed || !result.provider) {
+      ctx.onXmlComplete(
+        `<dyad-add-integration outcome="dismissed"></dyad-add-integration>`,
+      );
+      return "The user dismissed the integration setup without completing it. Ask them how they'd like to proceed.";
+    }
+    ctx.onXmlComplete(
+      `<dyad-add-integration provider="${escapeXmlAttr(result.provider)}" outcome="completed"></dyad-add-integration>`,
+    );
+    return `User completed the ${result.provider} integration.${mutationNote} You can now continue with the next step.`;
   },
 };

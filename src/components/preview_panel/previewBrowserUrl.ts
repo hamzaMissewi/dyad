@@ -1,6 +1,9 @@
+import { isAppPreviewHostname } from "../../../shared/preview_hostname";
+
 export async function resolvePreviewBrowserUrl(input: {
   isCloudMode: boolean;
   selectedAppId: number | null;
+  appUrl: string | null | undefined;
   originalUrl: string | null | undefined;
   createCloudSandboxShareLink: (params: {
     appId: number;
@@ -17,9 +20,18 @@ export async function resolvePreviewBrowserUrl(input: {
     return shareLink.url;
   }
 
-  if (!input.originalUrl) {
+  if (!input.appUrl) {
     throw new Error("Preview URL is unavailable.");
   }
 
-  return input.originalUrl;
+  if (isAppPreviewHostname(new URL(input.appUrl).hostname)) {
+    // The app-specific proxy rejects localhost on its port. Open the underlying
+    // dev server so external browsers use a regular localhost origin.
+    if (!input.originalUrl) {
+      throw new Error("Dev server URL is unavailable.");
+    }
+    return input.originalUrl;
+  }
+
+  return input.appUrl;
 }

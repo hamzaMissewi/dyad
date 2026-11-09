@@ -1,28 +1,42 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
-import { safeStorage } from "electron";
+import { app, safeStorage } from "electron";
 import {
   readSettings,
   resolveEffectiveSettings,
   readEffectiveSettings,
   getSettingsFilePath,
+  recordRendererCrash,
+  readRendererCrashRecord,
   writeSettings,
   tryWriteSettings,
   encrypt,
   decrypt,
   notifyRendererErrorToastListenerReady,
   writeCrashSentinel,
+  claimCrashSentinel,
   setSentinelActiveChat,
   readCrashSentinel,
+  rewriteRecoveredSafeStorageSecretsAfterKeychainUnlock,
 } from "@/main/settings";
 import { getUserDataPath } from "@/paths/paths";
-import { UserSettings } from "@/lib/schemas";
+import { forgottenCoolify, UserSettings } from "@/lib/schemas";
 import { DyadError, DyadErrorKind } from "@/errors/dyad_error";
 import { getRemoteDesktopConfig } from "@/ipc/shared/remote_desktop_config";
+import {
+  getRecoveryStats,
+  recoverLegacySafeStorageSecret,
+} from "@/main/safe_storage_legacy";
 import { ZodError } from "zod";
 
 const mockSend = vi.fn();
+const testBuildState = vi.hoisted(() => ({ value: false }));
+vi.mock("@/ipc/utils/test_utils", () => ({
+  get IS_TEST_BUILD() {
+    return testBuildState.value;
+  },
+}));
 const mockWebContents = {
   send: mockSend,
 } as unknown as Parameters<typeof notifyRendererErrorToastListenerReady>[0];
@@ -36,6 +50,9 @@ vi.mock("node:path");
 vi.mock("electron", () => ({
   app: {
     on: vi.fn(),
+    // Legacy safeStorage recovery is gated on app readiness; default to ready so
+    // recovery-path tests exercise it. Individual tests override as needed.
+    isReady: vi.fn(() => true),
   },
   BrowserWindow: {
     fromWebContents: vi.fn(() => mockWindow),
@@ -43,6 +60,7 @@ vi.mock("electron", () => ({
   },
   safeStorage: {
     isEncryptionAvailable: vi.fn(),
+    encryptString: vi.fn(),
     decryptString: vi.fn(),
   },
 }));
@@ -51,6 +69,12 @@ vi.mock("@/paths/paths", () => ({
 }));
 vi.mock("@/ipc/shared/remote_desktop_config", () => ({
   getRemoteDesktopConfig: vi.fn(),
+}));
+// settings.ts falls back to legacy Keychain recovery when a secret fails to
+// decrypt; unit tests must never shell out to the real `security` CLI.
+vi.mock("@/main/safe_storage_legacy", () => ({
+  getRecoveryStats: vi.fn(() => ({ attempted: 0, recovered: 0, failed: 0 })),
+  recoverLegacySafeStorageSecret: vi.fn(() => null),
 }));
 
 const mockFs = vi.mocked(fs);
@@ -89,27 +113,41 @@ describe("readSettings", () => {
       expect(scrubSettings(result)).toMatchInlineSnapshot(`
         {
           "autoApproveNonSchemaSql": true,
+          "autoApproveSafeMcpTools": true,
           "autoExpandPreviewPanel": true,
+          "autoFixReviewIssues": false,
+          "chatgptFastMode": false,
           "disablePreviewNodeAutoInstall": false,
+          "disableSandboxedE2eTests": false,
+          "enableAdvancedSubagents": false,
           "enableAppBlueprint": true,
-          "enableAutoFixProblems": false,
+          "enableAutoReview": false,
           "enableAutoUpdate": true,
+          "enableClaudeCodeSubscription": false,
           "enableCodeExplorer": true,
           "enableContextCompaction": true,
+          "enableExplorerSubagent": true,
+          "enableImplementerSubagent": false,
           "enableMcpToolSearch": true,
-          "enableNativeGit": true,
+          "enableMultiWindow": false,
+          "enableNeonBranchProtection": true,
           "enablePnpmMinimumReleaseAgeWarning": true,
+          "enablePreviewCookieIsolation": true,
           "enableProLazyEditsMode": true,
           "enableProSmartFilesContextMode": true,
+          "enableReviewButton": false,
           "enableSandboxScriptExecution": true,
+          "enableTestingForNewApps": false,
           "experiments": {},
           "hasRunBefore": false,
           "isRunning": false,
           "lastKnownPerformance": undefined,
+          "maxConcurrentTestRuns": 2,
           "nodeRuntimePreference": "system",
           "previewIdleTimeoutPolicy": "default",
           "providerSettings": {},
           "releaseChannel": "stable",
+          "runTypeScriptForWholeProject": false,
           "selectedChatMode": "build",
           "selectedModel": {
             "name": "auto",
@@ -117,6 +155,7 @@ describe("readSettings", () => {
           },
           "selectedTemplateId": "react",
           "selectedThemeId": "default",
+          "showSystemResourceUsage": true,
           "telemetryConsent": "unset",
           "telemetryUserId": "[scrubbed]",
         }
@@ -154,6 +193,26 @@ describe("readSettings", () => {
       expect(result.blockUnsafeNpmPackages).toBeUndefined();
       expect(result.enableAutoUpdate).toBe(true);
       expect(result.releaseChannel).toBe("stable");
+      expect(result.autoApproveSafeMcpTools).toBe(true);
+      expect(result.enablePreviewCookieIsolation).toBe(true);
+    });
+
+    it("preserves an explicit opt-out of preview cookie isolation", () => {
+      mockFs.existsSync.mockReturnValue(true);
+      mockFs.readFileSync.mockReturnValue(
+        JSON.stringify({ enablePreviewCookieIsolation: false }),
+      );
+
+      expect(readSettings().enablePreviewCookieIsolation).toBe(false);
+    });
+
+    it("preserves an explicit opt-out of safe MCP auto-approval", () => {
+      mockFs.existsSync.mockReturnValue(true);
+      mockFs.readFileSync.mockReturnValue(
+        JSON.stringify({ autoApproveSafeMcpTools: false }),
+      );
+
+      expect(readSettings().autoApproveSafeMcpTools).toBe(false);
     });
 
     it("should treat existing settings files without hasRunBefore as already run", () => {
@@ -492,6 +551,23 @@ describe("readSettings", () => {
       expect(result.enableAutoUpdate).toBe(true);
       expect(result.releaseChannel).toBe("stable");
     });
+
+    it("should remove the deprecated auto-fix problems setting", () => {
+      mockFs.existsSync.mockReturnValue(true);
+      mockFs.readFileSync.mockReturnValue(
+        JSON.stringify({
+          selectedModel: {
+            name: "gpt-4",
+            provider: "openai",
+          },
+          enableAutoFixProblems: true,
+        }),
+      );
+
+      const result = readSettings();
+
+      expect(result).not.toHaveProperty("enableAutoFixProblems");
+    });
   });
 
   describe("error handling", () => {
@@ -506,27 +582,41 @@ describe("readSettings", () => {
       expect(scrubSettings(result)).toMatchInlineSnapshot(`
         {
           "autoApproveNonSchemaSql": true,
+          "autoApproveSafeMcpTools": true,
           "autoExpandPreviewPanel": true,
+          "autoFixReviewIssues": false,
+          "chatgptFastMode": false,
           "disablePreviewNodeAutoInstall": false,
+          "disableSandboxedE2eTests": false,
+          "enableAdvancedSubagents": false,
           "enableAppBlueprint": true,
-          "enableAutoFixProblems": false,
+          "enableAutoReview": false,
           "enableAutoUpdate": true,
+          "enableClaudeCodeSubscription": false,
           "enableCodeExplorer": true,
           "enableContextCompaction": true,
+          "enableExplorerSubagent": true,
+          "enableImplementerSubagent": false,
           "enableMcpToolSearch": true,
-          "enableNativeGit": true,
+          "enableMultiWindow": false,
+          "enableNeonBranchProtection": true,
           "enablePnpmMinimumReleaseAgeWarning": true,
+          "enablePreviewCookieIsolation": true,
           "enableProLazyEditsMode": true,
           "enableProSmartFilesContextMode": true,
+          "enableReviewButton": false,
           "enableSandboxScriptExecution": true,
+          "enableTestingForNewApps": false,
           "experiments": {},
           "hasRunBefore": false,
           "isRunning": false,
           "lastKnownPerformance": undefined,
+          "maxConcurrentTestRuns": 2,
           "nodeRuntimePreference": "system",
           "previewIdleTimeoutPolicy": "default",
           "providerSettings": {},
           "releaseChannel": "stable",
+          "runTypeScriptForWholeProject": false,
           "selectedChatMode": "build",
           "selectedModel": {
             "name": "auto",
@@ -534,6 +624,7 @@ describe("readSettings", () => {
           },
           "selectedTemplateId": "react",
           "selectedThemeId": "default",
+          "showSystemResourceUsage": true,
           "telemetryConsent": "unset",
           "telemetryUserId": "[scrubbed]",
         }
@@ -819,6 +910,34 @@ describe("writeSettings", () => {
     );
   });
 
+  it("preserves the legacy Build-mode MCP setting across unrelated writes", () => {
+    mockFs.existsSync.mockReturnValue(true);
+    mockFs.readFileSync.mockReturnValue(
+      JSON.stringify({
+        providerSettings: {},
+        selectedModel: {
+          name: "gpt-4",
+          provider: "openai",
+        },
+        selectedTemplateId: "react",
+        enableAutoUpdate: true,
+        releaseChannel: "stable",
+        enableMcpServersForBuildMode: true,
+      }),
+    );
+
+    writeSettings({ enableAutoUpdate: false });
+
+    const tempFileWrite = mockFs.writeFileSync.mock.calls.find(([filePath]) =>
+      String(filePath).startsWith(`${mockSettingsPath}.tmp-`),
+    );
+    expect(tempFileWrite).toBeDefined();
+    expect(JSON.parse(String(tempFileWrite?.[1]))).toMatchObject({
+      enableAutoUpdate: false,
+      enableMcpServersForBuildMode: true,
+    });
+  });
+
   it("throws a classified error when the settings file cannot be written", () => {
     mockFs.existsSync.mockReturnValue(false);
     mockFs.writeFileSync.mockImplementation(() => {
@@ -871,6 +990,47 @@ describe("writeSettings", () => {
 });
 
 describe("encrypt", () => {
+  afterEach(() => {
+    testBuildState.value = false;
+    vi.unstubAllEnvs();
+  });
+
+  it("uses real encrypted writes when the Keychain suite opts in", () => {
+    testBuildState.value = true;
+    vi.stubEnv("DYAD_E2E_REAL_ENCRYPTION", "true");
+    mockSafeStorage.isEncryptionAvailable.mockReturnValue(true);
+    mockSafeStorage.encryptString.mockReturnValue(Buffer.from("ciphertext"));
+
+    expect(encrypt("  synthetic-token\n")).toEqual({
+      value: Buffer.from("ciphertext").toString("base64"),
+      encryptionType: "electron-safe-storage",
+    });
+    expect(mockSafeStorage.encryptString).toHaveBeenCalledWith(
+      "synthetic-token",
+    );
+  });
+
+  it("retains the unavailable-keyring fallback even when opted in", () => {
+    testBuildState.value = true;
+    vi.stubEnv("DYAD_E2E_REAL_ENCRYPTION", "true");
+    mockSafeStorage.isEncryptionAvailable.mockReturnValue(false);
+    expect(encrypt("synthetic-token")).toEqual({
+      value: "synthetic-token",
+      encryptionType: "plaintext",
+    });
+  });
+
+  it("keeps ordinary E2E writes plaintext unless explicitly opted in", () => {
+    testBuildState.value = true;
+    vi.stubEnv("DYAD_E2E_REAL_ENCRYPTION", "false");
+    mockSafeStorage.isEncryptionAvailable.mockReturnValue(true);
+    expect(encrypt("synthetic-token")).toEqual({
+      value: "synthetic-token",
+      encryptionType: "plaintext",
+    });
+    mockSafeStorage.isEncryptionAvailable.mockReturnValue(false);
+  });
+
   it("should trim whitespace before encrypting", () => {
     const result = encrypt("  my-api-key\n");
     // In test builds, encryption falls back to plaintext
@@ -922,6 +1082,575 @@ function scrubSettings(result: UserSettings) {
   };
 }
 
+describe("preserving undecryptable secrets", () => {
+  const mockUserDataPath = "/mock/user/data";
+  const mockSettingsPath = "/mock/user/data/user-settings.json";
+  let store: Record<string, string>;
+
+  // Marker-based ciphertext: a secret whose plaintext contains "LOCKED" fails to
+  // decrypt (simulating a Keychain identity flip); everything else decrypts.
+  const b64 = (value: string) => Buffer.from(value).toString("base64");
+  const lockedSecret = (marker: string) => ({
+    value: b64(`LOCKED-${marker}`),
+    encryptionType: "electron-safe-storage" as const,
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetUserDataPath.mockReturnValue(mockUserDataPath);
+    mockPath.join.mockReturnValue(mockSettingsPath);
+    // Unit tests are not an E2E build, so encrypt() only falls back to plaintext
+    // when safeStorage reports encryption unavailable. Keep it unavailable so new
+    // values written during these tests land as plaintext (decrypt still routes by
+    // encryptionType through the mocked decryptString).
+    mockSafeStorage.isEncryptionAvailable.mockReturnValue(false);
+
+    store = {};
+    mockFs.existsSync.mockImplementation((p) => (p as string) in store);
+    mockFs.readFileSync.mockImplementation((p) => {
+      const value = store[p as string];
+      if (value === undefined) {
+        const err = new Error("ENOENT") as NodeJS.ErrnoException;
+        err.code = "ENOENT";
+        throw err;
+      }
+      return value;
+    });
+    mockFs.writeFileSync.mockImplementation((p, data) => {
+      store[p as string] = data as string;
+    });
+    mockFs.copyFileSync.mockImplementation((src, dest) => {
+      store[dest as string] = store[src as string];
+    });
+    mockFs.renameSync.mockImplementation((oldPath, newPath) => {
+      store[newPath as string] = store[oldPath as string];
+      delete store[oldPath as string];
+    });
+    mockFs.unlinkSync.mockImplementation((p) => {
+      delete store[p as string];
+    });
+
+    mockSafeStorage.decryptString.mockImplementation((buf: Buffer) => {
+      const marker = Buffer.from(buf).toString("utf-8");
+      if (marker.includes("LOCKED")) {
+        throw new Error("decrypt failed: identity mismatch");
+      }
+      return `decrypted:${marker}`;
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const readStoredFile = () =>
+    JSON.parse(store[mockSettingsPath]) as Record<string, any>;
+
+  it("hides an undecryptable secret from readSettings but keeps its ciphertext on disk across unrelated writes", () => {
+    const locked = lockedSecret("github");
+    store[mockSettingsPath] = JSON.stringify({
+      telemetryConsent: "opted_in",
+      githubAccessToken: locked,
+    });
+
+    // Consumer read: the locked secret is absent (UI shows "not connected").
+    const read = readSettings();
+    expect(read.githubAccessToken).toBeUndefined();
+    expect(read.telemetryConsent).toBe("opted_in");
+
+    // An empty write must not destroy the ciphertext.
+    writeSettings({});
+    expect(readStoredFile().githubAccessToken).toEqual(locked);
+
+    // A write touching an unrelated field (e.g. the performance heartbeat) must
+    // not destroy it either.
+    writeSettings({ enableAutoUpdate: false });
+    const afterUnrelated = readStoredFile();
+    expect(afterUnrelated.githubAccessToken).toEqual(locked);
+    expect(afterUnrelated.enableAutoUpdate).toBe(false);
+  });
+
+  it("recovers the preserved secret automatically once it can be decrypted again", () => {
+    const locked = lockedSecret("github");
+    store[mockSettingsPath] = JSON.stringify({ githubAccessToken: locked });
+
+    writeSettings({});
+    expect(readStoredFile().githubAccessToken).toEqual(locked);
+
+    // A later session whose Keychain identity matches again can decrypt the same
+    // untouched ciphertext — no migration, just a normal read.
+    mockSafeStorage.decryptString.mockImplementation(
+      (buf: Buffer) => `recovered:${Buffer.from(buf).toString("utf-8")}`,
+    );
+    const read = readSettings();
+    expect(read.githubAccessToken?.value).toBe("recovered:LOCKED-github");
+  });
+
+  it("replaces a locked secret when the caller provides a new value", () => {
+    store[mockSettingsPath] = JSON.stringify({
+      githubAccessToken: lockedSecret("github"),
+    });
+
+    writeSettings({
+      githubAccessToken: {
+        value: "brand-new-token",
+        encryptionType: "electron-safe-storage",
+      },
+    });
+
+    // In test builds encrypt() falls back to plaintext; the point is that the new
+    // value wins and is written through the normal encryption path.
+    expect(readStoredFile().githubAccessToken).toEqual({
+      value: "brand-new-token",
+      encryptionType: "plaintext",
+    });
+  });
+
+  it("hides a Coolify token that will not decrypt", () => {
+    // Handing the ciphertext through would have it sent to Coolify as the
+    // token, and it would be rejected with no way to tell why.
+    store[mockSettingsPath] = JSON.stringify({
+      coolify: {
+        instanceUrl: "http://203.0.113.5:8000",
+        accessToken: lockedSecret("coolify"),
+      },
+    });
+
+    const read = readSettings();
+    expect(read.coolify?.accessToken).toBeUndefined();
+    expect(read.coolify?.instanceUrl).toBe("http://203.0.113.5:8000");
+  });
+
+  it("puts the GitLab token through encryption and reads it back", () => {
+    writeSettings({
+      gitlab: {
+        instanceUrl: "https://gitlab.example.com",
+        accessToken: { value: "glpat-secret" },
+        user: { username: "rene" },
+        tokenExpiresAt: null,
+      },
+    });
+
+    expect(readStoredFile().gitlab.accessToken).toEqual({
+      value: "glpat-secret",
+      encryptionType: "plaintext",
+    });
+    expect(readSettings().gitlab).toEqual({
+      instanceUrl: "https://gitlab.example.com",
+      accessToken: { value: "glpat-secret", encryptionType: "plaintext" },
+      user: { username: "rene" },
+      tokenExpiresAt: null,
+    });
+  });
+
+  it("hides a GitLab token that will not decrypt but keeps the address", () => {
+    store[mockSettingsPath] = JSON.stringify({
+      gitlab: {
+        instanceUrl: "https://gitlab.example.com",
+        accessToken: lockedSecret("gitlab"),
+        user: { username: "rene" },
+      },
+    });
+
+    const read = readSettings();
+    expect(read.gitlab?.accessToken).toBeUndefined();
+    expect(read.gitlab?.instanceUrl).toBe("https://gitlab.example.com");
+    expect(read.gitlab?.user?.username).toBe("rene");
+  });
+
+  it("puts the Coolify admin password through encryption", () => {
+    // Dyad made this one up and is the only thing holding it, which is a
+    // reason to keep it readable and not a reason to keep it in the clear.
+    writeSettings({
+      coolify: {
+        instanceUrl: "http://203.0.113.5:8000",
+        admin: {
+          email: "me@gmail.com",
+          password: { value: "invented-password" },
+          instanceUrl: "http://203.0.113.5:8000",
+        },
+      },
+    });
+
+    expect(readStoredFile().coolify.admin).toEqual({
+      email: "me@gmail.com",
+      password: { value: "invented-password", encryptionType: "plaintext" },
+      instanceUrl: "http://203.0.113.5:8000",
+    });
+  });
+
+  it("puts the Cloudflare API token through encryption", () => {
+    writeSettings({ cloudflareAccessToken: { value: "cf-token" } });
+
+    expect(readStoredFile().cloudflareAccessToken).toEqual({
+      value: "cf-token",
+      encryptionType: "plaintext",
+    });
+    expect(readSettings().cloudflareAccessToken?.value).toBe("cf-token");
+  });
+
+  it("keeps a Cloudflare API token that will not decrypt, without exposing it", () => {
+    // Cloudflare deploys with this token on every push, so losing the stored
+    // copy to an unrelated write would break deployments the user cannot see.
+    const locked = lockedSecret("cloudflare");
+    store[mockSettingsPath] = JSON.stringify({ cloudflareAccessToken: locked });
+
+    expect(readSettings().cloudflareAccessToken).toBeUndefined();
+
+    writeSettings({ enableAutoUpdate: false });
+    const stored = readStoredFile();
+    expect(stored.enableAutoUpdate).toBe(false);
+    expect(stored.cloudflareAccessToken).toEqual(locked);
+    expect(readSettings().cloudflareAccessToken).toBeUndefined();
+  });
+
+  it("forgets a Coolify token that will not decrypt when signing out", () => {
+    // The preservation pass puts a secret back whenever the container it
+    // lives in is still there, treating an absent key as a consumer read that
+    // could not decrypt it rather than as a clear. An empty coolify object is
+    // still a container, so the one write whose whole job is to forget the
+    // instance would hand the token straight back.
+    store[mockSettingsPath] = JSON.stringify({
+      coolify: {
+        instanceUrl: "http://203.0.113.5:8000",
+        accessToken: lockedSecret("coolify"),
+      },
+    });
+
+    writeSettings({ coolify: forgottenCoolify() });
+
+    expect(readStoredFile().coolify).toEqual({});
+  });
+
+  it("clears again on a second sign-out", () => {
+    // writeSettings edits the object it was handed, so a shape kept at module
+    // scope would carry one write's edits into the next sign-out.
+    store[mockSettingsPath] = JSON.stringify({
+      coolify: {
+        instanceUrl: "http://203.0.113.5:8000",
+        accessToken: lockedSecret("coolify"),
+      },
+    });
+    writeSettings({ coolify: forgottenCoolify() });
+    expect(readStoredFile().coolify).toEqual({});
+
+    store[mockSettingsPath] = JSON.stringify({
+      coolify: {
+        instanceUrl: "http://203.0.113.5:8000",
+        accessToken: lockedSecret("coolify"),
+      },
+    });
+    writeSettings({ coolify: forgottenCoolify() });
+    expect(readStoredFile().coolify).toEqual({});
+  });
+
+  it("keeps a locked Coolify admin password across an unrelated write", () => {
+    // The preservation path hands the ciphertext back after encryption, having
+    // deleted it from the merged settings first. Reading the account and then
+    // reaching for its password without checking finds nothing there — and
+    // every settings write, Coolify or not, dies on it.
+    const locked = lockedSecret("coolify");
+    store[mockSettingsPath] = JSON.stringify({
+      coolify: {
+        instanceUrl: "http://203.0.113.5:8000",
+        admin: {
+          email: "me@gmail.com",
+          password: locked,
+          instanceUrl: "http://203.0.113.5:8000",
+        },
+      },
+    });
+
+    writeSettings({ enableAutoUpdate: false });
+
+    expect(readStoredFile().enableAutoUpdate).toBe(false);
+    expect(readStoredFile().coolify.admin.password).toEqual(locked);
+  });
+
+  it("keeps a locked admin password when a Coolify write rebuilds the object without it", () => {
+    // What `coolify:save-token` does: spread what readSettings could decrypt,
+    // then add the token. The account came back without its password, so
+    // without the container still standing there is nowhere to put the
+    // ciphertext back and the only copy of it goes.
+    const locked = lockedSecret("coolify");
+    store[mockSettingsPath] = JSON.stringify({
+      coolify: {
+        instanceUrl: "http://203.0.113.5:8000",
+        admin: {
+          email: "me@gmail.com",
+          password: locked,
+          instanceUrl: "http://203.0.113.5:8000",
+        },
+      },
+    });
+
+    writeSettings({
+      coolify: {
+        ...readSettings().coolify,
+        instanceUrl: "http://203.0.113.5:8000",
+        accessToken: { value: "1|fresh" },
+      },
+    });
+
+    expect(readStoredFile().coolify.admin.password).toEqual(locked);
+    expect(readStoredFile().coolify.admin.email).toBe("me@gmail.com");
+  });
+
+  it("hides an admin password that will not decrypt, keeping the account", () => {
+    // Handing the ciphertext through would put it on screen as the password,
+    // and it would not open anything. The account it belongs to stays, so a
+    // later write still has somewhere to put the ciphertext back.
+    store[mockSettingsPath] = JSON.stringify({
+      coolify: {
+        instanceUrl: "http://203.0.113.5:8000",
+        admin: {
+          email: "me@gmail.com",
+          password: lockedSecret("coolify"),
+          instanceUrl: "http://203.0.113.5:8000",
+        },
+      },
+    });
+
+    const read = readSettings();
+    expect(read.coolify?.admin?.password).toBeUndefined();
+    expect(read.coolify?.admin?.email).toBe("me@gmail.com");
+    expect(read.coolify?.admin?.instanceUrl).toBe("http://203.0.113.5:8000");
+  });
+
+  it("preserves a locked provider apiKey when a write rebuilds providerSettings without it", () => {
+    const locked = lockedSecret("openai");
+    store[mockSettingsPath] = JSON.stringify({
+      providerSettings: { openai: { apiKey: locked } },
+    });
+
+    expect(readSettings().providerSettings.openai?.apiKey).toBeUndefined();
+
+    // Simulate a caller writing back a providerSettings object rebuilt from a
+    // readSettings() result: the openai provider is present but its dropped apiKey
+    // is missing. The shallow merge replaces the whole providerSettings object.
+    writeSettings({
+      providerSettings: {
+        openai: {},
+        anthropic: { apiKey: { value: "sk-ant", encryptionType: "plaintext" } },
+      },
+    });
+
+    const stored = readStoredFile();
+    expect(stored.providerSettings.openai.apiKey).toEqual(locked);
+    // A genuinely-new sibling secret is still encrypted normally.
+    expect(stored.providerSettings.anthropic.apiKey).toEqual({
+      value: "sk-ant",
+      encryptionType: "plaintext",
+    });
+  });
+
+  it("does not resurrect a locked provider apiKey when explicitly cleared", () => {
+    store[mockSettingsPath] = JSON.stringify({
+      providerSettings: { openai: { apiKey: lockedSecret("openai") } },
+    });
+
+    writeSettings({
+      providerSettings: {
+        openai: { apiKey: undefined },
+      },
+    });
+
+    expect(readStoredFile().providerSettings.openai.apiKey).toBeUndefined();
+
+    writeSettings({ enableAutoUpdate: false });
+    expect(readStoredFile().providerSettings.openai.apiKey).toBeUndefined();
+  });
+
+  it("does not resurrect a locked Vertex service account key when explicitly cleared", () => {
+    store[mockSettingsPath] = JSON.stringify({
+      providerSettings: {
+        vertex: {
+          projectId: "old-project",
+          location: "us-central1",
+          serviceAccountKey: lockedSecret("vertex"),
+        },
+      },
+    });
+
+    writeSettings({
+      providerSettings: {
+        vertex: {
+          apiKey: undefined,
+          projectId: "new-project",
+          location: "us-central1",
+          serviceAccountKey: undefined,
+        },
+      },
+    });
+
+    const storedVertex = readStoredFile().providerSettings.vertex;
+    expect(storedVertex.serviceAccountKey).toBeUndefined();
+    expect(storedVertex.projectId).toBe("new-project");
+  });
+
+  it("does not resurrect a locked provider whose provider object is deliberately removed", () => {
+    store[mockSettingsPath] = JSON.stringify({
+      providerSettings: { openai: { apiKey: lockedSecret("openai") } },
+    });
+
+    // The caller rebuilds providerSettings dropping the openai provider entirely.
+    writeSettings({
+      providerSettings: {
+        anthropic: { apiKey: { value: "sk-ant", encryptionType: "plaintext" } },
+      },
+    });
+
+    expect(readStoredFile().providerSettings.openai).toBeUndefined();
+  });
+
+  it("preserves a locked supabase organization access token across an unrelated write", () => {
+    const lockedAccess = lockedSecret("supabase-access");
+    store[mockSettingsPath] = JSON.stringify({
+      supabase: {
+        organizations: {
+          myorg: {
+            accessToken: lockedAccess,
+            refreshToken: {
+              value: b64("refresh"),
+              encryptionType: "electron-safe-storage",
+            },
+            expiresIn: 3600,
+            tokenTimestamp: 123,
+          },
+        },
+      },
+    });
+
+    // Consumer read drops the whole org because one token can't be decrypted.
+    expect(readSettings().supabase?.organizations).toEqual({});
+
+    // An unrelated write must keep the org and its locked ciphertext verbatim.
+    writeSettings({ enableAutoUpdate: false });
+
+    const org = readStoredFile().supabase.organizations.myorg;
+    expect(org.accessToken).toEqual(lockedAccess);
+    // The sibling token that decrypted fine is re-encrypted (plaintext in tests).
+    expect(org.refreshToken).toEqual({
+      value: "decrypted:refresh",
+      encryptionType: "plaintext",
+    });
+  });
+
+  it("preserves a locked supabase organization when the organizations map is rebuilt", () => {
+    const lockedAccess = lockedSecret("supabase-access");
+    store[mockSettingsPath] = JSON.stringify({
+      supabase: {
+        organizations: {
+          myorg: {
+            accessToken: lockedAccess,
+            refreshToken: {
+              value: b64("refresh"),
+              encryptionType: "electron-safe-storage",
+            },
+            expiresIn: 3600,
+            tokenTimestamp: 123,
+          },
+        },
+      },
+    });
+
+    // Consumer reads hide the locked org, and Supabase handlers rebuild the
+    // organizations map from that consumer-facing state when adding/removing orgs.
+    expect(readSettings().supabase?.organizations).toEqual({});
+
+    writeSettings({
+      supabase: {
+        organizations: {
+          otherorg: {
+            accessToken: { value: "other-access", encryptionType: "plaintext" },
+            refreshToken: {
+              value: "other-refresh",
+              encryptionType: "plaintext",
+            },
+            expiresIn: 7200,
+            tokenTimestamp: 456,
+          },
+        },
+      },
+    });
+
+    const organizations = readStoredFile().supabase.organizations;
+    expect(organizations.myorg.accessToken).toEqual(lockedAccess);
+    expect(organizations.myorg.refreshToken).toEqual({
+      value: "decrypted:refresh",
+      encryptionType: "plaintext",
+    });
+    expect(organizations.otherorg.accessToken).toEqual({
+      value: "other-access",
+      encryptionType: "plaintext",
+    });
+  });
+
+  it("drops a malformed secret without resetting unrelated settings on write", () => {
+    store[mockSettingsPath] = JSON.stringify({
+      telemetryConsent: "opted_in",
+      providerSettings: {
+        openai: {
+          apiKey: {
+            encryptionType: "plaintext",
+          },
+        },
+      },
+    });
+
+    writeSettings({ enableAutoUpdate: false });
+
+    const stored = readStoredFile();
+    expect(stored.telemetryConsent).toBe("opted_in");
+    expect(stored.enableAutoUpdate).toBe(false);
+    expect(stored.providerSettings.openai.apiKey).toBeUndefined();
+  });
+
+  it("removes a working secret when the caller explicitly clears it (no resurrection)", () => {
+    store[mockSettingsPath] = JSON.stringify({
+      githubAccessToken: {
+        value: b64("good-token"),
+        encryptionType: "electron-safe-storage",
+      },
+    });
+
+    // The secret decrypts fine, so it is never preserved.
+    expect(readSettings().githubAccessToken?.value).toBe(
+      "decrypted:good-token",
+    );
+
+    writeSettings({ githubAccessToken: undefined });
+    expect(readStoredFile().githubAccessToken).toBeUndefined();
+
+    // A subsequent unrelated write must not bring it back.
+    writeSettings({ enableAutoUpdate: false });
+    expect(readStoredFile().githubAccessToken).toBeUndefined();
+  });
+
+  it("preserves multiple locked secrets in a single write", () => {
+    const lockedGithub = lockedSecret("github");
+    const lockedVercel = lockedSecret("vercel");
+    const lockedOpenai = lockedSecret("openai");
+    store[mockSettingsPath] = JSON.stringify({
+      githubAccessToken: lockedGithub,
+      vercelAccessToken: lockedVercel,
+      providerSettings: { openai: { apiKey: lockedOpenai } },
+    });
+
+    const read = readSettings();
+    expect(read.githubAccessToken).toBeUndefined();
+    expect(read.vercelAccessToken).toBeUndefined();
+    expect(read.providerSettings.openai?.apiKey).toBeUndefined();
+
+    writeSettings({ enableAutoUpdate: false });
+
+    const stored = readStoredFile();
+    expect(stored.githubAccessToken).toEqual(lockedGithub);
+    expect(stored.vercelAccessToken).toEqual(lockedVercel);
+    expect(stored.providerSettings.openai.apiKey).toEqual(lockedOpenai);
+  });
+});
+
 describe("crash sentinel", () => {
   const mockUserDataPath = "/mock/user/data";
   const sentinelPath = `${mockUserDataPath}/session.lock`;
@@ -932,6 +1661,9 @@ describe("crash sentinel", () => {
     mockGetUserDataPath.mockReturnValue(mockUserDataPath);
     mockPath.join.mockImplementation((...args: string[]) => args.join("/"));
     store = {};
+    mockFs.existsSync.mockImplementation(
+      (p) => store[p as string] !== undefined,
+    );
     mockFs.writeFileSync.mockImplementation((p, data) => {
       store[p as string] = data as string;
     });
@@ -946,20 +1678,52 @@ describe("crash sentinel", () => {
     });
   });
 
-  it("writeCrashSentinel writes JSON with a timestamp and no active chat", () => {
-    writeCrashSentinel();
+  it("writeCrashSentinel persists the launch time with no active chat", () => {
+    writeCrashSentinel(1700000000000);
     const data = readCrashSentinel();
-    expect(typeof data?.ts).toBe("number");
+    expect(data?.ts).toBe(1700000000000);
     expect(data?.activeChatId).toBeUndefined();
   });
 
+  it("claimCrashSentinel reports the previous session and takes over the file", () => {
+    store[sentinelPath] = JSON.stringify({
+      ts: 1600000000000,
+      activeChatId: 5,
+    });
+
+    const previousSession = claimCrashSentinel(1700000000000);
+
+    expect(previousSession.existed).toBe(true);
+    expect(previousSession.previous?.ts).toBe(1600000000000);
+    expect(previousSession.previous?.activeChatId).toBe(5);
+    // The file now belongs to this session, so a crash below is attributed here.
+    expect(readCrashSentinel()?.ts).toBe(1700000000000);
+    expect(readCrashSentinel()?.activeChatId).toBeUndefined();
+  });
+
+  it("claimCrashSentinel reports no previous session after a clean exit", () => {
+    const previousSession = claimCrashSentinel(1700000000000);
+
+    expect(previousSession.existed).toBe(false);
+    expect(previousSession.previous).toBeNull();
+    expect(readCrashSentinel()?.ts).toBe(1700000000000);
+  });
+
+  it("claimCrashSentinel flags a legacy sentinel as existing but unparseable", () => {
+    store[sentinelPath] = "1600000000000";
+
+    const previousSession = claimCrashSentinel(1700000000000);
+
+    expect(previousSession.existed).toBe(true);
+    expect(previousSession.previous).toBeNull();
+  });
+
   it("setSentinelActiveChat records the chat id, preserving the timestamp", () => {
-    writeCrashSentinel();
-    const ts = readCrashSentinel()?.ts;
+    writeCrashSentinel(1700000000000);
     setSentinelActiveChat(42);
     const data = readCrashSentinel();
     expect(data?.activeChatId).toBe(42);
-    expect(data?.ts).toBe(ts);
+    expect(data?.ts).toBe(1700000000000);
   });
 
   it("readCrashSentinel returns null for the legacy bare-timestamp format", () => {
@@ -979,5 +1743,276 @@ describe("crash sentinel", () => {
   it("readCrashSentinel ignores a non-numeric activeChatId", () => {
     store[sentinelPath] = JSON.stringify({ ts: 123, activeChatId: "nope" });
     expect(readCrashSentinel()).toEqual({ ts: 123, activeChatId: undefined });
+  });
+});
+
+describe("legacy keychain recovery integration", () => {
+  const mockUserDataPath = "/mock/user/data";
+  const mockSettingsPath = "/mock/user/data/user-settings.json";
+  let store: Record<string, string>;
+  const mockRecover = vi.mocked(recoverLegacySafeStorageSecret);
+  const mockGetRecoveryStats = vi.mocked(getRecoveryStats);
+
+  const b64 = (value: string) => Buffer.from(value).toString("base64");
+  const lockedSecret = (marker: string) => ({
+    value: b64(`LOCKED-${marker}`),
+    encryptionType: "electron-safe-storage" as const,
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetUserDataPath.mockReturnValue(mockUserDataPath);
+    mockPath.join.mockReturnValue(mockSettingsPath);
+    mockSafeStorage.isEncryptionAvailable.mockReturnValue(false);
+    // Recovery is gated on app readiness; default these tests to ready.
+    vi.mocked(app.isReady).mockReturnValue(true);
+
+    store = {};
+    mockFs.existsSync.mockImplementation((p) => (p as string) in store);
+    mockFs.readFileSync.mockImplementation((p) => {
+      const value = store[p as string];
+      if (value === undefined) {
+        const err = new Error("ENOENT") as NodeJS.ErrnoException;
+        err.code = "ENOENT";
+        throw err;
+      }
+      return value;
+    });
+    mockFs.writeFileSync.mockImplementation((p, data) => {
+      store[p as string] = data as string;
+    });
+    mockFs.copyFileSync.mockImplementation((src, dest) => {
+      store[dest as string] = store[src as string];
+    });
+    mockFs.renameSync.mockImplementation((oldPath, newPath) => {
+      store[newPath as string] = store[oldPath as string];
+      delete store[oldPath as string];
+    });
+    mockFs.unlinkSync.mockImplementation((p) => {
+      delete store[p as string];
+    });
+
+    mockSafeStorage.decryptString.mockImplementation((buf: Buffer) => {
+      const marker = Buffer.from(buf).toString("utf-8");
+      if (marker.includes("LOCKED")) {
+        throw new Error("decrypt failed: identity mismatch");
+      }
+      return `decrypted:${marker}`;
+    });
+    mockRecover.mockReturnValue(null);
+    mockGetRecoveryStats.mockReturnValue({
+      attempted: 0,
+      recovered: 0,
+      failed: 0,
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const readStoredFile = () =>
+    JSON.parse(store[mockSettingsPath]) as Record<string, any>;
+
+  it("returns the recovered plaintext when safeStorage fails but a legacy identity decrypts", () => {
+    const locked = lockedSecret("github");
+    store[mockSettingsPath] = JSON.stringify({ githubAccessToken: locked });
+    mockRecover.mockReturnValue("gh_recovered_token");
+
+    const settings = readSettings();
+    expect(settings.githubAccessToken).toEqual({
+      value: "gh_recovered_token",
+      encryptionType: "electron-safe-storage",
+    });
+    expect(mockRecover).toHaveBeenCalledWith(locked.value);
+  });
+
+  it("trims recovered plaintext before returning it to consumers", () => {
+    const locked = lockedSecret("github");
+    store[mockSettingsPath] = JSON.stringify({ githubAccessToken: locked });
+    mockRecover.mockReturnValue("  gh_recovered_token\n");
+
+    const settings = readSettings();
+    expect(settings.githubAccessToken).toEqual({
+      value: "gh_recovered_token",
+      encryptionType: "electron-safe-storage",
+    });
+  });
+
+  it("re-encrypts a recovered secret through the normal write path", () => {
+    const locked = lockedSecret("github");
+    store[mockSettingsPath] = JSON.stringify({ githubAccessToken: locked });
+    mockRecover.mockReturnValue("gh_recovered_token");
+
+    // Any write re-reads the file (recovering the secret) and re-encrypts it
+    // under the current session identity. With encryption unavailable in this
+    // harness, encrypt() stores the recovered value as plaintext.
+    writeSettings({ enableAutoUpdate: false });
+    expect(readStoredFile().githubAccessToken).toEqual({
+      value: "gh_recovered_token",
+      encryptionType: "plaintext",
+    });
+  });
+
+  it("rewrites settings after Keychain unlock when recovery succeeds", () => {
+    const locked = lockedSecret("github");
+    store[mockSettingsPath] = JSON.stringify({ githubAccessToken: locked });
+    mockRecover.mockReturnValue("gh_recovered_token");
+    mockGetRecoveryStats
+      .mockReturnValueOnce({ attempted: 1, recovered: 0, failed: 1 })
+      .mockReturnValueOnce({ attempted: 2, recovered: 1, failed: 1 });
+
+    expect(rewriteRecoveredSafeStorageSecretsAfterKeychainUnlock()).toBe(1);
+    expect(readStoredFile().githubAccessToken).toEqual({
+      value: "gh_recovered_token",
+      encryptionType: "plaintext",
+    });
+  });
+
+  it("does not rewrite defaults when unlock recovery hits a later settings parse error", () => {
+    const locked = lockedSecret("github");
+    const originalStoredSettings = {
+      githubAccessToken: locked,
+      selectedModel: {},
+    };
+    store[mockSettingsPath] = JSON.stringify(originalStoredSettings);
+    mockRecover.mockReturnValue("gh_recovered_token");
+    mockGetRecoveryStats
+      .mockReturnValueOnce({ attempted: 1, recovered: 0, failed: 1 })
+      .mockReturnValueOnce({ attempted: 2, recovered: 1, failed: 1 });
+
+    expect(rewriteRecoveredSafeStorageSecretsAfterKeychainUnlock()).toBe(0);
+    expect(JSON.parse(store[mockSettingsPath])).toEqual(originalStoredSettings);
+  });
+
+  it("preserves the ciphertext when recovery also fails", () => {
+    const locked = lockedSecret("github");
+    store[mockSettingsPath] = JSON.stringify({ githubAccessToken: locked });
+    mockRecover.mockReturnValue(null);
+
+    expect(readSettings().githubAccessToken).toBeUndefined();
+    writeSettings({ enableAutoUpdate: false });
+    expect(readStoredFile().githubAccessToken).toEqual(locked);
+  });
+
+  it("does not attempt recovery for plaintext secrets or not-ready errors", () => {
+    // Not-ready: the whole read falls back to defaults without recovery.
+    store[mockSettingsPath] = JSON.stringify({
+      githubAccessToken: lockedSecret("github"),
+    });
+    mockSafeStorage.decryptString.mockImplementation(() => {
+      throw new Error("safeStorage cannot be used before app is ready");
+    });
+    const settings = readSettings();
+    expect(settings.githubAccessToken).toBeUndefined();
+    expect(mockRecover).not.toHaveBeenCalled();
+  });
+
+  it("does not shell out to recovery before the app is ready", () => {
+    // Electron 40 can run safeStorage pre-`ready`, so a decrypt failure can
+    // occur before the window exists. Recovery must not fire then (it would
+    // block the cold-start path and could raise a Keychain prompt).
+    vi.mocked(app.isReady).mockReturnValue(false);
+    const locked = lockedSecret("github");
+    store[mockSettingsPath] = JSON.stringify({ githubAccessToken: locked });
+    mockRecover.mockReturnValue("gh_recovered_token");
+
+    // Pre-ready read: the secret is omitted and recovery is never attempted.
+    expect(readSettings().githubAccessToken).toBeUndefined();
+    expect(mockRecover).not.toHaveBeenCalled();
+
+    // Pre-ready write still preserves the ciphertext verbatim (never destroyed),
+    // so a later post-ready read can recover it.
+    writeSettings({ enableAutoUpdate: false });
+    expect(mockRecover).not.toHaveBeenCalled();
+    expect(readStoredFile().githubAccessToken).toEqual(locked);
+
+    // Once ready, the same stored ciphertext is recovered.
+    vi.mocked(app.isReady).mockReturnValue(true);
+    expect(readSettings().githubAccessToken).toEqual({
+      value: "gh_recovered_token",
+      encryptionType: "electron-safe-storage",
+    });
+    expect(mockRecover).toHaveBeenCalledWith(locked.value);
+  });
+});
+
+describe("renderer crash record", () => {
+  const mockUserDataPath = "/mock/user/data";
+  const crashPath = `${mockUserDataPath}/renderer-crash.json`;
+  let store: Record<string, string>;
+
+  const performance = {
+    timestamp: 1751500000000,
+    memoryUsageMB: 400,
+    cpuUsagePercent: 12.5,
+    systemMemoryUsageMB: 8000,
+    systemMemoryTotalMB: 16000,
+    systemCpuPercent: 33,
+    heapUsedMB: 512,
+    heapLimitMB: 4144,
+    processWorkingSetsMB: { browser: 400, tab: 900 },
+    activity: {
+      activeStreams: 1,
+      runningApps: 2,
+      extractCodebase: true,
+      tsUtilityProcess: "tsc" as const,
+    },
+    peakHeapUsedMB: 1024,
+    peakHeapPct: 24.7,
+    peakRssMB: 2048,
+    peakProcessWorkingSetsMB: { browser: 900, tab: 2000 },
+    peakActivity: {
+      activeStreams: 2,
+      runningApps: 3,
+      extractCodebase: false,
+      tsUtilityProcess: null,
+    },
+    peakTimestamp: 1751499970000,
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetUserDataPath.mockReturnValue(mockUserDataPath);
+    mockPath.join.mockImplementation((...args: string[]) => args.join("/"));
+    store = {};
+    mockFs.writeFileSync.mockImplementation((p, data) => {
+      store[p as string] = data as string;
+    });
+    mockFs.renameSync.mockImplementation((from, to) => {
+      store[to as string] = store[from as string];
+      delete store[from as string];
+    });
+    mockFs.existsSync.mockImplementation(
+      (p) => store[p as string] !== undefined,
+    );
+    mockFs.readFileSync.mockImplementation((p) => {
+      const value = store[p as string];
+      if (value === undefined) {
+        const err = new Error("ENOENT") as NodeJS.ErrnoException;
+        err.code = "ENOENT";
+        throw err;
+      }
+      return value;
+    });
+  });
+
+  it("round-trips the full performance block, including memory and peak fields", () => {
+    recordRendererCrash({ reason: "oom", exitCode: 1, performance });
+    const record = readRendererCrashRecord();
+    expect(record?.reason).toBe("oom");
+    expect(record?.performance).toEqual(performance);
+  });
+
+  it("drops a malformed performance block but keeps the crash record", () => {
+    store[crashPath] = JSON.stringify({
+      reason: "crashed",
+      timestamp: 1751500000000,
+      count: 1,
+      performance: { timestamp: "not-a-number" },
+    });
+    const record = readRendererCrashRecord();
+    expect(record?.reason).toBe("crashed");
+    expect(record?.performance).toBeUndefined();
   });
 });

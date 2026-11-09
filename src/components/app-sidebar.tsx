@@ -5,10 +5,11 @@ import {
   HelpCircle,
   Store,
   BookOpen,
+  Blocks,
 } from "lucide-react";
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
 import { useSidebar } from "@/components/ui/sidebar"; // import useSidebar hook
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { ComponentType } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { useAtom, useAtomValue, useSetAtom } from "jotai";
@@ -29,7 +30,6 @@ import {
 import { cn } from "@/lib/utils";
 import { ChatList } from "./ChatList";
 import { AppList } from "./AppList";
-import { HelpDialog } from "./HelpDialog";
 import { helpDialogAtom } from "@/atoms/helpDialogAtom";
 import { SettingsList } from "./SettingsList";
 import { LibraryList } from "./LibraryList";
@@ -38,8 +38,11 @@ import {
   type AppSidebarItemTitle,
   getSelectedSidebarPanel,
   isSidebarItemActive,
+  shouldExpandSidebarForHover,
   shouldShowSelectedAppChatList,
 } from "./app-sidebar-state";
+
+const SIDEBAR_COLLAPSE_DELAY_MS = 300;
 
 // Menu items.
 const items = [
@@ -59,9 +62,14 @@ const items = [
     icon: BookOpen,
   },
   {
-    title: "Hub",
-    to: "/hub",
+    title: "Templates",
+    to: "/templates",
     icon: Store,
+  },
+  {
+    title: "Plugins",
+    to: "/plugins",
+    icon: Blocks,
   },
 ] satisfies Array<{
   title: AppSidebarItemTitle;
@@ -148,6 +156,8 @@ export function AppSidebar() {
   const [hoverState, setHoverState] =
     useState<AppSidebarHoverState>("no-hover");
   const expandedByHover = useRef(false);
+  const isPointerOverSidebar = useRef(false);
+  const collapseTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const setHelpDialog = useSetAtom(helpDialogAtom);
   const [isDropdownOpen] = useAtom(dropdownOpenAtom);
   const selectedAppId = useAtomValue(selectedAppIdAtom);
@@ -155,10 +165,33 @@ export function AppSidebar() {
   const setSelectedChatId = useSetAtom(selectedChatIdAtom);
   const navigate = useNavigate();
 
+  const cancelPendingCollapse = useCallback(() => {
+    if (collapseTimer.current !== null) {
+      clearTimeout(collapseTimer.current);
+      collapseTimer.current = null;
+    }
+  }, []);
+
+  useEffect(() => cancelPendingCollapse, [cancelPendingCollapse]);
+
   useEffect(() => {
-    if (hoverState.startsWith("start-hover") && state === "collapsed") {
+    if (
+      shouldExpandSidebarForHover({
+        hoverState,
+        sidebarState: state,
+        isPointerOverSidebar: isPointerOverSidebar.current,
+      })
+    ) {
       expandedByHover.current = true;
       toggleSidebar();
+    } else if (
+      hoverState.startsWith("start-hover") &&
+      state === "collapsed" &&
+      !isPointerOverSidebar.current
+    ) {
+      cancelPendingCollapse();
+      expandedByHover.current = false;
+      setHoverState("no-hover");
     }
     if (
       hoverState === "clear-hover" &&
@@ -170,7 +203,14 @@ export function AppSidebar() {
       expandedByHover.current = false;
       setHoverState("no-hover");
     }
-  }, [hoverState, toggleSidebar, state, setHoverState, isDropdownOpen]);
+  }, [
+    hoverState,
+    toggleSidebar,
+    state,
+    setHoverState,
+    isDropdownOpen,
+    cancelPendingCollapse,
+  ]);
 
   const routerState = useRouterState();
   const selectedItem = getSelectedSidebarPanel({
@@ -193,10 +233,23 @@ export function AppSidebar() {
   return (
     <Sidebar
       collapsible="icon"
-      className="shadow-lg"
+      // Ends above the screenshot bar when one is up, like the main panel.
+      className="shadow-lg h-[calc(100vh-var(--layout-bottom-bar-height))]"
+      onMouseEnter={() => {
+        isPointerOverSidebar.current = true;
+        cancelPendingCollapse();
+        setHoverState((current) =>
+          current === "clear-hover" ? "no-hover" : current,
+        );
+      }}
       onMouseLeave={() => {
+        isPointerOverSidebar.current = false;
         if (!isDropdownOpen) {
-          setHoverState("clear-hover");
+          cancelPendingCollapse();
+          collapseTimer.current = setTimeout(() => {
+            collapseTimer.current = null;
+            setHoverState("clear-hover");
+          }, SIDEBAR_COLLAPSE_DELAY_MS);
         }
       }}
     >
@@ -223,7 +276,7 @@ export function AppSidebar() {
             />
           </div>
           {/* Right Column: Contextual sub-list (only visible when expanded) */}
-          <div className="relative h-[calc(100vh-112px)] w-[224px] overflow-hidden border-l border-sidebar-border">
+          <div className="relative h-[calc(100vh-112px-var(--layout-bottom-bar-height))] w-[224px] overflow-hidden border-l border-sidebar-border">
             <AnimatePresence initial={false}>
               {selectedItem === "Apps" && !showSelectedAppChats && (
                 <motion.div
@@ -246,10 +299,15 @@ export function AppSidebar() {
                   exit={{ x: "100%" }}
                   transition={{ duration: 0.28, ease: [0.32, 0.72, 0, 1] }}
                 >
+                  {/* AnimatePresence keeps the last props of a list that is
+                      animating out, so passing the app id here (instead of
+                      ChatList reading the atom) keeps it on its own app after
+                      "View all apps" clears the selection. */}
                   <ChatList
                     show
                     showViewAllAppsButton
                     onViewAllApps={handleViewAllApps}
+                    appId={selectedAppId}
                   />
                 </motion.div>
               )}
@@ -269,7 +327,6 @@ export function AppSidebar() {
               isExpanded={state === "expanded"}
               onClick={() => setHelpDialog({ open: true })}
             />
-            <HelpDialog />
           </SidebarMenuItem>
         </SidebarMenu>
       </SidebarFooter>
@@ -296,8 +353,8 @@ function AppIcons({
       case "Library":
         return "start-hover:library";
       default:
-        // Items without a sub-list (e.g. Hub) dismiss any open preview so a
-        // stale list doesn't linger while hovering an unrelated icon.
+        // Items without a sub-list (Templates, Plugins) dismiss any open
+        // preview so a stale list doesn't linger while hovering an unrelated icon.
         return "clear-hover";
     }
   };

@@ -13,12 +13,39 @@ import {
 } from "./exploreCodeFixtures";
 import { fakeLlmLog } from "./log";
 import { resolveDumpDir, resolveFixturesDir } from "./paths";
+import {
+  matchConsentClassifierPayload,
+  SLOW_CONSENT_TOOL,
+} from "./consentClassifier";
+import {
+  matchAssertionCodePayload,
+  matchAssertionsAgentTurn,
+  matchAssertionsResumedTurn,
+  matchAssertionsVerifyTurn,
+} from "./testAssertionsFixtures";
+
+import { respondToInvalidApiKey } from "./apiKeyValidation";
 
 let globalCounter = 0;
 
-function hasInvalidApiKey(req: Request): boolean {
-  const authorization = req.headers.authorization;
-  return typeof authorization === "string" && /invalid/i.test(authorization);
+async function waitForDelayOrDisconnect(
+  res: Response,
+  delayMs: number,
+): Promise<boolean> {
+  let disconnected = false;
+  await new Promise<void>((resolve) => {
+    const onClose = () => {
+      disconnected = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      res.removeListener("close", onClose);
+      resolve();
+    }, delayMs);
+    res.once("close", onClose);
+  });
+  return disconnected;
 }
 
 function hasExploreCodeToolResult(
@@ -36,6 +63,36 @@ function hasExploreCodeToolResult(
       text.includes("src/App.tsx")
     );
   });
+}
+
+function isMergeConflictResolutionPrompt(content: string): boolean {
+  return (
+    content.includes("Resolve the Git conflict(s) in ") ||
+    content.includes(
+      "Please resolve the Git merge conflicts in the following file",
+    )
+  );
+}
+
+function hasTool(req: Request, toolName: string): boolean {
+  return (
+    Array.isArray(req.body.tools) &&
+    req.body.tools.some(
+      (tool: any) =>
+        tool?.type === "function" && tool.function?.name === toolName,
+    )
+  );
+}
+
+function isToolResultMessage(message: any): boolean {
+  return (
+    message?.role === "tool" ||
+    (Array.isArray(message?.content) &&
+      message.content.some(
+        (part: any) =>
+          part?.type === "tool-result" || part?.type === "tool_result",
+      ))
+  );
 }
 
 function sendToolCallJson(
@@ -71,11 +128,31 @@ function sendToolCallJson(
   });
 }
 
+/**
+ * Stream a tool call as SSE, a few characters at a time.
+ *
+ * The disconnect watch is on `res`, not `req`: the argument chunks are
+ * deliberately spread over time, so a client that gives up (the user stopping a
+ * stream, a test aborting) would otherwise leave this loop writing to a
+ * destroyed response for the rest of its run. It must NOT be on `req` — since
+ * Node 16 an `IncomingMessage` emits `close` as soon as the request itself is
+ * complete, which for a POST whose body express has already parsed is before
+ * the first chunk goes out. Watching that fired on every call, and the loop
+ * bailed after one chunk without ever ending the response: every fixture that
+ * answers with a streamed tool call hung until the client timed out.
+ */
 async function streamToolCall(
   res: Response,
   toolName: string,
   args: Record<string, unknown>,
 ) {
+  let closed = res.destroyed;
+  const onClose = () => {
+    closed = true;
+  };
+  res.on("close", onClose);
+  const finish = () => res.off("close", onClose);
+
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
@@ -118,8 +195,14 @@ async function streamToolCall(
       }),
     );
     await new Promise((resolve) => setTimeout(resolve, 5));
+    if (closed) {
+      finish();
+      return;
+    }
   }
 
+  finish();
+  if (closed) return;
   res.write(mkChunk({}, "tool_calls"));
   res.write("data: [DONE]\n\n");
   res.end();
@@ -130,48 +213,9 @@ export const createChatCompletionHandler =
     const { stream = false, messages = [] } = req.body;
     fakeLlmLog("* Received messages", messages);
 
-    if (hasInvalidApiKey(req)) {
-      // The Dyad engine (a LiteLLM proxy) reports auth failures as an SSE
-      // error event on an HTTP 200 response rather than an HTTP 401.
-      if (prefix === "engine") {
-        res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-        res.setHeader("Cache-Control", "no-cache");
-        res.write(
-          `event: error\ndata: ${JSON.stringify({
-            error: {
-              message:
-                "401 LiteLLM Virtual Key expected. Received=inva****-key, expected to start with 'sk-'.",
-              type: "server_error",
-              param: null,
-            },
-          })}\n\n`,
-        );
-        res.write("data: [DONE]\n\n");
-        res.end();
-        return;
-      }
-      return res.status(401).json({
-        error: {
-          message: "Invalid API key",
-          type: "authentication_error",
-          param: null,
-          code: "invalid_api_key",
-        },
-      });
-    }
+    if (respondToInvalidApiKey(req, res, prefix)) return;
 
-    // Check if the last message contains "[429]" to simulate rate limiting
     const lastMessage = messages[messages.length - 1];
-    if (lastMessage && lastMessage.content === "[429]") {
-      return res.status(429).json({
-        error: {
-          message: "Too many requests. Please try again later.",
-          type: "rate_limit_error",
-          param: null,
-          code: "rate_limit_exceeded",
-        },
-      });
-    }
 
     // Check for local-agent fixture requests (tc=local-agent/*)
     // We need to check ALL user messages, not just the last one, because
@@ -195,6 +239,19 @@ export const createChatCompletionHandler =
     const userTextContent = lastUserMessage
       ? getTextContent(lastUserMessage)
       : "";
+    const lastMessageText = lastMessage ? getTextContent(lastMessage) : "";
+
+    // Check if the last user message contains "[429]" to simulate rate limiting.
+    if (userTextContent === "[429]") {
+      return res.status(429).json({
+        error: {
+          message: "Too many requests. Please try again later.",
+          type: "rate_limit_error",
+          param: null,
+          code: "rate_limit_exceeded",
+        },
+      });
+    }
 
     // First, check if the LAST user message is a fixture trigger
     let localAgentFixture = extractLocalAgentFixture(userTextContent);
@@ -204,7 +261,8 @@ export const createChatCompletionHandler =
     // fixture trigger.
     if (
       !localAgentFixture &&
-      (userTextContent.includes("incomplete todo(s)") ||
+      (isToolResultMessage(lastUserMessage) ||
+        userTextContent.includes("incomplete todo(s)") ||
         userTextContent.includes("previous response stream was interrupted") ||
         userTextContent.includes("did not finish completely"))
     ) {
@@ -216,6 +274,14 @@ export const createChatCompletionHandler =
           break; // Use the first (original) fixture trigger found
         }
       }
+    }
+
+    if (
+      !localAgentFixture &&
+      isMergeConflictResolutionPrompt(userTextContent) &&
+      hasTool(req, "write_file")
+    ) {
+      localAgentFixture = "merge-conflict";
     }
 
     fakeLlmLog(
@@ -245,6 +311,24 @@ export const createChatCompletionHandler =
       messageContent =
         "## Key Decisions Made\n- Completed initial task as requested\n\n## Current Task State\nConversation was compacted to save context space.";
     }
+    // See testAssertionsFixtures.ts: propose the plan for the just-finished
+    // recording through the agent's generate_test_assertions tool.
+    const assertionsToolCall = matchAssertionsAgentTurn(
+      userTextContent,
+      messages.map(getTextContent),
+    );
+    if (assertionsToolCall) {
+      if (stream) {
+        await streamToolCall(
+          res,
+          assertionsToolCall.name,
+          assertionsToolCall.args,
+        );
+        return;
+      }
+      sendToolCallJson(res, assertionsToolCall.name, assertionsToolCall.args);
+      return;
+    }
     if (isExploreCodeSubagentPrompt(userTextContent)) {
       const toolName = hasExploreCodeToolResult(messages, getTextContent)
         ? "submit_report"
@@ -272,29 +356,36 @@ export const createChatCompletionHandler =
       messageContent += "\n\n" + generateDump(req);
     }
 
-    if (
-      lastMessage &&
-      typeof lastMessage.content === "string" &&
-      lastMessage.content.includes("[sleep=medium]")
-    ) {
-      await new Promise((resolve) => setTimeout(resolve, 10_000));
+    const isSubagentReviewerRequest =
+      userTextContent.includes("Review this exact diff.") &&
+      userTextContent.includes("Return JSON only, with this exact shape:");
+    if (isSubagentReviewerRequest) {
+      messageContent = JSON.stringify({
+        status: "no_findings",
+        findings: [],
+        summary: "No actionable defects found in the reviewed change.",
+      });
     }
+
+    const responseDelayMs = isSubagentReviewerRequest
+      ? 1_500
+      : userTextContent.includes("[sleep=long]")
+        ? 30_000
+        : userTextContent.includes("[sleep=medium]")
+          ? 10_000
+          : 0;
     if (
-      lastMessage &&
-      typeof lastMessage.content === "string" &&
-      lastMessage.content.includes("[sleep=long]")
+      responseDelayMs > 0 &&
+      (await waitForDelayOrDisconnect(res, responseDelayMs))
     ) {
-      await new Promise((resolve) => setTimeout(resolve, 30_000));
+      return;
     }
 
     // Handle merge conflict resolution prompts (both old and new formats)
     if (
       lastMessage &&
       typeof lastMessage.content === "string" &&
-      (lastMessage.content.includes("Resolve the Git conflict(s) in ") ||
-        lastMessage.content.includes(
-          "Please resolve the Git merge conflicts in the following file",
-        ))
+      isMergeConflictResolutionPrompt(lastMessage.content)
     ) {
       // Extract conflict file path from different prompt formats
       let conflictPath = "conflict.txt";
@@ -453,27 +544,26 @@ export default Index;
       typeof lastMessage.content === "string" &&
       lastMessage.content.startsWith("/security-review")
     ) {
-      messageContent = fs.readFileSync(
-        path.join(resolveFixturesDir(), "security-review", "findings.md"),
-        "utf-8",
-      );
+      messageContent = fs
+        .readFileSync(
+          path.join(resolveFixturesDir(), "security-review", "findings.md"),
+          "utf-8",
+        )
+        .replace(/\r\n/g, "\n");
       messageContent += "\n\n" + generateDump(req);
     }
 
-    if (lastMessage && lastMessage.content === "[increment]") {
+    if (userTextContent.startsWith("[increment]")) {
       globalCounter++;
       messageContent = `counter=${globalCounter}`;
     }
 
     // Check if the last message starts with "tc=" to load test case file
     if (
-      lastMessage &&
-      lastMessage.content &&
-      typeof lastMessage.content === "string" &&
-      lastMessage.content.startsWith("tc=") &&
-      !lastMessage.content.startsWith("tc=local-agent/")
+      userTextContent.startsWith("tc=") &&
+      !userTextContent.startsWith("tc=local-agent/")
     ) {
-      const testCaseName = lastMessage.content.slice(3).split("[")[0].trim(); // Remove "tc=" prefix
+      const testCaseName = userTextContent.slice(3).split("[")[0].trim(); // Remove "tc=" prefix
       fakeLlmLog(`* Loading test case: ${testCaseName}`);
       const testFilePath = path.join(
         resolveFixturesDir(),
@@ -483,8 +573,10 @@ export default Index;
 
       try {
         if (fs.existsSync(testFilePath)) {
-          messageContent = fs.readFileSync(testFilePath, "utf-8");
-          console.log(`* Loaded test case: ${testCaseName}`);
+          messageContent = fs
+            .readFileSync(testFilePath, "utf-8")
+            .replace(/\r\n/g, "\n");
+          fakeLlmLog(`* Loaded test case: `);
         } else {
           console.error(`* Test case file not found: ${testFilePath}`);
           messageContent = `Error: Test case file not found: ${testCaseName}.md`;
@@ -506,17 +598,53 @@ export default Index;
       messageContent = `[[STRING_IS_FINISHED]]";</dyad-write>\nFinished writing file.`;
       messageContent += "\n\n" + generateDump(req);
     }
+    // See testAssertionsFixtures.ts: code synthesis for assertions the user
+    // edited before approving the card.
+    const assertionsMatch = matchAssertionCodePayload(lastMessageText);
+    if (assertionsMatch) {
+      messageContent = assertionsMatch;
+    }
+    // ...and the "run the spec you just generated" hand-off, answered without
+    // spawning a real Playwright run. Normally it comes back as the parked
+    // tool's result inside the same turn, so it's found by scanning every
+    // message; the fallback path sends it as a user message instead.
+    const assertionsResumedMatch = matchAssertionsResumedTurn(
+      messages.map(getTextContent),
+    );
+    if (assertionsResumedMatch) {
+      messageContent = assertionsResumedMatch;
+    }
+    const assertionsVerifyMatch = matchAssertionsVerifyTurn(userTextContent);
+    if (assertionsVerifyMatch) {
+      messageContent = assertionsVerifyMatch;
+    }
+    // See consentClassifier.ts: fake decisions for the MCP auto-consent
+    // classifier, shared with the responses fake route.
+    const consentMatch = matchConsentClassifierPayload(lastMessageText);
+    if (consentMatch) {
+      messageContent = consentMatch.content;
+      if (consentMatch.toolName === SLOW_CONSENT_TOOL) {
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(() => {
+            req.off("close", onClose);
+            resolve();
+          }, 4000);
+          const onClose = () => {
+            clearTimeout(timer);
+            resolve();
+          };
+          req.on("close", onClose);
+        });
+        if (req.destroyed) return;
+      }
+    }
     const isToolCall = !!(
-      lastMessage &&
-      lastMessage.content &&
-      lastMessage.content.includes("[call_tool=calculator_add]")
+      lastMessage && lastMessageText.includes("[call_tool=calculator_add]")
     );
     // Emit two parallel tool calls (slow first, fast second) so their results
     // land out of order. See mcp_out_of_order.spec.ts.
     const isParallelOutOfOrderToolCall = !!(
-      lastMessage &&
-      lastMessage.content &&
-      lastMessage.content.includes("[call_tools_out_of_order]")
+      lastMessage && lastMessageText.includes("[call_tools_out_of_order]")
     );
     let message = {
       role: "assistant",
@@ -572,6 +700,24 @@ export default Index;
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
+
+    // Large, fast updates to ONE assistant row, through the real SSE/IPC path.
+    // Keep streaming long enough to exercise user scroll-away and reattachment.
+    if (userTextContent.includes("[scroll-bursts]")) {
+      res.write(createStreamChunk("", "assistant"));
+      for (let burst = 0; burst < 80; burst++) {
+        if (res.destroyed) return;
+        const text = Array.from(
+          { length: 12 },
+          (_, line) => `Burst ${burst}, line ${line}: streaming paragraph.\n\n`,
+        ).join("");
+        res.write(createStreamChunk(text));
+        if (await waitForDelayOrDisconnect(res, 120)) return;
+      }
+      res.write(createStreamChunk("Stream finished.", "assistant", true));
+      res.end();
+      return;
+    }
 
     // Two parallel tool calls in a single assistant message (slow + fast).
     // The AI SDK runs the executes concurrently, so the fast tool's result
@@ -686,10 +832,20 @@ export default Index;
     }
 
     // Check for high token usage marker to simulate near context limit
-    const highTokensMatch =
-      typeof lastMessage?.content === "string" &&
-      !lastMessage?.content.startsWith("Summarize the following chat:") &&
-      lastMessage?.content?.match?.(/\[high-tokens=(\d+)\]/);
+    // A native tool turn ends with a tool-result message, so preserve synthetic
+    // usage requested by the most recent user message across the follow-up
+    // completion. Legacy single-completion fixtures still match the same path.
+    const highTokensMatch = [...messages]
+      .reverse()
+      .filter((message: any) => message?.role === "user")
+      .map((message: any) => message?.content)
+      .find(
+        (content: unknown) =>
+          typeof content === "string" &&
+          !content.startsWith("Summarize the following chat:") &&
+          /\[high-tokens=(\d+)\]/.test(content),
+      )
+      ?.match(/\[high-tokens=(\d+)\]/);
     const highTokensValue = highTokensMatch
       ? parseInt(highTokensMatch[1], 10)
       : null;

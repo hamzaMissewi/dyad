@@ -1,19 +1,31 @@
 import fs from "node:fs/promises";
-import { createRequire } from "node:module";
 import path from "node:path";
 import log from "electron-log";
 import {
   bulkUpdateFunctions,
+  captureSupabaseFunction,
+  captureSupabaseSharedFiles,
   deleteSupabaseFunction,
   deploySupabaseFunction,
   listSupabaseFunctions,
+  withSupabaseFunctionDeployment,
   type DeployedFunctionResponse,
+  type SupabaseFunctionSnapshot,
 } from "./supabase_management_client";
 import { SUPABASE_BUNDLE_ONLY_DEPLOY_CONCURRENCY } from "./supabase_deploy_queue";
+import type { DeferredSupabaseFunctionSync } from "./supabase_recording_deferred_sync";
 import { DyadError, DyadErrorKind } from "@/errors/dyad_error";
+import { runSupabaseDependencyAnalysis } from "@/ipc/processors/supabase_dependency_analysis";
+import type { SupabaseFunctionImpact } from "../../shared/supabase_dependency_analysis_types";
+
+import {
+  describeSupabaseFallbackReason,
+  type SupabaseDeployScope,
+} from "./supabase_deploy_scope";
+
+export type { SupabaseFunctionImpact } from "../../shared/supabase_dependency_analysis_types";
 
 const logger = log.scope("supabase_utils");
-const require = createRequire(import.meta.url);
 
 export interface SupabaseDeployProgress {
   phase: "deploying" | "finished" | "failed";
@@ -24,6 +36,11 @@ export interface SupabaseDeployProgress {
   succeeded: number;
   failed: number;
   functionName?: string;
+}
+
+export interface SupabaseDeploySummary {
+  functionCount: number;
+  prunedFunctionNames: string[];
 }
 
 export async function mapSettledWithConcurrency<T, R>(
@@ -88,6 +105,22 @@ export function isSharedServerModule(filePath: string): boolean {
   return filePath.startsWith("supabase/functions/_shared/");
 }
 
+export async function supabaseFunctionEntryExists(
+  appPath: string,
+  functionName: string,
+): Promise<boolean> {
+  try {
+    await fs.access(
+      path.join(appPath, "supabase", "functions", functionName, "index.ts"),
+    );
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return false;
+    throw error;
+  }
+}
+
 /**
  * Extracts the function name from a Supabase function file path.
  * Handles nested paths like "supabase/functions/hello/lib/utils.ts" → "hello"
@@ -124,44 +157,6 @@ export function extractFunctionNameFromPath(filePath: string): string {
   return functionName;
 }
 
-export type SupabaseFunctionImpact =
-  | { kind: "partial"; functionNames: string[] }
-  | { kind: "all"; reason: string };
-
-const SUPPORTED_SOURCE_EXTENSIONS = new Set([
-  ".ts",
-  ".tsx",
-  ".js",
-  ".jsx",
-  ".mjs",
-  ".cjs",
-  ".mts",
-  ".cts",
-]);
-
-const RESOLUTION_EXTENSIONS = [
-  ".ts",
-  ".tsx",
-  ".js",
-  ".jsx",
-  ".mjs",
-  ".cjs",
-  ".mts",
-  ".cts",
-];
-
-function normalizeRelativePath(filePath: string): string {
-  return filePath.replace(/\\/g, "/").replace(/^\.\/+/, "");
-}
-
-function isPathWithin(parent: string, child: string): boolean {
-  const relative = path.relative(parent, child);
-  return (
-    relative === "" ||
-    (!!relative && !relative.startsWith("..") && !path.isAbsolute(relative))
-  );
-}
-
 async function getValidSupabaseFunctionNames(
   functionsDir: string,
 ): Promise<string[]> {
@@ -185,209 +180,6 @@ async function getValidSupabaseFunctionNames(
   return validFunctions;
 }
 
-function loadAppTypeScript(
-  appPath: string,
-): typeof import("typescript") | null {
-  try {
-    const tsPath = require.resolve("typescript", { paths: [appPath] });
-    return require(tsPath) as typeof import("typescript");
-  } catch {
-    return null;
-  }
-}
-
-function scriptKindForPath(ts: typeof import("typescript"), filePath: string) {
-  switch (path.extname(filePath)) {
-    case ".tsx":
-      return ts.ScriptKind.TSX;
-    case ".js":
-    case ".mjs":
-    case ".cjs":
-      return ts.ScriptKind.JS;
-    case ".jsx":
-      return ts.ScriptKind.JSX;
-    default:
-      return ts.ScriptKind.TS;
-  }
-}
-
-function isClearlyExternalSpecifier(specifier: string): boolean {
-  return (
-    specifier.startsWith("npm:") ||
-    specifier.startsWith("jsr:") ||
-    specifier.startsWith("http://") ||
-    specifier.startsWith("https://") ||
-    specifier.startsWith("@supabase/")
-  );
-}
-
-async function resolveLocalImport({
-  fromFile,
-  specifier,
-  functionsDir,
-}: {
-  fromFile: string;
-  specifier: string;
-  functionsDir: string;
-}): Promise<string | SupabaseFunctionImpact> {
-  const resolvedBase = path.resolve(path.dirname(fromFile), specifier);
-
-  if (!isPathWithin(functionsDir, resolvedBase)) {
-    return {
-      kind: "all",
-      reason: `relative_import_outside_supabase_functions:${specifier}`,
-    };
-  }
-
-  const ext = path.extname(resolvedBase);
-  const candidates =
-    ext.length > 0
-      ? [resolvedBase]
-      : [
-          resolvedBase,
-          ...RESOLUTION_EXTENSIONS.map(
-            (candidateExt) => resolvedBase + candidateExt,
-          ),
-          ...RESOLUTION_EXTENSIONS.map((candidateExt) =>
-            path.join(resolvedBase, `index${candidateExt}`),
-          ),
-        ];
-
-  for (const candidate of candidates) {
-    try {
-      const stat = await fs.stat(candidate);
-      if (stat.isFile()) {
-        if (!isPathWithin(functionsDir, candidate)) {
-          return {
-            kind: "all",
-            reason: `resolved_import_outside_supabase_functions:${specifier}`,
-          };
-        }
-        return candidate;
-      }
-    } catch {
-      // Try the next supported resolution candidate.
-    }
-  }
-
-  return { kind: "all", reason: `unresolved_relative_import:${specifier}` };
-}
-
-async function collectLocalDependencies({
-  ts,
-  filePath,
-  functionsDir,
-}: {
-  ts: typeof import("typescript");
-  filePath: string;
-  functionsDir: string;
-}): Promise<string[] | SupabaseFunctionImpact> {
-  let sourceText: string;
-  try {
-    sourceText = await fs.readFile(filePath, "utf8");
-  } catch {
-    return { kind: "all", reason: `unable_to_read_source:${filePath}` };
-  }
-
-  let sourceFile: import("typescript").SourceFile;
-  try {
-    sourceFile = ts.createSourceFile(
-      filePath,
-      sourceText,
-      ts.ScriptTarget.Latest,
-      true,
-      scriptKindForPath(ts, filePath),
-    );
-  } catch {
-    return { kind: "all", reason: `parse_failure:${filePath}` };
-  }
-
-  const specifiers: string[] = [];
-  let unsafeReason: string | undefined;
-
-  function addSpecifier(specifierNode: import("typescript").Expression) {
-    if (ts.isStringLiteralLike(specifierNode)) {
-      specifiers.push(specifierNode.text);
-    } else {
-      unsafeReason = `non_literal_dynamic_import:${filePath}`;
-    }
-  }
-
-  function visit(node: import("typescript").Node) {
-    if (unsafeReason) {
-      return;
-    }
-
-    if (
-      (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) &&
-      node.moduleSpecifier
-    ) {
-      addSpecifier(node.moduleSpecifier);
-      return;
-    }
-
-    if (
-      ts.isCallExpression(node) &&
-      node.expression.kind === ts.SyntaxKind.ImportKeyword
-    ) {
-      const [specifier] = node.arguments;
-      if (!specifier) {
-        unsafeReason = `missing_dynamic_import_specifier:${filePath}`;
-        return;
-      }
-      addSpecifier(specifier);
-      return;
-    }
-
-    if (
-      ts.isCallExpression(node) &&
-      ts.isIdentifier(node.expression) &&
-      node.expression.text === "require"
-    ) {
-      unsafeReason = `commonjs_require:${filePath}`;
-      return;
-    }
-
-    if (
-      ts.isImportEqualsDeclaration(node) &&
-      ts.isExternalModuleReference(node.moduleReference)
-    ) {
-      unsafeReason = `import_equals_require:${filePath}`;
-      return;
-    }
-
-    ts.forEachChild(node, visit);
-  }
-
-  visit(sourceFile);
-
-  if (unsafeReason) {
-    return { kind: "all", reason: unsafeReason };
-  }
-
-  const dependencies: string[] = [];
-  for (const specifier of specifiers) {
-    if (specifier.startsWith("./") || specifier.startsWith("../")) {
-      const resolved = await resolveLocalImport({
-        fromFile: filePath,
-        specifier,
-        functionsDir,
-      });
-      if (typeof resolved !== "string") {
-        return resolved;
-      }
-      dependencies.push(resolved);
-      continue;
-    }
-
-    if (!isClearlyExternalSpecifier(specifier)) {
-      return { kind: "all", reason: `unknown_bare_specifier:${specifier}` };
-    }
-  }
-
-  return dependencies;
-}
-
 export async function getSupabaseFunctionsAffectedBySharedModules({
   appPath,
   changedSharedModulePaths,
@@ -395,119 +187,95 @@ export async function getSupabaseFunctionsAffectedBySharedModules({
   appPath: string;
   changedSharedModulePaths: string[];
 }): Promise<SupabaseFunctionImpact> {
-  const functionsDir = path.join(appPath, "supabase", "functions");
   try {
-    await fs.access(functionsDir);
-  } catch {
-    return { kind: "partial", functionNames: [] };
+    return await runSupabaseDependencyAnalysis({
+      appPath,
+      changedSharedModulePaths,
+    });
+  } catch (error) {
+    logger.warn(
+      "Supabase dependency analysis failed; deploying all functions",
+      error,
+    );
+    return {
+      kind: "all",
+      reason: {
+        code: "dependency_analysis_failed",
+        detail: error instanceof Error ? error.message : String(error),
+      },
+    };
   }
+}
 
-  const ts = loadAppTypeScript(appPath);
-  if (!ts) {
-    return { kind: "all", reason: "typescript_not_installed" };
-  }
+interface AppScopedDeployArgs {
+  appId?: number;
+  appPath: string;
+  supabaseProjectId: string;
+  onSnapshotCaptured?: () => void | Promise<void>;
+  signal?: AbortSignal;
+}
 
-  const changedSharedPaths = new Set<string>();
-  for (const changedPath of changedSharedModulePaths) {
-    const normalized = normalizeRelativePath(changedPath);
-    const ext = path.extname(normalized);
-    if (!SUPPORTED_SOURCE_EXTENSIONS.has(ext)) {
-      return {
-        kind: "all",
-        reason: `unsupported_changed_shared_path:${changedPath}`,
-      };
-    }
+/**
+ * With an `appId`, admits the deploy under the app's function-deployment
+ * ownership, resolves the current app path, and releases the repository and
+ * provider preparation claims once the batch snapshot is captured.
+ */
+function withAppDeploymentOwnership<Args extends AppScopedDeployArgs, Result>(
+  { appId, ...args }: Args,
+  sync: Omit<DeferredSupabaseFunctionSync, "supabaseProjectId">,
+  deploy: (args: Omit<Args, "appId">) => Promise<Result>,
+): Promise<Result> {
+  if (appId === undefined) return deploy(args);
+  return withSupabaseFunctionDeployment(
+    {
+      appId,
+      supabaseProjectId: args.supabaseProjectId,
+      signal: args.signal,
+      sync,
+    },
+    (operation, appPath) =>
+      deploy({
+        ...args,
+        appPath,
+        onSnapshotCaptured: async () => {
+          operation.releaseResources(["repository", "provider"]);
+          await args.onSnapshotCaptured?.();
+        },
+      }),
+  );
+}
 
-    const absolutePath = path.resolve(appPath, normalized);
-    if (!isPathWithin(functionsDir, absolutePath)) {
-      return {
-        kind: "all",
-        reason: `changed_shared_path_outside_functions:${changedPath}`,
-      };
-    }
-
-    try {
-      const stat = await fs.stat(absolutePath);
-      if (stat.isDirectory()) {
-        return {
-          kind: "all",
-          reason: `changed_shared_directory:${changedPath}`,
-        };
-      }
-    } catch {
-      // Deleted or renamed files may no longer exist. Keep the exact source-like
-      // path in the impact set; unresolved imports will force fallback.
-    }
-
-    changedSharedPaths.add(absolutePath);
-  }
-
-  if (changedSharedPaths.size === 0) {
-    return { kind: "partial", functionNames: [] };
-  }
-
-  let validFunctions: string[];
-  try {
-    validFunctions = await getValidSupabaseFunctionNames(functionsDir);
-  } catch {
-    return { kind: "all", reason: "unable_to_enumerate_functions" };
-  }
-
-  const dependencyCache = new Map<string, string[]>();
-  const affectedFunctionNames: string[] = [];
-
-  for (const functionName of validFunctions) {
-    const entrypoint = path.join(functionsDir, functionName, "index.ts");
-    const visited = new Set<string>();
-    const stack = [entrypoint];
-    let affected = false;
-
-    while (stack.length > 0) {
-      const current = stack.pop()!;
-      if (visited.has(current)) {
-        continue;
-      }
-      visited.add(current);
-
-      if (changedSharedPaths.has(current)) {
-        affected = true;
-        break;
-      }
-
-      let dependencies = dependencyCache.get(current);
-      if (!dependencies) {
-        const collected = await collectLocalDependencies({
-          ts,
-          filePath: current,
-          functionsDir,
-        });
-        if (!Array.isArray(collected)) {
-          return collected;
-        }
-        dependencies = collected;
-        dependencyCache.set(current, dependencies);
-      }
-
-      for (const dependency of dependencies) {
-        if (!visited.has(dependency)) {
-          stack.push(dependency);
-        }
-      }
-    }
-
-    if (affected) {
-      affectedFunctionNames.push(functionName);
-    }
-  }
-
-  return { kind: "partial", functionNames: affectedFunctionNames };
+interface DeployAffectedSupabaseFunctionsArgs extends AppScopedDeployArgs {
+  supabaseOrganizationSlug: string | null;
+  skipPruneEdgeFunctions: boolean;
+  sharedModulesChanged: boolean;
+  changedSharedModulePaths: string[];
+  pendingFunctionDeploys: string[];
+  onProgress?: (progress: SupabaseDeployProgress) => void;
+  /** Called with the chosen function set before any function deploys. */
+  onScopeResolved?: (scope: SupabaseDeployScope) => void;
 }
 
 /**
  * Deploys the right Supabase function set after shared module changes and/or
  * deferred direct function deploys.
  */
-export async function deployAffectedSupabaseFunctions({
+export function deployAffectedSupabaseFunctions(
+  args: DeployAffectedSupabaseFunctionsArgs,
+): Promise<string[]> {
+  return withAppDeploymentOwnership(
+    args,
+    {
+      organizationSlug: args.supabaseOrganizationSlug,
+      functionNames: args.pendingFunctionDeploys,
+      sharedModulesChanged: args.sharedModulesChanged,
+      sharedModulePaths: args.changedSharedModulePaths,
+    },
+    deployAffectedUnscoped,
+  );
+}
+
+async function deployAffectedUnscoped({
   appPath,
   supabaseProjectId,
   supabaseOrganizationSlug,
@@ -516,22 +284,18 @@ export async function deployAffectedSupabaseFunctions({
   changedSharedModulePaths,
   pendingFunctionDeploys,
   onProgress,
-}: {
-  appPath: string;
-  supabaseProjectId: string;
-  supabaseOrganizationSlug: string | null;
-  skipPruneEdgeFunctions: boolean;
-  sharedModulesChanged: boolean;
-  changedSharedModulePaths: string[];
-  pendingFunctionDeploys: string[];
-  onProgress?: (progress: SupabaseDeployProgress) => void;
-}): Promise<string[]> {
+  onScopeResolved,
+  onSnapshotCaptured,
+  signal,
+}: Omit<DeployAffectedSupabaseFunctionsArgs, "appId">): Promise<string[]> {
   const deployArgs = {
     appPath,
     supabaseProjectId,
     supabaseOrganizationSlug,
     skipPruneEdgeFunctions,
     onProgress,
+    onSnapshotCaptured,
+    signal,
   };
 
   if (sharedModulesChanged) {
@@ -543,7 +307,7 @@ export async function deployAffectedSupabaseFunctions({
           })
         : ({
             kind: "all",
-            reason: "changed_shared_paths_missing",
+            reason: { code: "changed_shared_paths_missing" },
           } as const);
 
     if (impact.kind === "partial") {
@@ -555,26 +319,42 @@ export async function deployAffectedSupabaseFunctions({
           ? `Shared modules changed, redeploying affected Supabase functions: ${functionNames.join(", ")}`
           : "Shared modules changed, no affected Supabase functions to bundle",
       );
-      return deploySupabaseFunctions({
+      onScopeResolved?.({
+        kind: "affected",
+        changedSharedModulePaths: Array.from(new Set(changedSharedModulePaths)),
+        affectedFunctionNames: impact.functionNames,
+        editedFunctionNames: Array.from(new Set(pendingFunctionDeploys)),
+      });
+      return deploySupabaseFunctionsUnscoped({
         ...deployArgs,
         functionNames,
       });
     }
 
     logger.info(
-      `Shared module dependency analysis fell back to all functions: ${impact.reason}`,
+      `Shared module dependency analysis fell back to all functions (${impact.reason.code}): ${describeSupabaseFallbackReason(impact.reason)}`,
     );
-    return deployAllSupabaseFunctions(deployArgs);
+    onScopeResolved?.({ kind: "all", reason: impact.reason });
+    return deploySupabaseFunctionsUnscoped(deployArgs);
   }
 
   const functionNames = Array.from(new Set(pendingFunctionDeploys));
   logger.info(
     `Redeploying pending Supabase functions: ${functionNames.join(", ")}`,
   );
-  return deploySupabaseFunctions({
+  onScopeResolved?.({ kind: "edited", functionNames });
+  return deploySupabaseFunctionsUnscoped({
     ...deployArgs,
     functionNames,
   });
+}
+
+interface DeploySupabaseFunctionsArgs extends AppScopedDeployArgs {
+  supabaseOrganizationSlug: string | null;
+  skipPruneEdgeFunctions: boolean;
+  functionNames?: string[];
+  onProgress?: (progress: SupabaseDeployProgress) => void;
+  onSummary?: (summary: SupabaseDeploySummary) => void;
 }
 
 /**
@@ -585,29 +365,46 @@ export async function deployAffectedSupabaseFunctions({
  * @param skipPruneEdgeFunctions - If false, delete any deployed edge functions that are not in the codebase
  * @returns An array of error messages for functions that failed to deploy (empty if all succeeded)
  */
-export async function deploySupabaseFunctions({
+export function deploySupabaseFunctions(
+  args: DeploySupabaseFunctionsArgs,
+): Promise<string[]> {
+  return withAppDeploymentOwnership(
+    args,
+    {
+      organizationSlug: args.supabaseOrganizationSlug,
+      functionNames: args.functionNames,
+    },
+    deploySupabaseFunctionsUnscoped,
+  );
+}
+
+async function deploySupabaseFunctionsUnscoped({
   appPath,
   supabaseProjectId,
   supabaseOrganizationSlug,
   skipPruneEdgeFunctions,
   functionNames,
   onProgress,
-}: {
-  appPath: string;
-  supabaseProjectId: string;
-  supabaseOrganizationSlug: string | null;
-  skipPruneEdgeFunctions: boolean;
-  functionNames?: string[];
-  onProgress?: (progress: SupabaseDeployProgress) => void;
-}): Promise<string[]> {
+  onSnapshotCaptured,
+  signal,
+  onSummary,
+}: Omit<DeploySupabaseFunctionsArgs, "appId">): Promise<string[]> {
+  signal?.throwIfAborted();
   const functionsDir = path.join(appPath, "supabase", "functions");
+  const prunedFunctionNames: string[] = [];
+  let functionCount = 0;
+  let reportFailure: (() => void) | undefined;
+  const finish = (errors: string[]) => {
+    onSummary?.({ functionCount, prunedFunctionNames });
+    return errors;
+  };
 
-  // Check if supabase/functions directory exists
   try {
     await fs.access(functionsDir);
   } catch {
     logger.info(`No supabase/functions directory found at ${functionsDir}`);
-    return [];
+    await onSnapshotCaptured?.();
+    return finish([]);
   }
 
   const errors: string[] = [];
@@ -631,6 +428,7 @@ export async function deploySupabaseFunctions({
           return false;
         })
       : allValidFunctions;
+    functionCount = validFunctions.length;
     if (missingRequestedFunctionNames.length > 0) {
       const errorMessage = `Requested Supabase functions do not exist locally or are missing index.ts: ${missingRequestedFunctionNames.join(", ")}`;
       logger.error(errorMessage);
@@ -643,11 +441,19 @@ export async function deploySupabaseFunctions({
 
     if (validFunctions.length === 0) {
       logger.info("No valid functions to deploy");
-      if (!requestedFunctionNames) {
-        return [];
-      }
+      signal?.throwIfAborted();
       if (errors.length > 0) {
-        return errors;
+        await onSnapshotCaptured?.();
+        return finish(errors);
+      }
+      // An empty complete local set is not enough evidence that every remote
+      // function should be deleted. The project may have been connected with
+      // remote-only production functions, or the last local function may have
+      // just been removed. Manual whole-set sync therefore falls back to a
+      // deploy-only no-op instead of pruning the entire remote project.
+      if (allValidFunctions.length === 0) {
+        await onSnapshotCaptured?.();
+        return finish([]);
       }
     }
 
@@ -676,25 +482,52 @@ export async function deploySupabaseFunctions({
         functionName,
       });
     }
+    reportFailure = () => emitProgress("failed");
 
     if (validFunctions.length > 0) {
       emitProgress("deploying");
     }
 
-    const deployResults = await mapSettledWithConcurrency(
+    const sharedFiles =
+      validFunctions.length > 0
+        ? await captureSupabaseSharedFiles(appPath)
+        : [];
+    // Entries are cleared once bundled so a large batch does not keep every
+    // captured file alive through activation and pruning.
+    const snapshots: Array<
+      PromiseSettledResult<SupabaseFunctionSnapshot> | undefined
+    > = await mapSettledWithConcurrency(
       validFunctions,
       SUPABASE_BUNDLE_ONLY_DEPLOY_CONCURRENCY,
       async (functionName) => {
+        signal?.throwIfAborted();
+        return captureSupabaseFunction({ appPath, functionName, sharedFiles });
+      },
+    );
+    signal?.throwIfAborted();
+    await onSnapshotCaptured?.();
+    signal?.throwIfAborted();
+
+    const deployResults = await mapSettledWithConcurrency(
+      validFunctions,
+      SUPABASE_BUNDLE_ONLY_DEPLOY_CONCURRENCY,
+      async (functionName, index) => {
         activeFunctions++;
         emitProgress("deploying", functionName);
         logger.info(`Bundling function: ${functionName}`);
         try {
+          signal?.throwIfAborted();
+          const snapshot = snapshots[index]!;
+          snapshots[index] = undefined;
+          if (snapshot.status === "rejected") throw snapshot.reason;
           const result = await deploySupabaseFunction({
             supabaseProjectId,
             organizationSlug: supabaseOrganizationSlug,
             functionName,
             appPath,
             bundleOnly: true,
+            snapshot: snapshot.value,
+            signal,
           });
           succeededFunctions++;
           logger.info(`Successfully bundled function: ${functionName}`);
@@ -709,6 +542,8 @@ export async function deploySupabaseFunctions({
         }
       },
     );
+
+    signal?.throwIfAborted();
 
     // Collect successful results and errors
     const successfulDeploys: DeployedFunctionResponse[] = [];
@@ -736,12 +571,14 @@ export async function deploySupabaseFunctions({
         await bulkUpdateFunctions({
           supabaseProjectId,
           functions: successfulDeploys,
+          signal,
           organizationSlug: supabaseOrganizationSlug,
         });
         logger.info(
           `Successfully activated ${successfulDeploys.length} functions`,
         );
       } catch (error: any) {
+        signal?.throwIfAborted();
         const errorMessage = `Failed to bulk update functions: ${error.message}`;
         logger.error(errorMessage, error);
         errors.push(errorMessage);
@@ -755,6 +592,7 @@ export async function deploySupabaseFunctions({
         const deployedFunctions = await listSupabaseFunctions({
           supabaseProjectId,
           organizationSlug: supabaseOrganizationSlug,
+          signal,
         });
 
         const localFunctionNames = new Set(allValidFunctions);
@@ -773,9 +611,12 @@ export async function deploySupabaseFunctions({
                 supabaseProjectId,
                 functionName: fn.slug,
                 organizationSlug: supabaseOrganizationSlug,
+                signal,
               });
+              prunedFunctionNames.push(fn.slug);
               logger.info(`Pruned dangling edge function: ${fn.slug}`);
             } catch (deleteError: any) {
+              signal?.throwIfAborted();
               const errorMessage = `Failed to prune edge function ${fn.slug}: ${deleteError.message}`;
               logger.error(errorMessage, deleteError);
               errors.push(errorMessage);
@@ -785,6 +626,7 @@ export async function deploySupabaseFunctions({
           logger.info("No dangling edge functions found");
         }
       } catch (pruneError: any) {
+        signal?.throwIfAborted();
         const errorMessage = `Failed to check for dangling edge functions: ${pruneError.message}`;
         logger.error(errorMessage, pruneError);
         errors.push(errorMessage);
@@ -797,12 +639,14 @@ export async function deploySupabaseFunctions({
       );
     }
   } catch (error: any) {
+    reportFailure?.();
+    signal?.throwIfAborted();
     const errorMessage = `Error reading functions directory: ${error.message}`;
     logger.error(errorMessage, error);
     errors.push(errorMessage);
   }
 
-  return errors;
+  return finish(errors);
 }
 
 /**
@@ -814,11 +658,15 @@ export async function deploySupabaseFunctions({
  * @returns An array of error messages for functions that failed to deploy (empty if all succeeded)
  */
 export async function deployAllSupabaseFunctions(args: {
+  appId?: number;
   appPath: string;
   supabaseProjectId: string;
   supabaseOrganizationSlug: string | null;
   skipPruneEdgeFunctions: boolean;
   onProgress?: (progress: SupabaseDeployProgress) => void;
+  onSnapshotCaptured?: () => void | Promise<void>;
+  signal?: AbortSignal;
+  onSummary?: (summary: SupabaseDeploySummary) => void;
 }): Promise<string[]> {
   return deploySupabaseFunctions(args);
 }

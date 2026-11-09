@@ -1,5 +1,9 @@
 import { spawn as spawnProcess } from "node:child_process";
 import { spawn as spawnPty } from "node-pty";
+import {
+  BoundedOutputBuffer,
+  DEFAULT_MAX_BUFFERED_OUTPUT_BYTES,
+} from "./bounded_output_buffer";
 
 const DEFAULT_PTY_NAME = "xterm-color";
 const DEFAULT_PTY_COLS = 160;
@@ -9,6 +13,149 @@ export const DEFAULT_PTY_COMMAND_TIMEOUT_MS = 10 * 60 * 1000;
 const ANSI_OSC_PATTERN = /\u001B\][^\u0007]*(?:\u0007|\u001B\\)/g;
 const ANSI_CSI_PATTERN = /(?:\u001B\[|\u009B)[0-?]*[ -/]*[@-~]/g;
 const ANSI_SINGLE_CHAR_PATTERN = /\u001B[@-Z\\-_]/g;
+const MAX_UNTERMINATED_OSC_CHARACTERS = 8 * 1024;
+
+type AnsiParserState =
+  | "text"
+  | "escape"
+  | "csi"
+  | "osc"
+  | "osc-escape"
+  | "osc-discard"
+  | "osc-discard-escape";
+
+/**
+ * Removes terminal control sequences before output enters the bounded buffer.
+ * The parser state spans PTY chunks so truncation can never expose the middle
+ * of an ANSI sequence as user-visible text.
+ */
+class StreamingAnsiStripper {
+  private state: AnsiParserState = "text";
+  private oscCharacters = 0;
+
+  write(value: string): string {
+    let output = "";
+    let visibleStart = this.state === "text" ? 0 : -1;
+
+    const enterControlSequence = (
+      index: number,
+      state: Exclude<AnsiParserState, "text">,
+    ) => {
+      if (visibleStart >= 0) {
+        output += value.slice(visibleStart, index);
+      }
+      visibleStart = -1;
+      this.state = state;
+    };
+
+    const resumeText = (nextIndex: number) => {
+      this.state = "text";
+      this.oscCharacters = 0;
+      visibleStart = nextIndex;
+    };
+
+    for (let index = 0; index < value.length; index += 1) {
+      const code = value.charCodeAt(index);
+
+      switch (this.state) {
+        case "text":
+          if (code === 0x1b) {
+            enterControlSequence(index, "escape");
+          } else if (code === 0x9b) {
+            enterControlSequence(index, "csi");
+          }
+          break;
+        case "escape":
+          if (value[index] === "[") {
+            this.state = "csi";
+          } else if (value[index] === "]") {
+            this.state = "osc";
+            this.oscCharacters = 0;
+          } else if (code >= 0x40 && code <= 0x5f) {
+            resumeText(index + 1);
+          } else {
+            // Match normalizePtyOutput's behavior for an unknown escape:
+            // discard ESC but preserve the following visible character.
+            output += value[index];
+            resumeText(index + 1);
+          }
+          break;
+        case "csi":
+          if (code >= 0x40 && code <= 0x7e) {
+            resumeText(index + 1);
+          }
+          break;
+        case "osc":
+          this.oscCharacters += 1;
+          if (code === 0x07) {
+            resumeText(index + 1);
+          } else if (code === 0x0a) {
+            // OSC payloads cannot contain line feeds. Recover from malformed
+            // output so an unterminated title sequence cannot hide every
+            // later user-visible error line.
+            resumeText(index + 1);
+          } else if (code === 0x1b) {
+            // Check the ST terminator introducer before the size cap so an
+            // oversized-but-terminated OSC is not split at the boundary.
+            this.state = "osc-escape";
+          } else if (this.oscCharacters >= MAX_UNTERMINATED_OSC_CHARACTERS) {
+            // The OSC exceeded the recovery cap. A long-but-terminated OSC must
+            // still be stripped in full, so do not resume text in the middle
+            // of the sequence. Switch to discard mode and keep consuming bytes
+            // until a real ST terminator (BEL or ESC \) or a line feed arrives.
+            this.state = "osc-discard";
+          }
+          break;
+        case "osc-escape":
+          this.oscCharacters += 1;
+          if (value[index] === "\\") {
+            resumeText(index + 1);
+          } else if (code === 0x0a) {
+            resumeText(index + 1);
+          } else if (this.oscCharacters >= MAX_UNTERMINATED_OSC_CHARACTERS) {
+            this.state = "osc-discard";
+          } else if (code !== 0x1b) {
+            this.state = "osc";
+          }
+          break;
+        case "osc-discard":
+          // Discard the remainder of an oversized OSC until a real ST
+          // terminator (BEL or ESC \) or a line feed/carriage-return arrives,
+          // then resume visible text. Command output contains line feeds at
+          // every line boundary, so a genuinely unterminated producer still
+          // recovers at the next line — and the bounded output buffer plus
+          // command timeout cap any runaway that never emits a delimiter.
+          if (code === 0x07) {
+            resumeText(index + 1);
+          } else if (code === 0x0a || code === 0x0d) {
+            resumeText(index + 1);
+          } else if (code === 0x1b) {
+            this.state = "osc-discard-escape";
+          }
+          break;
+        case "osc-discard-escape":
+          if (value[index] === "\\") {
+            resumeText(index + 1);
+          } else if (code === 0x07) {
+            // ESC followed by BEL: the payload happened to end with ESC and the
+            // OSC is terminated by a standalone BEL — treat it as ST and resume.
+            resumeText(index + 1);
+          } else if (code === 0x0a || code === 0x0d) {
+            resumeText(index + 1);
+          } else if (code !== 0x1b) {
+            this.state = "osc-discard";
+          }
+          break;
+      }
+    }
+
+    if (this.state === "text" && visibleStart >= 0) {
+      output += value.slice(visibleStart);
+    }
+
+    return output;
+  }
+}
 
 export interface PtyCommandExecutionOptions {
   cwd?: string;
@@ -18,6 +165,18 @@ export interface PtyCommandExecutionOptions {
   rows?: number;
   name?: string;
   displayCommand?: string;
+  maxOutputBytes?: number;
+  /**
+   * When true, `args` is a pre-escaped command line that node-pty must forward
+   * VERBATIM (instead of running its `argsToCommandLine` MSVC `\"` argv-quoting
+   * on top). Used for the Windows `.cmd`/`.bat` shim path, where
+   * `buildWindowsCommandInvocation` already cmd-escaped the `/c` payload; a
+   * second escaping layer would corrupt every quoted argument. node-pty is
+   * handed the args as a single `string`, which its `argsToCommandLine` treats
+   * as an already-formed command line and only MSVC-quotes the executable
+   * path before appending.
+   */
+  useVerbatimArguments?: boolean;
 }
 
 export interface PtyCommandExecutionResult {
@@ -68,7 +227,7 @@ interface SpawnedProcessLike {
 
 export type PtySpawner = (
   file: string,
-  args: string[],
+  args: string[] | string,
   options: {
     cols: number;
     cwd?: string;
@@ -233,11 +392,96 @@ export async function runPtyCommand(
   options: PtyCommandExecutionOptions = {},
   ptySpawner: PtySpawner = spawnPty,
 ): Promise<PtyCommandExecutionResult> {
+  // node-pty is a native module built for Electron's ABI; under a plain node
+  // runtime (vitest harnesses, benchmarks) it fails with posix_spawnp errors.
+  // DYAD_DISABLE_PTY=1 opts into a plain child_process execution with the
+  // same result contract (merged output, cwd/env/timeout honored).
+  if (process.env.DYAD_DISABLE_PTY === "1") {
+    return runCommandWithoutPty(command, args, options);
+  }
+  return runPtyCommandWithPty(command, args, options, ptySpawner);
+}
+
+function runCommandWithoutPty(
+  command: string,
+  args: string[],
+  options: PtyCommandExecutionOptions = {},
+): Promise<PtyCommandExecutionResult> {
   return new Promise((resolve, reject) => {
     const displayedCommand =
       options.displayCommand ?? buildDisplayedCommand(command, args);
     const timeoutMs = options.timeoutMs ?? DEFAULT_PTY_COMMAND_TIMEOUT_MS;
-    const outputChunks: string[] = [];
+    const outputBuffer = new BoundedOutputBuffer(
+      options.maxOutputBytes ?? DEFAULT_MAX_BUFFERED_OUTPUT_BYTES,
+    );
+    let didSettle = false;
+    const child = spawnProcess(command, args, {
+      cwd: options.cwd,
+      env: options.env ?? process.env,
+      // shell resolves the command via PATH the same way a terminal would,
+      // matching what the PTY path effectively provides.
+      shell: true,
+      windowsHide: true,
+    });
+    const timeoutId = setTimeout(() => {
+      if (didSettle) return;
+      didSettle = true;
+      child.kill("SIGKILL");
+      reject(
+        new PtyCommandExecutionError({
+          message: `Command '${displayedCommand}' timed out after ${timeoutMs}ms`,
+          output: outputBuffer.toString(),
+          exitCode: null,
+        }),
+      );
+    }, timeoutMs);
+    child.stdout?.on("data", (d: Buffer) => outputBuffer.append(d.toString()));
+    child.stderr?.on("data", (d: Buffer) => outputBuffer.append(d.toString()));
+    child.on("error", (error) => {
+      if (didSettle) return;
+      didSettle = true;
+      clearTimeout(timeoutId);
+      reject(
+        new PtyCommandExecutionError({
+          message: `Command '${displayedCommand}' failed: ${error.message}`,
+          output: outputBuffer.toString(),
+          exitCode: null,
+        }),
+      );
+    });
+    child.on("exit", (code) => {
+      if (didSettle) return;
+      didSettle = true;
+      clearTimeout(timeoutId);
+      if (code === 0) {
+        resolve({ output: outputBuffer.toString() });
+      } else {
+        reject(
+          new PtyCommandExecutionError({
+            message: buildExitMessage(displayedCommand, code ?? -1, undefined),
+            output: outputBuffer.toString(),
+            exitCode: code ?? null,
+          }),
+        );
+      }
+    });
+  });
+}
+
+function runPtyCommandWithPty(
+  command: string,
+  args: string[],
+  options: PtyCommandExecutionOptions = {},
+  ptySpawner: PtySpawner = spawnPty,
+): Promise<PtyCommandExecutionResult> {
+  return new Promise((resolve, reject) => {
+    const displayedCommand =
+      options.displayCommand ?? buildDisplayedCommand(command, args);
+    const timeoutMs = options.timeoutMs ?? DEFAULT_PTY_COMMAND_TIMEOUT_MS;
+    const outputBuffer = new BoundedOutputBuffer(
+      options.maxOutputBytes ?? DEFAULT_MAX_BUFFERED_OUTPUT_BYTES,
+    );
+    const ansiStripper = new StreamingAnsiStripper();
     let didSettle = false;
     let timeoutId: NodeJS.Timeout | undefined;
     let dataSubscription: { dispose(): void } = { dispose: () => {} };
@@ -259,7 +503,19 @@ export async function runPtyCommand(
 
     let ptyProcess: PtyProcessLike;
     try {
-      ptyProcess = ptySpawner(command, args, {
+      // On the Windows batch path (`useVerbatimArguments`), `args` is the
+      // cmd-escaped `/d /s /c "..."` payload that `buildWindowsCommandInvocation`
+      // already quoted. Pass it as a single string so node-pty's
+      // `argsToCommandLine` treats it as a pre-formed command line (it only
+      // MSVC-quotes the executable path, then appends the string verbatim)
+      // instead of re-applying MSVC `\"` escaping on top of the cmd-style `""`
+      // doubling — which would corrupt every quoted argument. Otherwise pass
+      // the array so node-pty applies its normal argv-quoting for real
+      // executables (e.g. `git`, `node.exe`).
+      const ptyArgs: string[] | string = options.useVerbatimArguments
+        ? args.join(" ")
+        : args;
+      ptyProcess = ptySpawner(command, ptyArgs, {
         cols: options.cols ?? DEFAULT_PTY_COLS,
         cwd: options.cwd,
         env: options.env ?? process.env,
@@ -279,14 +535,15 @@ export async function runPtyCommand(
     }
 
     dataSubscription = ptyProcess.onData((chunk) => {
-      outputChunks.push(chunk);
+      outputBuffer.append(ansiStripper.write(chunk));
     });
 
     exitSubscription = ptyProcess.onExit(({ exitCode, signal }) => {
       const failed = exitCode !== 0 || hasSignal(signal);
-      const output = normalizePtyOutput(outputChunks.join(""), {
+      const output = normalizePtyOutput(outputBuffer.toString(), {
         preserveCarriageReturnFrames: failed,
       });
+      outputBuffer.clear();
 
       if (!failed) {
         settle(() => resolve({ output }));
@@ -306,19 +563,14 @@ export async function runPtyCommand(
     });
 
     timeoutId = setTimeout(() => {
-      try {
-        terminatePtyProcess(ptyProcess);
-      } catch {
-        // Best effort only. The timeout error below remains the source of truth.
-      }
-
       const timeoutMessage = buildTimeoutMessage(displayedCommand, timeoutMs);
       const output = appendCommandMessage(
-        normalizePtyOutput(outputChunks.join(""), {
+        normalizePtyOutput(outputBuffer.toString(), {
           preserveCarriageReturnFrames: true,
         }),
         timeoutMessage,
       );
+      outputBuffer.clear();
 
       settle(() =>
         reject(
@@ -328,6 +580,12 @@ export async function runPtyCommand(
           }),
         ),
       );
+
+      try {
+        terminatePtyProcess(ptyProcess);
+      } catch {
+        // Best effort only. The timeout error above remains the source of truth.
+      }
     }, timeoutMs);
   });
 }

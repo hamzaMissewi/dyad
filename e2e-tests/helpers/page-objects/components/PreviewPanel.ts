@@ -73,11 +73,35 @@ export class PreviewPanel {
       | "preview"
       | "configure"
       | "security"
-      | "publish",
+      | "publish"
+      | "tests",
   ) {
     // Mode buttons live inside the preview panel, so the panel must be expanded
     // before they're clickable. If the panel is collapsed, the chat panel covers
     // the toolbar and intercepts pointer events.
+    await this.ensurePreviewPanelOpen();
+
+    // When the tab row is too narrow, trailing tabs move into an overflow
+    // dropdown ("…"). Open the dropdown first if the direct button isn't
+    // visible; the active tab is always rendered in the row itself.
+    const directButton = this.page.getByTestId(`${mode}-mode-button`);
+    await expect(async () => {
+      const isInOverflow =
+        (await directButton
+          .first()
+          .isVisible()
+          .catch(() => false)) === false;
+      if (isInOverflow) {
+        await this.page
+          .getByTestId("preview-mode-overflow-button")
+          .click({ timeout: 1_000 });
+      }
+      await expect(directButton.first()).toBeVisible({ timeout: 1_000 });
+      await directButton.first().click({ timeout: 1_000 });
+    }).toPass({ timeout: Timeout.MEDIUM });
+  }
+
+  async ensurePreviewPanelOpen() {
     const previewPanel = this.page.locator("#preview-panel");
     const sizeAttr = await previewPanel.getAttribute("data-panel-size");
     if (sizeAttr === null || parseFloat(sizeAttr) < 5) {
@@ -93,26 +117,55 @@ export class PreviewPanel {
         { timeout: Timeout.MEDIUM },
       );
     }
+  }
 
-    // When the toolbar is narrow (< 700px), `configure`, `problems`, and
-    // `security` move into an overflow dropdown. Open the dropdown first if
-    // the direct button isn't visible.
-    const directButton = this.page.getByTestId(`${mode}-mode-button`);
-    await expect(async () => {
-      const isInOverflow =
-        (mode === "security" || mode === "problems" || mode === "configure") &&
-        (await directButton
-          .first()
-          .isVisible()
-          .catch(() => false)) === false;
-      if (isInOverflow) {
-        await this.page
-          .getByTestId("preview-mode-overflow-button")
-          .click({ timeout: 1_000 });
-      }
-      await expect(directButton.first()).toBeVisible({ timeout: 1_000 });
-      await directButton.first().click({ timeout: 1_000 });
-    }).toPass({ timeout: Timeout.MEDIUM });
+  // --- Tests panel (behind the per-app opt-in gate) ---
+
+  locateEnableTestingButton() {
+    return this.page.getByRole("button", {
+      name: "Enable testing for this app",
+    });
+  }
+
+  locateDisableTestingButton() {
+    return this.page.getByRole("button", {
+      name: "Disable testing for this app",
+    });
+  }
+
+  locateRunAllTestsButton() {
+    return this.page.getByRole("button", { name: "Run all tests" });
+  }
+
+  async openTestingOptions() {
+    await this.page.getByRole("button", { name: "Open test options" }).click();
+  }
+
+  async clickEnableTesting() {
+    await this.locateEnableTestingButton().click();
+  }
+
+  async clickDisableTesting() {
+    await this.locateDisableTestingButton().click();
+  }
+
+  /**
+   * Press Record, accept the storage warning, and wait for capture to be ready.
+   *
+   * Starting a recording clears the preview's cookies and local storage, so
+   * every entry point (this one and the Tests panel's) asks first. Takes the
+   * button so both can share the confirmation step.
+   */
+  async startRecording(testId = "preview-record-button") {
+    await this.page.getByTestId(testId).click();
+    await this.page
+      .getByTestId("recording-storage-warning-continue")
+      .click({ timeout: Timeout.MEDIUM });
+    // The bar also renders during setup, while the preview is being reloaded.
+    // Stop only appears once the new document's recorder has been armed.
+    await expect(
+      this.page.getByTestId("preview-recording-stop-button"),
+    ).toBeVisible({ timeout: Timeout.EXTRA_LONG });
   }
 
   async clickRecheckProblems() {
@@ -130,8 +183,15 @@ export class PreviewPanel {
   }
 
   async clickRebuild() {
+    await this.ensurePreviewPanelOpen();
     await this.clickPreviewMoreOptions();
-    await this.page.getByText("Rebuild").click();
+    // The preview can rerender this animated menu while Playwright waits for
+    // the item to become stable, closing it before the click is dispatched.
+    const rebuildItem = this.page.getByRole("menuitem", {
+      name: /^Rebuild/,
+    });
+    await expect(rebuildItem).toBeVisible({ timeout: Timeout.MEDIUM });
+    await rebuildItem.click({ force: true });
   }
 
   async clickTogglePreviewPanel() {
@@ -139,9 +199,16 @@ export class PreviewPanel {
   }
 
   async clickPreviewPickElement() {
-    await this.page
-      .getByTestId("preview-pick-element-button")
-      .click({ timeout: Timeout.EXTRA_LONG });
+    await this.ensurePreviewPanelOpen();
+    const button = this.getPreviewPickElementButton();
+    await expect(button).toBeEnabled({
+      timeout: Timeout.EXTRA_LONG,
+    });
+    await button.click();
+  }
+
+  getPreviewPickElementButton() {
+    return this.page.getByTestId("preview-pick-element-button");
   }
 
   async clickDeselectComponent(options?: { index?: number }) {
@@ -256,6 +323,18 @@ export class PreviewPanel {
 
   async clickFixErrorWithAI() {
     await this.page.getByRole("button", { name: "Fix error with AI" }).click();
+  }
+
+  async collapsePreviewErrorBanner() {
+    await this.page
+      .getByRole("button", { name: "Collapse error banner" })
+      .click();
+  }
+
+  async expandPreviewErrorBanner() {
+    await this.page
+      .getByRole("button", { name: "Expand error banner" })
+      .click();
   }
 
   async clickCopyErrorMessage() {

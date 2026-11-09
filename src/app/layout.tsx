@@ -4,37 +4,116 @@ import { ThemeProvider } from "../contexts/ThemeContext";
 import { DeepLinkProvider } from "../contexts/DeepLinkContext";
 import { Toaster } from "sonner";
 import { TitleBar } from "./TitleBar";
-import { useEffect, type ReactNode } from "react";
-import { useRunApp, useAppOutputSubscription } from "@/hooks/useRunApp";
+import { useEffect, useMemo, type ReactNode } from "react";
+import { useAppOutputSubscription } from "@/hooks/useRunApp";
 import { useAtomValue, useSetAtom } from "jotai";
-import { previewModeAtom, selectedAppIdAtom } from "@/atoms/appAtoms";
+import { selectedAppIdAtom } from "@/atoms/appAtoms";
 import { useSettings } from "@/hooks/useSettings";
 import { DEFAULT_ZOOM_LEVEL } from "@/lib/schemas";
 import { selectedComponentsPreviewAtom } from "@/atoms/previewAtoms";
+import { PreviewNativeOverlayGuard } from "@/components/preview_panel/PreviewNativeOverlayGuard";
 import { usePlanEvents } from "@/hooks/usePlanEvents";
 import { useIntegrationEvents } from "@/hooks/useIntegrationEvents";
 import { useAppBlueprintEvents } from "@/hooks/useAppBlueprintEvents";
+import { useTestRunEvents } from "@/hooks/useTestRunEvents";
 import { useZoomShortcuts } from "@/hooks/useZoomShortcuts";
-import { useQueueProcessor } from "@/hooks/useQueueProcessor";
-import { useIntegrationContinuation } from "@/hooks/useIntegrationContinuation";
+import { useChatStreamRuntime } from "@/hooks/useChatStream";
+import { useBackgroundAutoReview } from "@/hooks/subagentReviewOrchestration";
 import { useReopenClosedTab } from "@/hooks/useReopenClosedTab";
+import { VersionPreviewProvider } from "@/version_preview/VersionPreviewProvider";
+import {
+  AppRunRemoteProvider,
+  useAppRunRemoteManager,
+} from "@/app_run/AppRunRemoteProvider";
+import { PlanHandoffProvider } from "@/plan_handoff/PlanHandoffProvider";
 import i18n from "@/i18n";
 import { LanguageSchema } from "@/lib/schemas";
 import { useShortcut } from "@/hooks/useShortcut";
 import { useIsMac } from "@/hooks/useChatModeToggle";
 import { ReleaseNotesDialog } from "@/components/ReleaseNotesDialog";
 import { ForceCloseDialog } from "@/components/ForceCloseDialog";
+import { HelpDialog } from "@/components/HelpDialog";
+import { SubscriptionStatusBanner } from "@/components/SubscriptionStatusBanner";
+import { ImageGenerationProvider } from "@/image_generation/ImageGenerationProvider";
+import {
+  FirstPromptProvider,
+  type FirstPromptChatStream,
+} from "@/first_prompt/FirstPromptProvider";
+import { systemClock, uuidIdSource } from "@/state_machines/clock";
+import { useStreamChat } from "@/hooks/useStreamChat";
+import { PreviewIframeProvider } from "@/preview_iframe/PreviewIframeProvider";
+import { GithubOpsProvider } from "@/github_ops/GithubOpsProvider";
+import {
+  ScreenshotProvider,
+  useScreenshotManager,
+} from "@/screenshot/ScreenshotProvider";
+import { useSyncDefaultChatMode } from "@/hooks/useSyncDefaultChatMode";
+import { PreviewErrorFacadeProvider } from "@/app_wiring/preview_error_facade";
+import { usePreviewErrorFacade } from "@/app_wiring/preview_error_facade";
+import { PackageManagerWarningProvider } from "@/package_manager_warnings/PackageManagerWarningProvider";
 
 export default function RootLayout({ children }: { children: ReactNode }) {
-  const { refreshAppIframe } = useRunApp();
+  const { streamMessage } = useStreamChat({ hasChatId: false });
+  const { settings } = useSettings();
+  const firstPromptChatStream = useMemo<FirstPromptChatStream>(
+    () => ({
+      submit: (request) =>
+        streamMessage({
+          ...request,
+          attachments: [...request.attachments],
+        }),
+    }),
+    [streamMessage],
+  );
+  return (
+    <PreviewErrorFacadeProvider>
+      <PackageManagerWarningProvider>
+        <AppRunRemoteProvider>
+          <ScreenshotProvider>
+            <GithubOpsProvider>
+              <ImageGenerationProvider>
+                <FirstPromptProvider
+                  chatStream={firstPromptChatStream}
+                  clock={systemClock}
+                  idSource={uuidIdSource}
+                  settleDelayMs={settings?.isTestMode ? 0 : 2_000}
+                >
+                  <PlanHandoffProvider>
+                    <RootLayoutContent>{children}</RootLayoutContent>
+                  </PlanHandoffProvider>
+                </FirstPromptProvider>
+              </ImageGenerationProvider>
+            </GithubOpsProvider>
+          </ScreenshotProvider>
+        </AppRunRemoteProvider>
+      </PackageManagerWarningProvider>
+    </PreviewErrorFacadeProvider>
+  );
+}
+
+function RootLayoutContent({ children }: { children: ReactNode }) {
+  const appRunManager = useAppRunRemoteManager();
+  const previewErrors = usePreviewErrorFacade();
+  const screenshotManager = useScreenshotManager();
   // Subscribe to app output events once at the root level to avoid duplicates
   useAppOutputSubscription();
-  const previewMode = useAtomValue(previewModeAtom);
+  useEffect(
+    () =>
+      appRunManager.subscribeRunStateChanged((appId, state) => {
+        if (state.operationError) {
+          previewErrors.setAppError(appId, state.operationError.message);
+        } else {
+          previewErrors.clearAppError(appId);
+        }
+      }),
+    [appRunManager, previewErrors],
+  );
   const { settings } = useSettings();
   const setSelectedComponentsPreview = useSetAtom(
     selectedComponentsPreviewAtom,
   );
   const selectedAppId = useAtomValue(selectedAppIdAtom);
+  useSyncDefaultChatMode();
 
   // Initialize plan events listener
   usePlanEvents();
@@ -42,6 +121,10 @@ export default function RootLayout({ children }: { children: ReactNode }) {
 
   // Initialize app blueprint events listener
   useAppBlueprintEvents();
+
+  // Consume agent test-run lifecycle events at the root so the terminal
+  // "finished" event is never dropped by a TestsPanel unmount mid-run.
+  useTestRunEvents();
 
   // Zoom keyboard shortcuts (Ctrl/Cmd + =/- /0)
   useZoomShortcuts();
@@ -56,13 +139,17 @@ export default function RootLayout({ children }: { children: ReactNode }) {
     true,
   );
 
-  // Process queued messages globally (even when not on chat page)
-  useQueueProcessor();
+  // Wire the chat stream machine's runtime (side-effect adapter). Streams
+  // and queued-message dispatch keep running globally, even when the chat
+  // page is closed.
+  useChatStreamRuntime({
+    requestPreviewReload: appRunManager.requestManualReload,
+    requestCapture: screenshotManager.requestCapture,
+  });
+  useBackgroundAutoReview();
 
-  // Auto-send integration continuation messages and clean up stale integration
-  // state at the root level — keeps the dispatch alive even if the in-chat
-  // card unmounts (e.g. virtualized scroll-out).
-  useIntegrationContinuation();
+  // Persist queued messages to disk and hydrate them on startup, so queued
+  // prompts survive app restarts / crashes.
 
   useEffect(() => {
     const zoomLevel = settings?.zoomLevel ?? DEFAULT_ZOOM_LEVEL;
@@ -98,54 +185,58 @@ export default function RootLayout({ children }: { children: ReactNode }) {
     }
   }, [settings?.language]);
 
-  // Global keyboard listener for refresh events
-  useEffect(() => {
-    const handleKeyDown = (event: KeyboardEvent) => {
-      // Check for Ctrl+R (Windows/Linux) or Cmd+R (macOS)
-      if (event.key === "r" && (event.ctrlKey || event.metaKey)) {
-        event.preventDefault(); // Prevent default browser refresh
-        if (previewMode === "preview") {
-          refreshAppIframe(); // Use our custom refresh function instead
-        }
-      }
-    };
-
-    // Add event listener to document
-    document.addEventListener("keydown", handleKeyDown);
-
-    // Cleanup function to remove event listener
-    return () => {
-      document.removeEventListener("keydown", handleKeyDown);
-    };
-  }, [refreshAppIframe, previewMode]);
-
   useEffect(() => {
     setSelectedComponentsPreview([]);
   }, [selectedAppId, setSelectedComponentsPreview]);
 
   return (
     <>
-      <ThemeProvider>
-        <DeepLinkProvider>
-          <SidebarProvider defaultOpen={false}>
-            <TitleBar />
-            <AppSidebar />
-            <div
-              id="layout-main-content-container"
-              className="flex h-screenish w-full overflow-x-hidden mt-[var(--layout-title-bar-offset)] border-l border-border bg-background"
-            >
-              {children}
-            </div>
-            <Toaster
-              richColors
-              expand
-              duration={settings?.isTestMode ? 500 : undefined}
-            />
-            <ReleaseNotesDialog />
-            <ForceCloseDialog />
-          </SidebarProvider>
-        </DeepLinkProvider>
-      </ThemeProvider>
+      <VersionPreviewProvider>
+        <PreviewIframeProvider appRunState={appRunManager}>
+          <ThemeProvider>
+            <DeepLinkProvider>
+              <SidebarProvider defaultOpen={false}>
+                <TitleBar />
+                <AppSidebar />
+                <div className="flex h-screenish min-w-0 flex-1 flex-col overflow-hidden mt-[var(--layout-title-bar-offset)] border-l border-border bg-background">
+                  <SubscriptionStatusBanner />
+                  <div
+                    id="layout-main-content-container"
+                    className="flex min-h-0 w-full flex-1 overflow-x-hidden"
+                  >
+                    {children}
+                  </div>
+                </div>
+                <Toaster
+                  richColors
+                  expand
+                  duration={settings?.isTestMode ? 500 : undefined}
+                  // Sonner's own 24px, plus the screenshot bar when one is up,
+                  // so toasts stack above the bar instead of covering its
+                  // buttons.
+                  offset={{
+                    bottom: "calc(24px + var(--layout-bottom-bar-height))",
+                  }}
+                  // Sonner switches to this one under a 600px viewport, which
+                  // an 800px window reaches at 150% zoom.
+                  mobileOffset={{
+                    bottom: "calc(16px + var(--layout-bottom-bar-height))",
+                  }}
+                />
+                {/* Next to the Toaster on purpose: it is what keeps these
+                    toasts from being painted underneath the native preview. */}
+                <PreviewNativeOverlayGuard />
+                <ReleaseNotesDialog />
+                <ForceCloseDialog />
+                {/* Outside the sidebar, whose hover handlers would otherwise
+                    hear the screenshot bar's pointer events through React's
+                    tree and keep the sidebar expanded. */}
+                <HelpDialog />
+              </SidebarProvider>
+            </DeepLinkProvider>
+          </ThemeProvider>
+        </PreviewIframeProvider>
+      </VersionPreviewProvider>
     </>
   );
 }

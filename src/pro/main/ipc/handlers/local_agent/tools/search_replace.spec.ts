@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import { searchReplaceTool } from "./search_replace";
 import type { AgentContext } from "./types";
+import { assertMutationPathAllowed } from "@/ipc/utils/path_utils";
 
 // Mock fs module
 vi.mock("node:fs", async () => {
@@ -9,8 +10,10 @@ vi.mock("node:fs", async () => {
   return {
     ...actual,
     default: {
+      ...actual,
       existsSync: vi.fn(),
       promises: {
+        ...actual.promises,
         readFile: vi.fn(),
         writeFile: vi.fn(),
       },
@@ -33,6 +36,7 @@ vi.mock("electron-log", () => ({
 // Mock path utils
 vi.mock("@/ipc/utils/path_utils", () => ({
   safeJoin: (base: string, path: string) => `${base}/${path}`,
+  assertMutationPathAllowed: vi.fn().mockResolvedValue("test.ts"),
 }));
 
 describe("searchReplaceTool", () => {
@@ -55,6 +59,8 @@ describe("searchReplaceTool", () => {
     todos: [],
     dyadRequestId: "test-request",
     fileEditTracker: {},
+    testingEnabled: true,
+    testRunAttempts: new Map(),
     onXmlStream: vi.fn(),
     onXmlComplete: vi.fn(),
     requireConsent: vi.fn().mockResolvedValue(true),
@@ -64,6 +70,13 @@ describe("searchReplaceTool", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    mockContext.supabaseProjectId = null;
+    mockContext.allowDeploySideEffects = undefined;
+    mockContext.pendingFunctionDeploys = [];
+    mockContext.onDeferredFunctionDeploy = undefined;
+    vi.mocked(assertMutationPathAllowed).mockImplementation(
+      async ({ relativePath }) => relativePath.replace(/^self\//, ""),
+    );
   });
 
   afterEach(() => {
@@ -157,7 +170,7 @@ describe("searchReplaceTool", () => {
 
       const result = await searchReplaceTool.execute(
         {
-          file_path: "test.ts",
+          file_path: "self/test.ts",
           old_string: "  const x = 1;\n  const y = 2;\n  return x + y;",
           new_string: "  const a = 10;\n  const b = 20;\n  return a + b;",
         },
@@ -169,6 +182,45 @@ describe("searchReplaceTool", () => {
         "/test/app/test.ts",
         expect.stringContaining("const a = 10"),
       );
+      expect(assertMutationPathAllowed).toHaveBeenCalledWith({
+        appPath: "/test/app",
+        relativePath: "self/test.ts",
+      });
+    });
+
+    it("deduplicates deferred function deploys through the root callback", async () => {
+      const onDeferredFunctionDeploy = vi.fn((functionName: string) => {
+        if (!mockContext.pendingFunctionDeploys.includes(functionName)) {
+          mockContext.pendingFunctionDeploys.push(functionName);
+        }
+      });
+      mockContext.supabaseProjectId = "project-id";
+      mockContext.allowDeploySideEffects = false;
+      mockContext.onDeferredFunctionDeploy = onDeferredFunctionDeploy;
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      vi.mocked(fs.promises.readFile)
+        .mockResolvedValueOnce("const value = 1;\n")
+        .mockResolvedValueOnce("const value = 2;\n");
+
+      await searchReplaceTool.execute(
+        {
+          file_path: "supabase/functions/hello/index.ts",
+          old_string: "const value = 1;",
+          new_string: "const value = 2;",
+        },
+        mockContext,
+      );
+      await searchReplaceTool.execute(
+        {
+          file_path: "supabase/functions/hello/index.ts",
+          old_string: "const value = 2;",
+          new_string: "const value = 3;",
+        },
+        mockContext,
+      );
+
+      expect(onDeferredFunctionDeploy).toHaveBeenCalledTimes(2);
+      expect(mockContext.pendingFunctionDeploys).toEqual(["hello"]);
     });
 
     it("escapes marker-like lines inside content to avoid parser splitting", async () => {
@@ -291,9 +343,12 @@ describe("searchReplaceTool", () => {
       );
 
       expect(result).toContain("Successfully");
+      // Asserted exactly, not with stringContaining: the point of these cases
+      // is what the stray newline does to the OUTPUT, and a substring check
+      // passes just as happily on a file with extra blank lines in it.
       expect(fs.promises.writeFile).toHaveBeenCalledWith(
         "/test/app/test.ts",
-        expect.stringContaining("const y = 2"),
+        "function test() {\n  const y = 2;\n  return y;\n}",
       );
     });
 
@@ -321,7 +376,7 @@ describe("searchReplaceTool", () => {
       expect(result).toContain("Successfully");
       expect(fs.promises.writeFile).toHaveBeenCalledWith(
         "/test/app/test.ts",
-        expect.stringContaining("const y = 2"),
+        "function test() {\n  const y = 2;\n  return y;\n}",
       );
     });
 
@@ -349,7 +404,64 @@ describe("searchReplaceTool", () => {
       expect(result).toContain("Successfully");
       expect(fs.promises.writeFile).toHaveBeenCalledWith(
         "/test/app/test.ts",
-        expect.stringContaining("const y = 2"),
+        "function test() {\n  const y = 2;\n  return y;\n}",
+      );
+    });
+
+    // The shape observed in production traffic: GPT 5.6 Sol terminates both
+    // args together because it copies a contiguous region of the file, and the
+    // trailing empty line matches nothing when the boundary has no blank line.
+    it("does not add a blank line when both args are newline-terminated and the file has none", async () => {
+      const originalContent = [
+        "function test() {",
+        "  if (!ok) {",
+        "    rollback();",
+        "  }",
+        "}",
+      ].join("\n");
+
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      vi.mocked(fs.promises.readFile).mockResolvedValue(originalContent);
+
+      const result = await searchReplaceTool.execute(
+        {
+          file_path: "test.ts",
+          old_string: "  if (!ok) {\n",
+          new_string: "  if (!found) {\n",
+        },
+        mockContext,
+      );
+
+      expect(result).toContain("Successfully");
+      expect(fs.promises.writeFile).toHaveBeenCalledWith(
+        "/test/app/test.ts",
+        "function test() {\n  if (!found) {\n    rollback();\n  }\n}",
+      );
+    });
+
+    it("preserves a blank line the terminated args genuinely matched", async () => {
+      const originalContent = [
+        "const a = 1;",
+        "const b = 2;",
+        "",
+        "const c = 3;",
+      ].join("\n");
+
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      vi.mocked(fs.promises.readFile).mockResolvedValue(originalContent);
+
+      await searchReplaceTool.execute(
+        {
+          file_path: "test.ts",
+          old_string: "const b = 2;\n",
+          new_string: "const b = 22;\n",
+        },
+        mockContext,
+      );
+
+      expect(fs.promises.writeFile).toHaveBeenCalledWith(
+        "/test/app/test.ts",
+        "const a = 1;\nconst b = 22;\n\nconst c = 3;",
       );
     });
   });

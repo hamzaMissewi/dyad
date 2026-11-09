@@ -28,7 +28,18 @@ This project uses a **contract-driven IPC architecture**. Contracts in `src/ipc/
 5. Register the handler in `src/ipc/handlers/<domain>_handlers.ts` using `createTypedHandler(contract, handler)`.
 6. Import and call the registration function in `src/ipc/ipc_host.ts`.
 
+For a domain's first main-to-renderer event, also import its event-contract
+object in `src/ipc/preload/channels.ts` and include it with
+`getReceiveChannels(...)`. The receive allowlist is derived from imported event
+objects, so defining and exporting an event alone does not make its channel
+available through preload. Add the domain to `channels.test.ts` to prevent a
+runtime `Invalid channel` failure that TypeScript cannot detect.
+
 ## Renderer usage
+
+Local-only IPC queries that must keep working offline need `networkMode: "always"`.
+TanStack Query's default mode pauses them without data or an error when offline;
+cover a fresh offline mount for local monitoring or status queries.
 
 ```ts
 // Individual domain client
@@ -48,9 +59,59 @@ ipc.chatStream.start(params, { onChunk, onEnd, onError });
 
 ## Stream client notes
 
-- `createStreamClient(...).start()` returns `void`, not a cleanup/unsubscribe function. You cannot capture a handle to abort or clean up an active stream from the caller side.
-- To guard against duplicate streams, use a module-level `Set` (like `pendingStreamChatIds` in `useStreamChat.ts`) or a React state/ref-based lock, not the return value.
-- **Never gate global-state cleanup in `onEnd`/`onError` on a local `isMountedRef`.** Stream callbacks outlive the component that started them. If the user navigates away mid-stream, an unmount-guarded `onEnd` skips `setIsStreamingByIdAtom(false)` and `syncChatFromDb`, leaving the chat permanently `isStreaming=true` — `ChatPanel.fetchChatMessages` then skips IPC fetches forever and only a page refresh recovers. Always run global Jotai state writes and DB syncs unconditionally; only guard UI-only side effects (toasts, console logs, local React state) on mount. See `useStreamChat.ts` for the no-guard pattern.
+- `createStreamClient(...).start(input, callbacks, opts?)` returns the correlation identity for that `start()` call: an `InvocationRef` when supplied, or a legacy monotonic numeric `streamId`. It is not an abort handle — aborting still goes through the domain channel (e.g. `chat:cancel`).
+- Each key holds at most one entry; a new `start()` for the same key replaces the previous entry, so events can never reach a replaced entry's callbacks (structural stale-event rejection).
+- Stream payloads should echo the renderer's complete `InvocationRef`. When present, `createStreamClient` routes chunk/end/error events only to the matching operation; an absent ref preserves legacy key-only routing for in-flight streams crossing an app update. Numeric `streamId` matching remains only for older stream contracts.
+- When changing stream correlation, audit every delegated producer that emits the same channels, not only the owning IPC handler. Keep executable models and co-sim inputs faithful to the real optional wire shape; do not fabricate a legacy identity on the new path.
+- Mint an `InvocationRef` through the injected `IdSource` at the authoritative start boundary. Globally unique operation IDs eliminate cross-controller lifetime reuse without retaining per-key generation maps.
+- Terminal stream callbacks may synchronously start a replacement stream with the same key. Cleanup after `onEnd`/`onError` (including invoke rejection) must delete the entry only when the map still points to the generation that ended; an unconditional keyed delete can orphan the replacement stream.
+- By default the entry is removed when the end/error event arrives (`autoRelease: true`). Pass `{ autoRelease: false }` to keep receiving events after a terminal event, and call `release(key, { invocationRef })` when done — the chat stream machine uses this to keep entry ownership with its controller until finalization side effects complete (a stale release is a no-op).
+- Chat streams: do NOT call `ipc.chatStream.start` or guard against duplicate streams from renderer code. The main-owned `chat_stream` actor is the single lifecycle and queue authority; submit through `useStreamChat().streamMessage` or `ChatStreamRemoteManager.ensure(chatId).send({ type: "submit", ... })`.
+- Gate renderer queries that derive actions from the latest persisted assistant
+  message while that chat is streaming. Main may persist an intermediate message,
+  and caching a fallback result before the terminal invalidation can hide the
+  completed proposal; disable the query during streaming and re-enable it on end.
+  Force a fresh read on re-enable: an older in-flight request can settle after
+  the terminal invalidation, clear its invalidated flag, and otherwise leave its
+  intermediate result fresh under the global query `staleTime`.
+- A null chat mode means the automatic default is still implicit. Renderer
+  submissions must preserve that distinction with the existing null
+  `requestedChatMode` sentinel instead of sending the computed display mode as
+  an explicit override; otherwise main cannot apply the latest provider/quota
+  state before the first turn.
+- Apply model/mode compatibility rules in the authoritative main-process
+  resolution as well as renderer previews. Share the normalization helper so
+  an automatic mode cannot be displayed as valid and then latched as an
+  incompatible mode when provider or quota state changes.
+- Pass an authoritative per-turn model selection through an explicit
+  `ModelSelection` parameter. Do not hide it inside a `UserSettings` override or
+  detect it by duck-typing `settings.selectedModel`; that reverses chat/model
+  precedence and creates an undeclared type contract. When changing
+  `GetProviderOptionsParams`, audit every `getProviderOptions` caller, including
+  assertion synthesis, compaction, and local-agent subagents.
+- Keep durable first-turn acceptance atomic with latching an implicit chat
+  mode. The idempotent user-message insert and conditional mode update belong
+  in one synchronous SQLite transaction, duplicate replay must repair legacy
+  null rows, and a concurrent conditional-update loser must use the stored
+  winner before choosing prompts or tools.
+- Run synchronous precondition checks that can reject a chat turn before its
+  idempotency insert, implicit-mode latch, and renderer acceptance event.
+  Otherwise a rejected request leaves durable state and replays as accepted
+  even though no model turn ran.
+- Queue mutations must go through the main actor's revisioned events. Pass the
+  revision from the exact snapshot that rendered the action; falling back to a
+  newer client snapshot can accept stale clear/edit/reorder intent against
+  prompts the user never saw. Do not add renderer-owned queue atoms or
+  full-snapshot queue persistence.
+- Mirror bounded chat-prompt validation in the renderer before clearing the
+  composer. A main-only schema rejection otherwise discards the user's draft
+  before they can shorten it.
+- Terminal observation and cleanup belong to the main actor and must not depend on renderer liveness. Renderer callbacks are window-local receipts only.
+- The remote-machine transport rejects dispatch envelopes above 256 KiB before
+  running the event codec and reports `invalid-event`. If a bounded domain
+  schema legitimately permits larger payloads (for example base64 chat
+  attachments), set that machine's `remote.maxDispatchEnvelopeBytes` to match
+  the schema limit instead of raising the global transport limit.
 
 ## Settings write safety (`writeSettings`)
 
@@ -69,17 +130,93 @@ writeSettings({
 
 **Stale-read race condition:** If you call `readSettings()` before an async operation (network call, file I/O), then use the snapshot to construct the write, any concurrent settings changes during the async gap will be silently overwritten. Always call `readSettings()` immediately before `writeSettings()` — never across an `await` boundary.
 
-**Electron readiness:** `readSettings()` and `writeSettings()` may decrypt/encrypt secrets through Electron `safeStorage`, which throws `safeStorage cannot be used before app is ready` before `app.whenReady()`. Queue pre-ready entry points like deep links (`open-url`, `second-instance`) until the app/window is ready before calling OAuth/settings handlers.
+**Stream-admission barrier atomicity:** In `chat_stream_handlers.ts`, a stream's final admission-block check (`streamAdmissionBlockCounts`) and its `admissionPendingStreams.delete(controller)` "start" transition must run in the **same synchronous frame — no `await` between them**. `cancelActiveStreamsForApp` (used by restore-to-message) deliberately skips controllers still in `admissionPendingStreams`, so a restore that installs its `blockNewStreamsForApp` barrier in a gap between the check and the marker removal would neither cancel the stream nor make it re-observe the new barrier — letting it start mid-restore and dirty the freshly reverted tree. Adding any `await` in that window silently reintroduces this race.
+
+**Electron readiness:** `readSettings()` and `writeSettings()` may decrypt/encrypt secrets through Electron `safeStorage`, which throws `safeStorage cannot be used before app is ready` before `app.whenReady()`. Queue pre-ready entry points like deep links (`open-url`, `second-instance`) until the app/window is ready before calling OAuth/settings handlers. In a multi-window flow, tie renderer readiness to the current delivery target: mark delivery not-ready when the target changes to a loading window, and drain only after that target finishes loading. A global first-window-ready flag can flush payloads to a different renderer before its listeners exist.
+`did-finish-load` can still precede React effect subscriptions, so fire-and-forget startup events must register a renderer-module-level listener before bootstrap and replay buffered payloads when their UI consumer mounts.
+Mark transport readiness before development-only completed-load filters: a DevTools reload can abort the initial navigation, making the filtered completion the window's only `did-finish-load` event.
+Clear a window's renderer readiness only for a non-in-place main-frame `did-start-navigation`. `did-start-loading` is broader and can leave deep links queued when a usable renderer triggers loading activity that has no matching top-level `did-finish-load`.
+When explicit window creation awaits `loadURL()` / `loadFile()`, start any
+development-only DevTools reload only after that initial load promise resolves.
+Scheduling the reload first can reject the awaited promise with
+`ERR_ABORTED (-3)` and incorrectly roll back a healthy window.
+When a loaded window consumes and clears a persisted one-shot event, send the
+event through that known-ready window rather than `BrowserWindow.getAllWindows()[0]`.
+In multi-window startup the first global window may still be loading, which
+would drop the only replay before its early listener exists.
+For cross-window ownership transfer, a successful `webContents.send()` is not
+an acknowledgement. Buffer the request before React mounts, require a
+correlated renderer receipt after local persistence, retain the main-process
+transfer until that receipt arrives, and roll back source or destination state
+on timeout/failure so the same stable identity cannot remain in both windows.
+The typed IPC handler must return/await the receipt promise; dropping it reports
+success early and turns later rejection into an unhandled main-process promise.
+The persistence path used for the receipt must propagate or verify write
+failure—best-effort storage adapters that log and swallow errors do not prove
+durability.
+If either side writes ownership to durable renderer storage before the receipt,
+also reconcile duplicate stable identities across restorable sessions during
+bootstrap. An in-memory coordinator cannot resolve the crash/restart window by
+itself.
+If the source durably removes transferred state before the destination observes
+its acknowledgement, persist a correlated removal marker until the destination
+observes that acknowledgement. On a lost receipt, the destination can use the
+marker to keep its durable adoption instead of rolling back both copies.
+The receipt timeout must retain that correlated settlement long enough for a
+late confirmation; the destination's explicit rollback/rejection is the abort
+decision that makes later source confirmation invalid.
+
+When a replayed renderer event mutates persisted session state, do not consume
+it until the session's derived atoms have hydrated. Persisting from empty
+pre-hydration atoms can erase unrelated restored entities.
+
+**Custom-protocol debugging:** Before using `git bisect` on a `dyad://` flow, quit every dev and packaged Dyad instance and verify which build owns the protocol registration. macOS may route the link to a different running/registered build, producing a convincing but false good/bad result.
+
+Custom-protocol delivery (`open-url`, argv, or `second-instance`) carries only
+the callback URL, not a trustworthy web origin. Credential-bearing callbacks
+must present a provider-bound, expiring, single-use correlation value minted at
+the authoritative flow-start boundary; an unmatched or unsolicited callback
+must not perform the credential write. Browser protocol-launch prompts are UX,
+not an authentication boundary.
+Test-only producers (`neon:fake-connect`, `supabase:fake-connect-and-set-project`)
+that call `runOAuthReturnExchange` without a ref must pass
+`allowUnclaimedExchange: true`: integration tests invoke them without starting a
+connection flow and otherwise fail with "OAuth return did not match an active connection flow".
 
 ## Handler expectations
 
+- Vercel project scope comes from the project's `accountId`, not the first team
+  in the user's team list. Personal owners require unscoped requests; preserve
+  legacy rows with a bounded 403/404 fallback, never retries of ambiguous writes.
+- After repairing Vercel environment variables, explicitly start and verify a
+  build. A successful GitHub push can be a no-op and trigger no provider build.
+
+- Keep handler registration free of database-dependent startup work. Handlers
+  register before `onReady()` initializes SQLite; run restart reconciliation
+  immediately after `initializeDatabase()` instead, or the first access fails
+  once and is never retried.
 - Handlers should `throw new Error("...")` on failure instead of returning `{ success: false }` style payloads.
+- Entity-loading handlers that enrich a valid local row with optional external metadata must catch enrichment failures and return the base entity with nullable enrichment fields. Letting an OAuth/API failure reject the whole load can make renderer queries misreport an existing entity as missing.
 - For **non-bug** failures (validation, not found, auth, user refusal, etc.), prefer `DyadError` with the right `DyadErrorKind` so PostHog does not flood with `$exception` events — see [rules/dyad-errors.md](dyad-errors.md).
 - Use `createTypedHandler(contract, handler)` which validates inputs at runtime via Zod.
+- Production invoke handlers must register through `createTypedHandler`, `createLoggedHandler`, or `registerTrustedIpcHandler`; never call `ipcMain.handle` or `ipcMain.handleOnce` directly outside `trusted_handle.ts`. The facade enforces the trusted-main-frame policy for both contract and legacy channels.
+- When migrating a large inline `ipcMain.handle` callback to the trusted facade, extract a named local handler first. Adding another wrapper level around the inline callback makes the formatter reindent the entire body and obscures the security-only diff.
+- Treat output schemas as type/validation contracts, not production serializers: `createTypedHandler` returns the handler result unchanged outside development. Explicitly project and map renderer-visible database columns before returning, especially for large or main-only fields such as `aiMessagesJson`.
 - When editing shared IPC contract code imported by `src/preload.ts` (especially `src/ipc/contracts/core.ts`), run `npm run build` before E2E. The preload Vite target may not resolve `@/...` aliases from those shared modules; use relative imports for preload-reachable shared code when packaging reports `Rollup failed to resolve import "@/..."`.
 - Avoid unguarded top-level `app.on(...)` or similar Electron API calls in modules that are imported broadly by tests. Many unit tests mock only the Electron APIs they touch, so prefer guarded calls like `app?.on?.(...)` or move event registration behind an explicit initialization function.
+- Keep best-effort persistence failures from escaping `BrowserWindow` close
+  callbacks. Catch and log file writes before continuing in-memory registry,
+  focused-window, and delivery-target cleanup; otherwise a closed window can
+  remain the authoritative target.
+- Electron lifecycle events do not await async handlers. When `before-quit` must finish asynchronous cleanup, call `event.preventDefault()` synchronously, wait with a hard timeout, then call `app.quit()` again behind a re-entry guard so cleanup cannot hang or recursively restart shutdown.
+- Treat the main process as terminal once `before-quit` starts disposing process-lifetime services. macOS `activate`/`open-url` and Electron `second-instance` can still arrive during that asynchronous gap; never create a replacement window or dispatch protocol work in the half-disposed process. A prevented quit can leave existing windows present, so count `activate` as a reopen request only when the normal activation policy would create a window. Preserve any new protocol URL in one shared relaunch request, strip stale protocol URLs from explicit relaunch arguments even for payload-free reopens, and call `app.relaunch()` exactly once immediately before the final guarded `app.quit()` instead of scheduling it in individual restart paths.
+- When main awaits a correlated renderer decision that can auto-settle on timeout or abort, emit a request-specific terminal event for every settlement path. Key every actionable renderer projection (including native notifications) by that request ID, consume the terminal event in each projection, and guard async UI setup so it cannot create stale UI after settlement; stream-end cleanup alone may be delayed or never run.
 - When splitting large handlers behind service boundaries, leave the handler responsible for IPC registration and request orchestration while moving runtime/policy logic into `src/ipc/services/*`. Preserve any intentional module side effects in the extracted service, such as `fixPath()` for child process PATH setup.
 - Electron `net.request()` response typings do not expose every runtime stream event. If download code needs a `close` guard in addition to `aborted`/`error`, cast the response through `EventEmitter` instead of dropping the guard to appease `npm run ts`.
+- When combining a user-controlled signal with `AbortSignal.timeout()` via `AbortSignal.any()`, do not identify every fetch cancellation by matching `AbortError`: Node propagates the timeout signal's `TimeoutError` reason. Check the original controller's `signal.aborted` and the timeout signal's `aborted` state separately so user cancellation and timeout keep their intended error classifications.
+- Chat/provider retry backoff must race the request's `AbortSignal`, clear its timer and listener on either settlement, and recheck cancellation immediately before starting the next attempt. Otherwise Stop can remain pending for the full delay and launch another provider request after cancellation.
+- A handler that registers `event.sender.once("destroyed", ...)` **after** its first `await` can miss the event entirely — it fires once, and a window that closed during the await is already gone. Registering earlier is often impossible (the cleanup closure does not exist yet), so also check the `event.sender.isDestroyed?.()` flag immediately after registering: it is state, not an event, and still reports an owner that left. This matters most for handlers that hold long-lived resources (`recording:start` holds the app's coordinator claims for 30 minutes); pair it with an `AbortSignal.aborted` check at the top of the coordinated callback so a session ended before admission never sets anything up.
+- For cancellable file persistence, passing an `AbortSignal` to `fs.promises.writeFile` is not sufficient because cancellation is best-effort and may leave a partial file. Write to a same-directory temporary path, remove it on failure or abort, check cancellation before and after an atomic rename, and remove the finalized path if cancellation raced the rename.
 
 ## React Query key factory
 
@@ -108,19 +245,55 @@ queryClient.invalidateQueries({ queryKey: queryKeys.apps.all });
 
 **Adding new keys:** Add entries to the appropriate domain in `queryKeys.ts`. Follow the existing pattern with `all` for the base key and factory functions using object parameters for parameterized keys.
 
+**Event-fed read models (`setQueryData` + `queryFn: skipToken`):** a key written only by a permanent event subscriber is garbage-collected after React Query's default 5-minute `gcTime` whenever no component observes it, so data collected while a panel is closed silently vanishes. Call `queryClient.setQueryDefaults(key, { gcTime: Infinity, staleTime: Infinity })` before `setQueryData` (it applies query defaults when it creates the query), keep the payload bounded, and cover it with a fake-timer test that advances past five minutes with no observer (see `recentRuns` in `useTestRunEvents`).
+
+**Mutation-state filters must not change with the selection:** `useMutationState`/`useIsMutating` compute once and recompute only on mutation-cache events, reading their filter from a ref updated in an effect, so a filter keyed on `selectedAppId` keeps showing the previous app's pending mutations after a switch. Filter on a stable prefix (e.g. `queryKeys.tests.runs`, with `appId` last in `tests.run`) and narrow by the mutation variables in a `useMemo`. A component whose own `useMutation` takes inline callbacks emits `observerOptionsUpdated` on every render, which hides the staleness one render later — so a render test usually passes on the broken code too.
+
+A plain IPC `Error` is not proof of a transport failure: `deserializeIpcError` also reconstructs unclassified handler errors and validation failures as plain errors. Do not use `!isDyadError(error)` as an automatic retry predicate.
+
+## Events and invoke replies are not ordered relative to each other
+
+An `invoke` reply and a `safeSend`/`webContents.send` event travel different Electron interfaces, so a renderer can observe them in either order even when main emits the event strictly before the handler returns. Never let an event handler reset state that an in-flight invoke's continuation is about to set — the reset can land last and wipe the result.
+
+Symptom: a flow works, then intermittently "does nothing", as if the successful path never ran. Fix by making the event handler ignore endings the renderer itself requested (e.g. `recording:ended` with `reason === "stopped"` in `useTestRecorder`), rather than relying on the ordering that happens to hold today.
+
+For cancellable operations that cross an irreversible boundary, close
+cancellation in main synchronously immediately before starting that mutation,
+and make later cancel invokes return `false`. A renderer progress event is only
+presentation; it can arrive after a cancel invoke on a separate IPC interface.
+
+When app-scoped lifecycle state explains why another workflow is waiting,
+preserve and check the operation source or correlation identity. An app id plus
+phase is insufficient when a panel-started operation can overlap an unrelated
+chat cancellation and make otherwise accurate explanatory copy misleading.
+
 ## High-volume event batching
 
 When an IPC event can fire at very high frequency (e.g., stdout/stderr from child processes), **batch messages and flush on a timer** instead of sending each message individually. This prevents IPC channel saturation, excessive array allocations in the renderer, and unnecessary React re-renders.
 
 **Pattern** (see `app_handlers.ts` `enqueueAppOutput`/`flushAllAppOutputs`):
 
-- Buffer outgoing events in a `Map<WebContents, Payload[]>`.
+- Buffer outgoing events by registered window identity and keyed entity
+  interest. A renderer closing or crashing can make `send()` throw after a
+  liveness check, so catch per destination (and per payload for individual
+  delivery) to ensure one failed window cannot abort fanout to healthy peers or
+  escape from a timer callback.
+- A proxy that masks `WebContents.isDestroyed()` to observe terminal sends must
+  dynamically expose a non-integer producer ID once its real target is gone.
+  Otherwise high-volume routing can re-register the destroyed endpoint.
 - Start a `setTimeout` on first enqueue; flush all buffered messages as a single batch event (e.g., `app:output-batch`) when the timer fires (100ms default).
 - Flush immediately on process exit so no messages are lost.
 - Keep latency-sensitive events (e.g., `input-requested`) on an immediate, unbatched channel.
 - On the renderer side, process the entire batch array in a single state update (`setConsoleEntries(prev => [...prev, ...newEntries])`) instead of one update per message.
 
 ## Streaming chunk optimizations
+
+Mid-turn compaction stores both an inline indicator and a separate model-history
+summary row. Use `toRendererMessages` for all full display projections, applying
+live placeholder content first, and `buildCompactionBlock` in both producers so
+empty-summary fallbacks and formatting cannot diverge between streaming and reload.
+Scope duplicate matching to the triggering user's turn by insertion ID; repeated
+summary text (especially empty-summary fallbacks) must not hide a later turn's indicator.
 
 The `chat:response:chunk` event supports two modes:
 
@@ -131,9 +304,26 @@ When modifying `ChatResponseChunkSchema` or adding new `safeSend("chat:response:
 
 **Tail-diff baseline invariant:** Never call `safeSend("chat:response:chunk", { messages: ... })` directly in `local_agent_handler.ts`. Route all full-update sends through `sendResponseChunk(..., true, lastSentRef)` so `lastSentRef` stays in sync automatically. A bare `safeSend` bypasses the sync and leaves `lastSentRef` stale, causing the next patch to compute LCP against the wrong baseline and corrupting streamed output.
 
+**Peer-stream correlation:** A multi-window passive stream consumer may project
+chunks classified as unsolicited because that renderer has no local invocation
+owner. It must not project chunks classified as stale: those belong to a
+superseded local invocation and retaining the old correlation rejection prevents
+late output from overwriting the current stream.
+
 **Zod schema contract changes:** Making a field optional (e.g., `messages` → `messages.optional()`) causes TypeScript errors in all consumers that assume the field is always present. Search for all destructuring/usage sites and add guards before committing.
 
 **Renderer-visible fields must be in the output schema:** `createTypedHandler` validates handler output through the contract's Zod schema. If the handler returns extra fields that are not declared in the output schema, renderer code cannot type-safely consume them and they may be stripped by parsing. Add any consumed fields (for example `appId` on `ChatSchema`) to the IPC output schema when relying on them in renderer code.
+
+Test-run `infraError` can accompany completed results (for example when restoring
+`.env.local` fails). Preserve those results; use each file's `incomplete` marker
+to prevent interrupted preview reports from becoming whole-file passes.
+Canonicalize the app root before constructing Playwright selectors and report keys.
+Resolve discovery and execution paths against `config.rootDir`, then make them app-relative.
+Mixed logical/physical roots or differing report keys break selection, split cases, and lose incomplete status.
+
+When one IPC producer needs stronger presentation semantics (for example, a persistent multiline error toast), carry that intent as an explicit optional event field and scope it at the producer. Do not infer global renderer behavior from message shape such as the presence of a newline; shared toast/event consumers serve unrelated features and tests.
+
+**Model refusals are stream completions, not errors:** AI SDK providers can normalize a successful safety refusal to `finishReason: "content-filter"` while preserving a provider-specific value such as `rawFinishReason: "refusal"`. Route every stream-consumption path (including continuation/fix streams) through the shared refusal handling, treat refusal as terminal for follow-up generation, discard incomplete output from the refused attempt, and persist a renderer-visible warning in both renderer content and AI history instead of relying on `onError` or matching generated text.
 
 ## End-of-turn warnings
 
@@ -155,9 +345,108 @@ Automated `pnpm add` commands that run in an app root with a generated `pnpm-wor
 
 ## React + IPC integration pattern
 
+Electron `WebContentsView` surfaces are composited above the renderer DOM, so
+portals and higher CSS `z-index` values cannot cover them. For overlapping
+workbench UI, hide the native view with `setVisible(false)` and paint a
+renderer-side in-memory `capturePage()` fallback; pass `{ stayHidden: true }`
+when capturing a hidden view so Electron cannot flash it back above the DOM.
+
 When creating hooks/components that call IPC handlers:
 
+- When diagnosing a preview stuck at `Waiting for server logs…`, distinguish the
+  ordinary selection IPC from the app-run actor transport: `App <id> selected for preview`
+  without a later `Starting app`, `already running`, or
+  `Restarting app` entry means selection succeeded but lifecycle dispatch never
+  reached main. Switching apps cannot repair a renderer-owned app-run manager
+  that is stuck in that state.
+- Treat a window-session ID as potentially durable even when BrowserWindow
+  layout is process-local: renderer storage may use it as a namespace. Keep the
+  primary ID stable or migrate its storage before pruning old session keys.
+- On macOS, `activate` can arrive while asynchronous startup is still running.
+  Gate Dock window creation until the initial window exists, or use one
+  idempotent ensure-window path, so startup cannot create stacked renderers.
+- Before destroying a BrowserWindow during creation rollback, remove its
+  session descriptor from authoritative state. Electron may emit `closed`
+  synchronously, and close handlers must not retain a failed window for Dock
+  activation.
+- Treat request/correlation IDs as identifiers, not capabilities. If an ID can
+  appear in a shared snapshot, operation wait and cancellation paths must also
+  verify the invoking window-session ownership before exposing or mutating the
+  correlated outcome.
+- For renderer event streams with a bootstrap/replay epoch, subscribe before
+  bootstrapping, pass the last applied epoch (`0` for a fresh cache), and dedupe
+  buffered live events against replay. Advancing directly to the bootstrap's
+  current epoch can acknowledge and discard an event received during startup.
+  Retry failed bootstrap attempts with bounded backoff, clearing pending data
+  that the next epoch replay will recover so a half-initialized listener cannot
+  grow an unbounded queue. Keep long-term gap-recovery history bounded by
+  compacting entity-specific scopes to family-root invalidations once precision
+  is no longer required; a bounded event journal alone does not bound a
+  lifetime recovery-scope map.
+- Async keyed subscription attach must use a generation/current-state check
+  after awaiting bootstrap and roll back that generation on rejection.
+  Otherwise detach or replacement during bootstrap can deliver stale data, and
+  a rejected bootstrap can leave later payloads buffered forever. Pending
+  delivery queues must also retain the interest/generation key so replacement
+  can discard superseded payloads before sending its bootstrap.
+- Contract-declared query invalidation runs only through typed handler wrappers.
+  Legacy handlers registered through `createLoggedHandler`/`handle(...)` must
+  publish after their authoritative mutation explicitly or migrate to a typed
+  contract. When the origin renderer installs only some mutation scopes
+  locally, carry the exact handled scopes with the invalidation event: peers
+  invalidate every scope, while the origin skips only equivalent local data
+  and still receives its unhandled scopes. Omitted origin-handled metadata must
+  default to no handled scopes; only declare `originHandles` when every caller
+  of that contract performs the matching local cache update/invalidation.
+- A tab-scoped event subscription must refresh its IPC snapshot on remount (`staleTime: 0`), since events may be missed while the tab is closed. Apply complete event snapshots directly and prevent an older in-flight bootstrap from overwriting them.
 - Wrap reads in `useQuery`, using keys from `queryKeys` factory (see above), async `queryFn` that calls the relevant domain client (e.g., `appClient.getApp(...)`) or unified `ipc` namespace, and conditionally use `enabled`/`initialData`/`meta` as needed.
 - Wrap writes in `useMutation`; validate inputs locally, call the domain client, and invalidate related queries on success. Use shared utilities (e.g., toast helpers) in `onError`.
+- When a mutation changes fields exposed by both `apps.detail(...)` and `apps.all` (for example linking or unlinking a GitHub repository), invalidate both query families. Refreshing only the detail query can leave parent pages that derive conditional UI from the apps list stale.
+- To require a fresh read before enabling an action, gate on `query.isFetchedAfterMount`, not `!query.isFetching`. `isFetching` flips on every background refetch (window focus with `staleTime: 0`), so UI gated on it unmounts mid-flow — e.g. it unmounted `MigrationPanelBody` mid-migration in the deploy dialog.
+- When a mutation's result picks an item out of a query whose key does not change (e.g. a new deployment uid in `vercel.deployments`), invalidate that query in the mutation's `onSuccess`. A fast mutation can settle before React renders its pending state, so an `enabled: !!result` toggle never happens and the stale cache hides the new item until the next poll.
+- Callbacks passed to `useMutation(...)` are bound when `mutate()` runs, so they see that render's state. Read a ref for anything that can change while the request is in flight (such as the user cancelling the dialog that started it).
 - Synchronize TanStack Query data with any global state (like Jotai atoms) via `useEffect` only if required.
+- Root-mounted effects that automatically persist settings must depend on
+  stable derived values rather than hook-returned callback identities. Set an
+  in-flight ref before invoking the mutation to survive Strict Mode effect
+  replay and mutation-state rerenders, and handle the returned promise so
+  transient write failures do not become unhandled rejections.
+- Treat `queryClient.getQueryData(...)` as an optional cache peek. When a
+  mutation post-effect must inspect IPC-backed data to decide correctness-critical
+  work (such as restarting a runtime), use `fetchQuery`/`ensureQueryData` with
+  the canonical query key and query function so cache eviction cannot skip it.
 - For renderer launch telemetry that needs first-run state, do not infer it from `settings.hasRunBefore` after startup. `onFirstRunMaybe` flips that setting before `createWindow()`, so expose the pre-write value through an IPC/query context instead.
+- Renderer-side `isProviderSetup()` env-var detection only sees env vars whitelisted by the `get-env-vars` handler in `src/ipc/handlers/app_handlers.ts`, which returns one `envVarName` per provider. Providers needing extra env vars (e.g. Azure's `AZURE_RESOURCE_NAME`) must have those keys added to the handler explicitly, or the renderer reports the provider as not set up even though the main process can use it.
+
+## Unit-testing IPC handlers with the harness
+
+`src/testing/handler_test_harness.ts` (`setupHandlerTestHarness` + `harness.invokeHandler("channel", input)`) gives you a real in-memory DB and works even for heavyweight modules: `registerAppHandlers` loads in vitest with just `vi.mock("electron")` plus module mocks for `@/paths/paths` (point `getDyadAppPath` at a temp dir), `@/ipc/services/git_service`, `createFromTemplate`, `gitignoreUtils`, and `chat_mode_resolution`.
+
+- Preserve async helper contracts used by IPC handlers unless every caller and
+  test mock is migrated together. A still-async mock consumed without `await`
+  can pass a `Promise` into a database binding and fail far from the changed
+  helper.
+- Only handlers registered via `createTypedHandler` land in the harness registry. Handlers registered with `createLoggedHandler`/`handle(...)` (e.g. `import_handlers.ts`) must be captured through the mocked `ipcMain.handle` — and their return value is an IPC envelope shaped `{ ok, value, error }` (NOT `{ success, data }`), so unwrap accordingly.
+- Tests that invoke a captured `ipcMain.handle` listener run through the production trust facade. Call `configureTrustedRenderer(...)` and pass an event whose `senderFrame` matches `sender.mainFrame`; an empty `{}` event now fails with `Renderer trust policy is not configured` before the tested handler runs.
+
+## Renderer trust and child windows
+
+- In packaged builds, TanStack Router history updates turn the loaded `index.html` URL into root-relative locations such as `file:///chat` (`file:///C:/chat` on Windows). IPC trust must require `senderFrame === sender.mainFrame`, `file:` with an empty host, the configured file-volume prefix, and an allowlisted renderer route; pinning only the built entry pathname breaks packaged IPC, while accepting arbitrary file paths is unsafe.
+- Electron's `setWindowOpenHandler` details do not identify the initiating frame. When preview iframes need popups, fail closed on missing or privileged request details and construct allowed HTTP(S) popups yourself after removing inherited `preload` and forcing sandboxed, Node-disabled web preferences; `about:blank` cannot be safely overridden this way.
+- Keep a strong `BrowserWindow` reference for every popup created through a custom `createWindow` callback until its `closed` event. A callback-local window can be garbage-collected and close an active OAuth or payment flow; remove the reference on close so the owner collection remains bounded.
+- Preview recording cleanup must use `session.clearData({ origins, originMatchingMode: "origin-in-all-contexts", dataTypes })` for origin-based storage: `clearStorageData({ origin })` leaves partitioned iframe localStorage behind. Exclude cookies from `clearData`, which removes them at registrable-domain scope; enumerate and remove cookies for the exact `app-<id>.localhost` hostname instead. On shared `localhost` (app-preview domains off), that exact-host loop also sees every other app's `dyad-a<id>.` namespaced HttpOnly session, so pass the app ID and skip foreign prefixes. Verify with two apps so cleanup cannot silently sign out a sibling preview.
+- Before changing preview hostnames, audit exact-`localhost` assumptions in OAuth redirect allowlists, browser identity providers, passkeys, site-restricted keys, and generated app code; Google OAuth, for example, rejects `app-<id>.localhost` as a registered origin. Stage a compatibility-sensitive origin change behind an off-by-default setting and provide a preview fallback that users can toggle when an integration rejects the new origin.
+
+When billing direct OpenAI-compatible model streams, set the provider's
+`includeUsage: true`; otherwise the SDK omits `stream_options.include_usage`
+and providers may return no final token counts. Enable it only on billed routes.
+
+When a billing wrapper receives an explicit request-scoped API key, use that key
+without reading current settings. Use an explicit free sentinel for accepted unbilled turns; resolve it from the
+accepted settings snapshot, alongside the key for billed turns, before building
+model clients. Never let tool-loop requests re-read live billing settings.
+
+Keep chat-turn network preflight outside `withChatQueueLock`; recheck the model,
+mode and billing settings under the lock before acceptance, including after a
+failed preflight. Cancellation should release a turn's wait without aborting
+shared account/token refreshes needed by other chats.

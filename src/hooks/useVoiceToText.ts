@@ -1,6 +1,15 @@
-import { useState, useRef, useCallback, useEffect } from "react";
-import { ipc } from "@/ipc/types";
-import { v4 as uuidv4 } from "uuid";
+import { useCallback, useEffect, useState } from "react";
+import { systemClock, uuidIdSource } from "@/state_machines/clock";
+import {
+  useControllerSnapshot,
+  useManagerLifecycle,
+} from "@/state_machines/react";
+import { createBrowserVoiceCommandRunner } from "@/voice_to_text/commands";
+import {
+  isVoiceRecording,
+  isVoiceTranscribing,
+  VoiceToTextController,
+} from "@/voice_to_text/controller";
 
 interface UseVoiceToTextOptions {
   enabled: boolean;
@@ -13,123 +22,38 @@ export function useVoiceToText({
   onTranscription,
   onError,
 }: UseVoiceToTextOptions) {
-  const [isRecording, setIsRecording] = useState(false);
-  const [isTranscribing, setIsTranscribing] = useState(false);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
-  const streamRef = useRef<MediaStream | null>(null);
-  const skipOnStopProcessingRef = useRef(false);
-
-  const stopMediaStream = useCallback(() => {
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((track) => track.stop());
-      streamRef.current = null;
-    }
-  }, []);
-
-  useEffect(() => {
-    return () => {
-      skipOnStopProcessingRef.current = true;
-      const mediaRecorder = mediaRecorderRef.current;
-      if (mediaRecorder && mediaRecorder.state !== "inactive") {
-        mediaRecorder.stop();
-      }
-      mediaRecorderRef.current = null;
-      stopMediaStream();
-      chunksRef.current = [];
+  const [{ controller, runner }] = useState(() => {
+    const commandRunner = createBrowserVoiceCommandRunner({
+      clock: systemClock,
+      idSource: uuidIdSource,
+      callbacks: { onTranscription, onError },
+    });
+    return {
+      runner: commandRunner,
+      controller: new VoiceToTextController({
+        idSource: uuidIdSource,
+        runner: commandRunner,
+      }),
     };
-  }, [stopMediaStream]);
+  });
 
-  const toggleRecording = useCallback(async () => {
-    if (isTranscribing) return;
+  useManagerLifecycle(controller);
+  useEffect(() => {
+    runner.updateCallbacks({ onTranscription, onError });
+  }, [runner, onTranscription, onError]);
 
-    if (isRecording) {
-      // Stop recording
-      if (mediaRecorderRef.current?.state === "recording") {
-        mediaRecorderRef.current.stop();
-      }
-      return;
+  const state = useControllerSnapshot(controller);
+  const toggleRecording = useCallback(() => {
+    if (enabled || isVoiceRecording(controller.getSnapshot())) {
+      controller.toggle();
     }
-
-    if (!enabled) return;
-
-    // Start recording
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
-
-      const mediaRecorder = new MediaRecorder(stream, {
-        mimeType: "audio/webm",
-      });
-      mediaRecorderRef.current = mediaRecorder;
-      chunksRef.current = [];
-
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          chunksRef.current.push(event.data);
-        }
-      };
-
-      mediaRecorder.onstop = async () => {
-        mediaRecorderRef.current = null;
-        stopMediaStream();
-        if (skipOnStopProcessingRef.current) {
-          chunksRef.current = [];
-          return;
-        }
-
-        setIsRecording(false);
-
-        const blob = new Blob(chunksRef.current, { type: "audio/webm" });
-        chunksRef.current = [];
-
-        if (blob.size === 0) {
-          return;
-        }
-
-        setIsTranscribing(true);
-        try {
-          const arrayBuffer = await blob.arrayBuffer();
-          const audioData = Array.from(new Uint8Array(arrayBuffer));
-
-          const result = await ipc.audio.transcribeAudio({
-            audioData,
-            filename: "recording.webm",
-            requestId: uuidv4(),
-          });
-
-          if (result.text.trim()) {
-            onTranscription(result.text.trim());
-          }
-        } catch (err) {
-          const message =
-            err instanceof Error ? err.message : "Transcription failed";
-          onError?.(message);
-        } finally {
-          setIsTranscribing(false);
-        }
-      };
-
-      mediaRecorder.start();
-      setIsRecording(true);
-    } catch (err) {
-      stopMediaStream();
-      const message =
-        err instanceof Error ? err.message : "Failed to access microphone";
-      onError?.(message);
-    }
-  }, [
-    enabled,
-    isRecording,
-    isTranscribing,
-    onTranscription,
-    onError,
-    stopMediaStream,
-  ]);
+  }, [controller, enabled]);
 
   return {
-    isRecording,
-    isTranscribing,
+    isRecording: isVoiceRecording(state),
+    isTranscribing: isVoiceTranscribing(state),
+    // True from microphone acquisition through transcription.
+    isVoiceBusy: state.type !== "idle",
     toggleRecording,
   };
 }

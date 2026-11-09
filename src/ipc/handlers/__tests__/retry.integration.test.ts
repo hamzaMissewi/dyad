@@ -14,6 +14,10 @@
 // mount) holds just the fixture's initial commit, so the Retry handler's
 // `versions[0].oid === lastMessage.commitHash` check is false and it takes the
 // plain `redo: true` path — the exact behavior the node test invoked directly.
+import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { fireEvent, screen, waitFor } from "@testing-library/react";
@@ -24,12 +28,43 @@ import {
 } from "@/testing/hybrid_chat_harness";
 import { h } from "@/testing/hybrid.setup";
 
+function commitWithTestIdentity(cwd: string, message: string) {
+  execFileSync(
+    "git",
+    [
+      "-c",
+      "user.email=test@example.com",
+      "-c",
+      "user.name=Test User",
+      "commit",
+      "-m",
+      message,
+    ],
+    { cwd },
+  );
+}
+
+async function waitForCleanGit(harness: HybridChatHarness) {
+  await harness.bridge.settleInFlight();
+  const cwd = harness.appDir;
+  await waitFor(
+    () => {
+      expect(fs.existsSync(path.join(cwd, ".git", "index.lock"))).toBe(false);
+      expect(
+        execFileSync("git", ["status", "--porcelain"], { cwd }).toString(),
+      ).toBe("");
+    },
+    { timeout: 15_000 },
+  );
+}
+
 describe("retry (hybrid)", () => {
   let harness: HybridChatHarness;
 
   beforeAll(async () => {
     harness = await setupHybridChatHarness({
       electronMock: h,
+      autoApprove: true,
       settings: { isTestMode: true },
     });
   }, 60_000);
@@ -38,72 +73,190 @@ describe("retry (hybrid)", () => {
     await harness?.dispose();
   });
 
-  it("retry - should work", async () => {
+  it("preserves commits from before the response and confirms before reverting newer commits", async () => {
     harness.mount();
     await waitFor(
-      () => {
-        expect(screen.getByTestId("messages-list")).toBeTruthy();
-        expect(screen.getByTestId("chat-input-container")).toBeTruthy();
-      },
+      () => expect(screen.getByTestId("chat-input-container")).toBeTruthy(),
       { timeout: 15_000 },
     );
 
-    // First turn: the fake server responds with counter=1.
-    const { send } = await harness.typeInChat("[increment]");
-    send();
-    await waitFor(() => expect(screen.getByText(/counter=1/)).toBeTruthy(), {
-      timeout: 20_000,
+    const sendTurn = async (prompt: string) => {
+      const end = harness.waitForNextStreamEnd(harness.chatId);
+      const { send } = await harness.typeInChat(prompt);
+      send();
+      await end;
+    };
+
+    await sendTurn("tc=local-agent/write-index");
+    await waitForCleanGit(harness);
+    const earlierManualPath = path.join(
+      harness.appDir,
+      "retry-earlier-manual-change.txt",
+    );
+    fs.writeFileSync(earlierManualPath, "keep me\n");
+    execFileSync("git", ["add", "retry-earlier-manual-change.txt"], {
+      cwd: harness.appDir,
     });
-    await harness.waitForStreamEnd(harness.chatId);
+    commitWithTestIdentity(harness.appDir, "Manual work before latest AI turn");
+    await sendTurn("tc=local-agent/write-index-2");
+    await waitForCleanGit(harness);
 
-    // Original db assertions for the first turn.
-    const firstMessages = await harness.db.query.messages.findMany();
-    expect(firstMessages).toHaveLength(2);
-    expect(firstMessages[0].role).toBe("user");
-    expect(firstMessages[0].content).toBe("[increment]");
-    expect(firstMessages[1].role).toBe("assistant");
-    expect(firstMessages[1].content).toContain("counter=1");
+    const directRetryEnd = harness.waitForNextStreamEnd(harness.chatId);
+    fireEvent.click(await screen.findByRole("button", { name: /Retry/ }));
+    expect(screen.queryByTestId("extra-commits-revert-dialog")).toBeNull();
+    await directRetryEnd;
+    await waitForCleanGit(harness);
+    expect(fs.existsSync(earlierManualPath)).toBe(true);
 
-    // Click the REAL Retry button (rendered in the footer once streaming ends).
+    const newerManualPath = path.join(
+      harness.appDir,
+      "retry-newer-manual-change.txt",
+    );
+    fs.writeFileSync(newerManualPath, "choose what happens to me\n");
+    execFileSync("git", ["add", "retry-newer-manual-change.txt"], {
+      cwd: harness.appDir,
+    });
+    commitWithTestIdentity(harness.appDir, "Manual work after latest AI turn");
+
+    const messagesBefore = await harness.db.query.messages.findMany();
     const retryButton = await screen.findByRole("button", { name: /Retry/ });
-    // Baseline-aware gate: snapshot the current end-count BEFORE clicking retry,
-    // then await a NEW chat:response:end. Plain waitForStreamEnd would resolve
-    // immediately on the first turn's stale event.
-    const retriedStreamEnd = harness.waitForNextStreamEnd(harness.chatId);
     fireEvent.click(retryButton);
 
-    // The retried request replaces counter=1 with counter=2 in the DOM.
-    await waitFor(
-      () => {
-        expect(screen.getByText(/counter=2/)).toBeTruthy();
-        expect(screen.queryByText(/counter=1/)).toBeNull();
-      },
-      { timeout: 20_000 },
+    expect(
+      await screen.findByTestId("extra-commits-revert-dialog"),
+    ).toBeTruthy();
+    expect(screen.getByText("Manual work after latest AI turn")).toBeTruthy();
+    expect(screen.getByTestId("retry-from-current-code-button")).toBeTruthy();
+    fireEvent.click(screen.getByTestId("cancel-revert-button"));
+    await waitFor(() =>
+      expect(screen.queryByTestId("extra-commits-revert-dialog")).toBeNull(),
+    );
+    expect(fs.existsSync(newerManualPath)).toBe(true);
+    expect(await harness.db.query.messages.findMany()).toHaveLength(
+      messagesBefore.length,
     );
 
-    // Wait for the retry's OWN end-of-stream before asserting main-side outcomes.
+    const retriedStreamEnd = harness.waitForNextStreamEnd(harness.chatId);
+    fireEvent.click(screen.getByRole("button", { name: /Retry/ }));
+    fireEvent.click(await screen.findByTestId("confirm-revert-anyway-button"));
     await retriedStreamEnd;
+    await waitForCleanGit(harness);
 
-    // No error events were emitted during the flow.
+    expect(fs.existsSync(newerManualPath)).toBe(false);
+    expect(fs.existsSync(earlierManualPath)).toBe(true);
+    await waitFor(() =>
+      expect(screen.queryByTestId("extra-commits-revert-dialog")).toBeNull(),
+    );
+  }, 60_000);
+
+  it("can retry from current code without reverting newer commits", async () => {
+    harness.mount();
+    await waitFor(
+      () => expect(screen.getByTestId("chat-input-container")).toBeTruthy(),
+      { timeout: 15_000 },
+    );
+
+    const end = harness.waitForNextStreamEnd(harness.chatId);
+    const { send } = await harness.typeInChat("tc=local-agent/write-index");
+    send();
+    await end;
+    await waitForCleanGit(harness);
+
+    const manualPath = path.join(
+      harness.appDir,
+      "retry-current-code-change.txt",
+    );
+    fs.writeFileSync(manualPath, "keep current code\n");
+    execFileSync("git", ["add", "retry-current-code-change.txt"], {
+      cwd: harness.appDir,
+    });
+    commitWithTestIdentity(harness.appDir, "Newer work to preserve");
+
+    fireEvent.click(await screen.findByRole("button", { name: /Retry/ }));
     expect(
-      harness.bridge.sentEvents.filter(
-        (e) => e.channel === "chat:response:error",
+      await screen.findByTestId("extra-commits-revert-dialog"),
+    ).toBeTruthy();
+    expect(screen.getByText("Newer work to preserve")).toBeTruthy();
+
+    const retryEnd = harness.waitForNextStreamEnd(harness.chatId);
+    fireEvent.click(screen.getByTestId("retry-from-current-code-button"));
+    await retryEnd;
+    await waitForCleanGit(harness);
+
+    expect(fs.existsSync(manualPath)).toBe(true);
+    await waitFor(() =>
+      expect(screen.queryByTestId("extra-commits-revert-dialog")).toBeNull(),
+    );
+  }, 60_000);
+
+  it("offers the safe retry path when the working tree has uncommitted changes", async () => {
+    harness.mount();
+    await waitFor(
+      () => expect(screen.getByTestId("chat-input-container")).toBeTruthy(),
+      { timeout: 15_000 },
+    );
+
+    const end = harness.waitForNextStreamEnd(harness.chatId);
+    const { send } = await harness.typeInChat("tc=local-agent/write-index-2");
+    send();
+    await end;
+    await waitForCleanGit(harness);
+
+    const uncommittedPath = path.join(
+      harness.appDir,
+      "retry-uncommitted-change.txt",
+    );
+    fs.writeFileSync(uncommittedPath, "keep uncommitted work\n");
+
+    fireEvent.click(await screen.findByRole("button", { name: /Retry/ }));
+    expect(
+      await screen.findByTestId("extra-commits-revert-dialog"),
+    ).toBeTruthy();
+    expect(screen.getByText("1 uncommitted file change")).toBeTruthy();
+    expect(
+      screen.getByText(
+        /Please commit your changes before using Restore and retry/,
       ),
-    ).toHaveLength(0);
+    ).toBeTruthy();
+    expect(screen.queryByTestId("confirm-revert-anyway-button")).toBeNull();
 
-    // Still exactly one user+assistant pair — the retry replaced, not appended.
-    const retriedMessages = await harness.db.query.messages.findMany();
-    expect(retriedMessages).toHaveLength(2);
-    expect(retriedMessages[0].role).toBe("user");
-    expect(retriedMessages[0].content).toBe("[increment]");
-    expect(retriedMessages[1].role).toBe("assistant");
+    const retryEnd = harness.waitForNextStreamEnd(harness.chatId);
+    fireEvent.click(screen.getByTestId("retry-from-current-code-button"));
+    await retryEnd;
 
-    // The counter was incremented by the retried request.
-    expect(retriedMessages[1].content).toContain("counter=2");
-    expect(retriedMessages[1].content).not.toContain("counter=1");
+    expect(fs.existsSync(uncommittedPath)).toBe(true);
+  }, 60_000);
 
-    // The replacement rows are new db rows (old pair was deleted).
-    expect(retriedMessages[0].id).not.toBe(firstMessages[0].id);
-    expect(retriedMessages[1].id).not.toBe(firstMessages[1].id);
+  it("retries a text-only response without restoring a dirty tree", async () => {
+    harness.mount();
+    await waitFor(
+      () => expect(screen.getByTestId("chat-input-container")).toBeTruthy(),
+      { timeout: 15_000 },
+    );
+
+    const firstEnd = harness.waitForNextStreamEnd(harness.chatId);
+    const { send } = await harness.typeInChat("[increment]");
+    send();
+    await firstEnd;
+    expect(screen.getByText("counter=1")).toBeTruthy();
+    const messagesBeforeRetry = await harness.db.query.messages.findMany();
+
+    const uncommittedPath = path.join(
+      harness.appDir,
+      "retry-text-only-uncommitted-change.txt",
+    );
+    fs.writeFileSync(uncommittedPath, "preserve me\n");
+
+    const retryEnd = harness.waitForNextStreamEnd(harness.chatId);
+    fireEvent.click(await screen.findByRole("button", { name: /Retry/ }));
+    expect(screen.queryByTestId("extra-commits-revert-dialog")).toBeNull();
+    await retryEnd;
+
+    expect(fs.existsSync(uncommittedPath)).toBe(true);
+    await waitFor(() => expect(screen.getByText("counter=2")).toBeTruthy());
+    expect(screen.queryByText("counter=1")).toBeNull();
+    expect(await harness.db.query.messages.findMany()).toHaveLength(
+      messagesBeforeRetry.length,
+    );
   }, 60_000);
 });

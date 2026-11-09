@@ -1,0 +1,444 @@
+import { describe, expect, it, vi } from "vitest";
+import { CancellationReason } from "@/shared/cancellation_reason";
+import { TestRunQueue } from "./controller";
+
+function gate() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+function createQueue() {
+  return new TestRunQueue({ onChange: vi.fn(), onError: vi.fn() });
+}
+const request = (runId: number) => ({
+  runId,
+  source: "agent" as const,
+  testFile: `e2e-tests/${runId}.spec.ts`,
+});
+
+describe("test run queue", () => {
+  it("rejects failed admission without executing or cancelling it and keeps siblings available", async () => {
+    const queue = new TestRunQueue({
+      manualAdmission: true,
+      onChange: vi.fn(),
+      onError: vi.fn(),
+    });
+    const external = new AbortController();
+    const detach = vi.spyOn(external.signal, "removeEventListener");
+    const execute = vi.fn(async () => "unexpected");
+    const cancelled = vi.fn(() => "cancelled");
+    const first = queue.enqueue({
+      request: request(1),
+      signal: external.signal,
+      execute,
+      cancelled,
+    });
+    const cleanup = gate();
+    const second = queue.enqueue({
+      request: request(2),
+      execute: async () => {
+        await cleanup.promise;
+        return "second";
+      },
+      cancelled,
+    });
+    const error = new Error("setup unavailable");
+    queue.failAdmission(1, error);
+    await expect(first).rejects.toBe(error);
+    expect(detach).toHaveBeenCalledOnce();
+    external.abort();
+    queue.failAdmission(1, new Error("stale"));
+    expect(execute).not.toHaveBeenCalled();
+    expect(cancelled).not.toHaveBeenCalled();
+    expect(queue.getSnapshot().queuedRuns.map((run) => run.runId)).toEqual([2]);
+    queue.admit(2);
+    queue.failAdmission(2, new Error("already admitted"));
+    cleanup.resolve();
+    await expect(second).resolves.toBe("second");
+    await queue.drain();
+    expect(queue.getSnapshot().activeRuns).toEqual([]);
+    expect(queue.getSnapshot().queuedRuns).toEqual([]);
+  });
+
+  it("rejects asynchronously when an already-aborted request cannot deliver cancellation", async () => {
+    const queue = createQueue();
+    const execute = vi.fn(async () => "unexpected");
+    const result = queue.enqueue({
+      request: request(1),
+      signal: AbortSignal.abort(),
+      execute,
+      cancelled: () => {
+        throw new Error("delivery failed");
+      },
+    });
+    await expect(result).rejects.toThrow("delivery failed");
+    expect(execute).not.toHaveBeenCalled();
+    expect(queue.getSnapshot()).toEqual({ activeRun: null, queuedRuns: [] });
+  });
+  it("executes FIFO and holds the slot through cleanup and result accounting", async () => {
+    const queue = createQueue();
+    const cleanup = gate();
+    const accounting = gate();
+    const calls: string[] = [];
+    let activeSignal: AbortSignal | undefined;
+    const first = queue.enqueue({
+      request: request(1),
+      cancelled: () => "cancelled",
+      execute: async ({ signal }) => {
+        activeSignal = signal;
+        calls.push("run 1");
+        await cleanup.promise;
+        calls.push("cleanup 1");
+        await accounting.promise;
+        calls.push("result 1");
+        return "first";
+      },
+    });
+    const second = queue.enqueue({
+      request: request(2),
+      cancelled: () => "cancelled",
+      execute: async () => {
+        calls.push("run 2");
+        return "second";
+      },
+    });
+    const third = queue.enqueue({
+      request: request(3),
+      cancelled: () => "cancelled",
+      execute: async () => {
+        calls.push("run 3");
+        return "third";
+      },
+    });
+    await Promise.resolve();
+    expect(calls).toEqual(["run 1"]);
+    expect(activeSignal?.aborted).toBe(false);
+    expect(queue.getSnapshot().queuedRuns.map((run) => run.runId)).toEqual([
+      2, 3,
+    ]);
+    cleanup.resolve();
+    await Promise.resolve();
+    expect(calls).toEqual(["run 1", "cleanup 1"]);
+    accounting.resolve();
+    expect(await Promise.all([first, second, third])).toEqual([
+      "first",
+      "second",
+      "third",
+    ]);
+    expect(calls).toEqual(["run 1", "cleanup 1", "result 1", "run 2", "run 3"]);
+    expect(queue.getSnapshot()).toEqual({ activeRun: null, queuedRuns: [] });
+  });
+
+  it("settles a cancelled middle request immediately without skipping the active cleanup", async () => {
+    const queue = createQueue();
+    const cleanup = gate();
+    const abort = new AbortController();
+    const execute = vi.fn(async () => "unexpected");
+    const first = queue.enqueue({
+      request: request(1),
+      cancelled: () => "cancelled",
+      execute: async () => {
+        await cleanup.promise;
+        return "first";
+      },
+    });
+    const second = queue.enqueue({
+      request: request(2),
+      signal: abort.signal,
+      cancelled: () => "cancelled",
+      execute,
+    });
+    const third = queue.enqueue({
+      request: request(3),
+      cancelled: () => "cancelled",
+      execute: async () => "third",
+    });
+    abort.abort();
+    expect(await second).toBe("cancelled");
+    expect(execute).not.toHaveBeenCalled();
+    expect(queue.getSnapshot().activeRun?.runId).toBe(1);
+    expect(queue.getSnapshot().queuedRuns.map((run) => run.runId)).toEqual([3]);
+    cleanup.resolve();
+    expect(await Promise.all([first, third])).toEqual(["first", "third"]);
+  });
+
+  it("stops all admitted requests but waits for the active request's cleanup before draining", async () => {
+    const queue = createQueue();
+    const cleanup = gate();
+    let signal: AbortSignal | undefined;
+    const first = queue.enqueue({
+      request: request(1),
+      cancelled: () => "cancelled",
+      execute: async (run) => {
+        signal = run.signal;
+        await cleanup.promise;
+        return "first";
+      },
+    });
+    const execute = vi.fn(async () => "second");
+    const second = queue.enqueue({
+      request: request(2),
+      cancelled: () => "cancelled",
+      execute,
+    });
+    await Promise.resolve();
+    queue.stop({ kind: "tests-panel-stop" });
+    expect(signal?.aborted).toBe(true);
+    expect(await second).toBe("cancelled");
+    const drained = vi.fn();
+    const drain = queue.drain().then(drained);
+    await Promise.resolve();
+    expect(drained).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+    cleanup.resolve();
+    await Promise.all([first, drain]);
+    expect(drained).toHaveBeenCalledOnce();
+  });
+
+  it("continues after an execution throws", async () => {
+    const queue = createQueue();
+    const first = queue.enqueue({
+      request: request(1),
+      cancelled: () => "cancelled",
+      execute: async () => {
+        throw new Error("setup failed");
+      },
+    });
+    const second = queue.enqueue({
+      request: request(2),
+      cancelled: () => "cancelled",
+      execute: async () => "second",
+    });
+    await expect(first).rejects.toThrow("setup failed");
+    expect(await second).toBe("second");
+  });
+
+  it("keeps separate app queues independent", async () => {
+    const firstQueue = createQueue();
+    const secondQueue = createQueue();
+    const cleanup = gate();
+    const first = firstQueue.enqueue({
+      request: request(1),
+      cancelled: () => "cancelled",
+      execute: async () => {
+        await cleanup.promise;
+        return "first";
+      },
+    });
+    expect(
+      await secondQueue.enqueue({
+        request: request(1),
+        cancelled: () => "cancelled",
+        execute: async () => "second",
+      }),
+    ).toBe("second");
+    expect(firstQueue.getSnapshot().activeRun?.runId).toBe(1);
+    cleanup.resolve();
+    await first;
+  });
+
+  it("rejects an execution handle from another app even when their run IDs match", async () => {
+    const firstQueue = createQueue();
+    const secondQueue = createQueue();
+    const cleanup = gate();
+    const first = firstQueue.enqueue({
+      request: request(1),
+      cancelled: () => "cancelled",
+      execute: async (run) => {
+        expect(firstQueue.ownsExecution(run)).toBe(true);
+        expect(secondQueue.ownsExecution(run)).toBe(false);
+        await cleanup.promise;
+        return "first";
+      },
+    });
+    const second = secondQueue.enqueue({
+      request: request(1),
+      cancelled: () => "cancelled",
+      execute: async () => {
+        await cleanup.promise;
+        return "second";
+      },
+    });
+    await Promise.resolve();
+    cleanup.resolve();
+    await Promise.all([first, second]);
+  });
+
+  it("updates a queued caller's position as earlier requests are cancelled", async () => {
+    const queue = createQueue();
+    const cleanup = gate();
+    const abort = new AbortController();
+    const onQueued = vi.fn();
+    const first = queue.enqueue({
+      request: request(1),
+      cancelled: () => "cancelled",
+      execute: async () => {
+        await cleanup.promise;
+        return "first";
+      },
+    });
+    const second = queue.enqueue({
+      request: request(2),
+      signal: abort.signal,
+      cancelled: () => "cancelled",
+      execute: async () => "second",
+    });
+    const third = queue.enqueue({
+      request: request(3),
+      onQueued,
+      cancelled: () => "cancelled",
+      execute: async () => "third",
+    });
+    expect(onQueued).toHaveBeenCalledExactlyOnceWith(2);
+    const fourth = queue.enqueue({
+      request: request(4),
+      cancelled: () => "cancelled",
+      execute: async () => "fourth",
+    });
+    expect(onQueued).toHaveBeenCalledExactlyOnceWith(2);
+    abort.abort();
+    expect(onQueued).toHaveBeenLastCalledWith(1);
+    expect(onQueued).toHaveBeenCalledTimes(2);
+    cleanup.resolve();
+    await Promise.all([first, second, third, fourth]);
+  });
+
+  it("honors cancellation reentered from admission publication before execution", async () => {
+    const abort = new AbortController();
+    const queue = new TestRunQueue({
+      onChange: () => abort.abort(),
+      onError: vi.fn(),
+    });
+    const execute = vi.fn(async () => "unexpected");
+    expect(
+      await queue.enqueue({
+        request: request(1),
+        signal: abort.signal,
+        execute,
+        cancelled: () => "cancelled",
+      }),
+    ).toBe("cancelled");
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("rejects a failed cancellation callback without stranding the remaining queue", async () => {
+    const queue = createQueue();
+    const cleanup = gate();
+    const abort = new AbortController();
+    const first = queue.enqueue({
+      request: request(1),
+      cancelled: () => "cancelled",
+      execute: async () => {
+        await cleanup.promise;
+        return "first";
+      },
+    });
+    const second = queue.enqueue({
+      request: request(2),
+      signal: abort.signal,
+      cancelled: () => {
+        throw new Error("delivery failed");
+      },
+      execute: async () => "second",
+    });
+    const executeThird = vi.fn(async () => "third");
+    const third = queue.enqueue({
+      request: request(3),
+      cancelled: () => "cancelled",
+      execute: executeThird,
+    });
+    abort.abort();
+    await expect(second).rejects.toThrow("delivery failed");
+    expect(executeThird).not.toHaveBeenCalled();
+    cleanup.resolve();
+    expect(await Promise.all([first, third])).toEqual(["first", "third"]);
+    expect(executeThird).toHaveBeenCalledOnce();
+    expect(queue.getSnapshot().activeRun).toBeNull();
+  });
+
+  it("aborts the active run with the Stop's cause and hands it to cancelled queued requests", async () => {
+    const queue = createQueue();
+    const cleanup = gate();
+    let signal: AbortSignal | undefined;
+    const first = queue.enqueue({
+      request: request(1),
+      cancelled: () => "cancelled",
+      execute: async (run) => {
+        signal = run.signal;
+        await cleanup.promise;
+        return "first";
+      },
+    });
+    const second = queue.enqueue({
+      request: request(2),
+      cancelled: (reason) => reason,
+      execute: async () => {
+        throw new Error("unexpected execution");
+      },
+    });
+    await Promise.resolve();
+    queue.stop({ kind: "tests-panel-stop" });
+    expect(signal?.reason).toBeInstanceOf(CancellationReason);
+    expect(signal?.reason).toMatchObject({
+      name: "AbortError",
+      kind: "tests-panel-stop",
+    });
+    expect(queue.getSnapshot().activeRun?.stopReason).toEqual({
+      kind: "tests-panel-stop",
+    });
+    expect(await second).toEqual({ kind: "tests-panel-stop" });
+    cleanup.resolve();
+    expect(await first).toBe("first");
+  });
+
+  it("forwards the cause an external signal aborted with, and names a reasonless abort", async () => {
+    const queue = createQueue();
+    const cleanup = gate();
+    const external = new AbortController();
+    let signal: AbortSignal | undefined;
+    const first = queue.enqueue({
+      request: request(1),
+      signal: external.signal,
+      cancelled: () => "cancelled",
+      execute: async (run) => {
+        signal = run.signal;
+        await cleanup.promise;
+        return "first";
+      },
+    });
+    const queuedExternal = new AbortController();
+    const second = queue.enqueue({
+      request: request(2),
+      signal: queuedExternal.signal,
+      cancelled: (reason) => reason,
+      execute: async () => {
+        throw new Error("unexpected execution");
+      },
+    });
+    await Promise.resolve();
+    external.abort(
+      new CancellationReason("claude-code-call-abandoned", "Request timed out"),
+    );
+    expect(signal?.reason).toMatchObject({
+      kind: "claude-code-call-abandoned",
+      detail: "Request timed out",
+    });
+    queuedExternal.abort();
+    expect(await second).toEqual({ kind: "agent-cancelled" });
+    cleanup.resolve();
+    expect(await first).toBe("first");
+    await expect(
+      queue.enqueue({
+        request: request(3),
+        signal: AbortSignal.abort(new CancellationReason("chat-deleted")),
+        cancelled: (reason) => reason,
+        execute: async () => {
+          throw new Error("unexpected execution");
+        },
+      }),
+    ).resolves.toEqual({ kind: "chat-deleted" });
+  });
+});

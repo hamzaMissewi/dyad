@@ -1,31 +1,19 @@
 import { useCallback, useRef, useState } from "react";
-import { useSetAtom, useStore } from "jotai";
+import { useSetAtom } from "jotai";
 import { useNavigate } from "@tanstack/react-router";
 import { ipc } from "@/ipc/types";
-import {
-  selectedChatIdAtom,
-  chatMessagesByIdAtom,
-  isStreamingByIdAtom,
-  chatStreamCountByIdAtom,
-  streamingPreviewByChatIdAtom,
-} from "@/atoms/chatAtoms";
+import { selectedChatIdAtom } from "@/atoms/chatAtoms";
 import { selectedAppIdAtom } from "@/atoms/appAtoms";
+import { useChatStreamManager } from "@/chat_stream/ChatStreamProvider";
 import { showError } from "@/lib/toast";
 import { useChats } from "@/hooks/useChats";
 import { useLoadApp } from "@/hooks/useLoadApp";
-import { useSettings } from "@/hooks/useSettings";
-import { handleEffectiveChatModeChunk } from "@/lib/chatModeStream";
-import { applyStreamingPatch } from "@/lib/applyStreamingPatch";
-import { triggerResync, syncChatFromDb } from "@/lib/resyncChat";
-import {
-  applyPreviewChunk,
-  clearPreviewForChat,
-} from "@/lib/streamingPreviewSync";
 
 interface UseResolveMergeConflictsWithAIProps {
   appId: number;
-  conflicts: string[];
-  onStartResolving?: () => void;
+  conflicts: readonly string[];
+  onStartResolving?: (chatId: number) => void | Promise<void>;
+  onStartFailed?: () => void | Promise<void>;
 }
 
 /**
@@ -36,204 +24,123 @@ export function useResolveMergeConflictsWithAI({
   appId,
   conflicts,
   onStartResolving,
+  onStartFailed,
 }: UseResolveMergeConflictsWithAIProps) {
   const setSelectedChatId = useSetAtom(selectedChatIdAtom);
   const setSelectedAppId = useSetAtom(selectedAppIdAtom);
-  const setMessagesById = useSetAtom(chatMessagesByIdAtom);
-  const setIsStreamingById = useSetAtom(isStreamingByIdAtom);
-  const setStreamCountById = useSetAtom(chatStreamCountByIdAtom);
-  const setStreamingPreviewByChatId = useSetAtom(streamingPreviewByChatIdAtom);
-  const store = useStore();
   const navigate = useNavigate();
   const [isResolving, setIsResolving] = useState(false);
   const isResolvingRef = useRef(false);
   const { invalidateChats } = useChats(appId);
   const { refreshApp } = useLoadApp(appId);
-  const { settings } = useSettings();
+  const chatStreamManager = useChatStreamManager();
 
-  const resolveWithAI = useCallback(async () => {
-    if (!appId) {
-      showError("App ID is required");
-      return;
-    }
-    if (conflicts.length === 0) {
-      showError("No conflicts to resolve");
-      return;
-    }
-    if (isResolvingRef.current) {
-      return;
-    }
+  const resolveFilesWithAI = useCallback(
+    async (requestedConflicts: readonly string[]) => {
+      if (!appId) {
+        showError("App ID is required");
+        return;
+      }
+      if (requestedConflicts.length === 0) {
+        showError("No conflicts to resolve");
+        return;
+      }
+      if (isResolvingRef.current) {
+        return;
+      }
 
-    isResolvingRef.current = true;
-    setIsResolving(true);
+      isResolvingRef.current = true;
+      setIsResolving(true);
 
-    let chatId: number | null = null;
-    try {
-      // Create a new chat for conflict resolution
-      const newChatId = await ipc.chat.createChat({
-        appId,
-        initialChatMode: "build",
-      });
-      chatId = newChatId;
-
-      // Clear conflicts state after successful chat creation
-      onStartResolving?.();
-
-      // Build the prompt for resolving all conflicts
-      const fileList = conflicts.map((f) => `- ${f}`).join("\n");
-      const prompt = `Please resolve the Git merge conflicts in the following file${conflicts.length > 1 ? "s" : ""}:
+      try {
+        // Create a new chat for conflict resolution
+        const newChatId = await ipc.chat.createChat({
+          appId,
+          initialChatMode: "local-agent",
+        });
+        try {
+          // Clear conflicts state after successful chat creation.
+          await onStartResolving?.(newChatId);
+        } catch (error) {
+          // The claim can expire while durable chat creation is in flight.
+          // Remove the chat if main does not accept the corresponding start.
+          try {
+            await ipc.chat.deleteChat(newChatId);
+          } catch (deleteError) {
+            console.error(
+              "Failed to delete unused conflict-resolution chat:",
+              deleteError,
+            );
+          }
+          throw error;
+        }
+        // Build the prompt for resolving all conflicts
+        const fileList = requestedConflicts.map((f) => `- ${f}`).join("\n");
+        const prompt = `Please resolve the Git merge conflicts in the following file${requestedConflicts.length > 1 ? "s" : ""}:
 
 ${fileList}
 
-For each file, review the conflict markers (<<<<<<<, =======, >>>>>>>) and choose the best resolution that preserves the intended functionality from both sides. Remove all conflict markers and provide the complete resolved file content.`;
+For each listed file, resolve every Git conflict by editing the file in place. Preserve the intended behavior from both sides where compatible, and remove all conflict markers (<<<<<<<, =======, >>>>>>>). Do not only describe the resolution or paste the file contents into chat. Before finishing, verify that none of the listed files contain conflict markers.`;
 
-      // Set up the chat state and navigate
-      setSelectedChatId(newChatId);
-      setSelectedAppId(appId);
+        // Set up the chat state and navigate
+        setSelectedChatId(newChatId);
+        setSelectedAppId(appId);
 
-      // Mark as streaming
-      setIsStreamingById((prev) => {
-        const next = new Map(prev);
-        next.set(newChatId, true);
-        return next;
-      });
-
-      // Navigate to the chat page
-      navigate({
-        to: "/chat",
-        search: { id: newChatId },
-      });
-
-      // Start the stream
-      let hasIncrementedStreamCount = false;
-      ipc.chatStream.start(
-        {
-          chatId: newChatId,
-          prompt,
-        },
-        {
-          onChunk: ({
-            messages,
-            streamingMessageId,
-            streamingPatch,
-            streamingPreview,
-            effectiveChatMode,
-            chatModeFallbackReason,
-          }) => {
-            if (
-              handleEffectiveChatModeChunk(
-                { effectiveChatMode, chatModeFallbackReason },
-                settings,
-                newChatId,
-              )
-            ) {
-              return;
-            }
-
-            if (!hasIncrementedStreamCount) {
-              setStreamCountById((prev) => {
-                const next = new Map(prev);
-                next.set(newChatId, (prev.get(newChatId) ?? 0) + 1);
-                return next;
-              });
-              hasIncrementedStreamCount = true;
-            }
-
-            applyPreviewChunk(
-              setStreamingPreviewByChatId,
-              newChatId,
-              streamingPreview,
-            );
-
-            if (messages) {
-              // Full messages update (initial load, post-compaction, etc.)
-              setMessagesById((prev) => {
-                const next = new Map(prev);
-                next.set(newChatId, messages);
-                return next;
-              });
-            } else if (
-              streamingMessageId !== undefined &&
-              streamingPatch !== undefined
-            ) {
-              const applied = applyStreamingPatch(
-                setMessagesById,
-                newChatId,
-                streamingMessageId,
-                streamingPatch,
-              );
-              if (!applied) {
-                triggerResync(newChatId, setMessagesById, store);
-              }
-            }
-          },
-          onEnd: () => {
-            setIsStreamingById((prev) => {
-              const next = new Map(prev);
-              next.set(newChatId, false);
-              return next;
-            });
-            clearPreviewForChat(setStreamingPreviewByChatId, newChatId);
-            isResolvingRef.current = false;
-            setIsResolving(false);
-            invalidateChats();
-            refreshApp();
-            syncChatFromDb(
-              newChatId,
-              setMessagesById,
-              "[CHAT] Merge conflict onEnd",
-              store,
-            );
-          },
-          onError: ({ error }) => {
-            showError(error || "Failed to resolve conflicts");
-            setIsStreamingById((prev) => {
-              const next = new Map(prev);
-              next.set(newChatId, false);
-              return next;
-            });
-            clearPreviewForChat(setStreamingPreviewByChatId, newChatId);
-            isResolvingRef.current = false;
-            setIsResolving(false);
-            invalidateChats();
-            refreshApp();
-            syncChatFromDb(
-              newChatId,
-              setMessagesById,
-              "[CHAT] Merge conflict onError",
-              store,
-            );
-          },
-        },
-      );
-    } catch (error: any) {
-      showError(error?.message || "Failed to start conflict resolution");
-      if (chatId !== null) {
-        setIsStreamingById((prev) => {
-          const next = new Map(prev);
-          next.set(chatId!, false);
-          return next;
+        // Navigate to the chat page
+        navigate({
+          to: "/chat",
+          search: { id: newChatId },
         });
-      }
-      isResolvingRef.current = false;
-      setIsResolving(false);
-    }
-  }, [
-    appId,
-    conflicts,
-    onStartResolving,
-    setSelectedChatId,
-    setSelectedAppId,
-    setMessagesById,
-    setIsStreamingById,
-    setStreamCountById,
-    setStreamingPreviewByChatId,
-    navigate,
-    invalidateChats,
-    refreshApp,
-    settings,
-    store,
-  ]);
 
-  return { resolveWithAI, isResolving };
+        chatStreamManager.ensure(newChatId).send({
+          type: "submit",
+          request: {
+            chatId: newChatId,
+            prompt,
+            appId,
+            onSettled: () => {
+              isResolvingRef.current = false;
+              setIsResolving(false);
+              invalidateChats();
+              void refreshApp();
+            },
+          },
+        });
+      } catch (error: unknown) {
+        try {
+          await onStartFailed?.();
+        } catch (rollbackError) {
+          console.error(
+            "Failed to release conflict-resolution claim:",
+            rollbackError,
+          );
+        }
+        showError(
+          error instanceof Error
+            ? error.message
+            : "Failed to start conflict resolution",
+        );
+        isResolvingRef.current = false;
+        setIsResolving(false);
+      }
+    },
+    [
+      appId,
+      onStartResolving,
+      onStartFailed,
+      setSelectedChatId,
+      setSelectedAppId,
+      navigate,
+      invalidateChats,
+      refreshApp,
+      chatStreamManager,
+    ],
+  );
+
+  const resolveWithAI = useCallback(
+    () => resolveFilesWithAI(conflicts),
+    [conflicts, resolveFilesWithAI],
+  );
+
+  return { resolveWithAI, resolveFilesWithAI, isResolving };
 }

@@ -3,22 +3,32 @@ import treeKill from "tree-kill";
 import log from "electron-log";
 import type { Worker } from "node:worker_threads";
 import type { RuntimeMode2 } from "@/lib/schemas";
-import { withLock } from "./lock_utils";
+import { appOperationCoordinator } from "../services/app_operation_coordinator";
 import {
   destroyCloudSandbox,
   stopCloudSandboxFileSync,
   unregisterRunningCloudSandbox,
 } from "./cloud_sandbox_provider";
 import { readSettings } from "../../main/settings";
+import { endRecordingForApp } from "../services/recording_registry";
+import type { AppRunInvocationRef, PreviewAuthStatus } from "@/app_run/state";
+import type { AppRuntimeOutput } from "@/ipc/types/app_runtime";
+import { killProcessTreeSync } from "./kill_process_tree_sync";
+import type { PreviewAuthTarget } from "../services/preview_auth_target";
 
 const logger = log.scope("process_manager");
 
 // Define a type for the value stored in runningApps
 export interface RunningAppInfo {
+  /** Preview address choice captured at startup; settings changes need a restart. */
+  previewHostname?: string;
   process: ChildProcess | null;
   processId: number;
+  /** Correlation identity of the run/restart that owns this producer. */
+  invocationRef?: AppRunInvocationRef;
   mode: RuntimeMode2;
-  rendererSender?: Electron.WebContents;
+  /** Output producer captured when this runtime invocation is created. */
+  output?: AppRuntimeOutput;
   containerName?: string;
   cloudSandboxId?: string;
   cloudPreviewUrl?: string;
@@ -30,10 +40,46 @@ export interface RunningAppInfo {
   lastViewedAt: number;
   /** Proxy URL for the running app, set when the proxy server starts */
   proxyUrl?: string;
+  previewAuthTarget?: PreviewAuthTarget | null;
+  /** Fences startup lookups against provider switches, including disconnects. */
+  previewAuthTargetRevision?: number;
+  previewAuth?: PreviewAuthStatus;
+  /** Runtime-owned registration; cancelled and drained on stop or replacement. */
+  previewAuthRegistration?: {
+    target: PreviewAuthTarget;
+    origin: string;
+    invocationRef?: AppRunInvocationRef;
+    output?: AppRuntimeOutput;
+    controller: AbortController;
+    settled: Promise<void>;
+  };
+  proxyStartup?: Promise<void>;
+  proxyStartupError?: Error;
+  /** Releases a pending readiness wait for a queued, intentional Stop. */
+  stopRequested?: boolean;
+  proxyAbortController?: AbortController;
+  previewAbortSignal?: AbortSignal;
+  /**
+   * Capability embedded in proxied HTML and returned only to the trusted
+   * renderer. Auth bootstrap messages must echo it before the preview will
+   * accept credentials from its framing parent.
+   */
+  authBootstrapToken?: string;
   /** Original localhost URL for the running app */
   originalUrl?: string;
   /** Proxy worker dedicated to this running app */
   proxyWorker?: Worker;
+  /**
+   * Set while a recording's own lifecycle is replacing this process.
+   *
+   * The child's `close` listener runs to completion before `stopAppByInfo`
+   * resumes past its kill and removes the map entry, so an intentional
+   * replacement is indistinguishable from a crash at that point. Isolation
+   * setup restarts the very app it is preparing to record; without this marker
+   * that restart reports itself as `app-stopped` and cancels the session it
+   * belongs to.
+   */
+  recordingOwnedRestart?: boolean;
 }
 
 // Store running app processes
@@ -53,6 +99,30 @@ export const processCounter = {
     return ++processCounterValue;
   },
 };
+
+/**
+ * Returns [appId, pid] pairs for apps with a locally spawned process.
+ * Read-only accessor used by memory diagnostics; excludes cloud/docker apps,
+ * which have no local child process to inspect.
+ */
+export function getRunningAppProcessPids(): { appId: number; pid: number }[] {
+  const pairs: { appId: number; pid: number }[] = [];
+  for (const [appId, appInfo] of runningApps.entries()) {
+    if (appInfo.mode !== "host") {
+      continue;
+    }
+    const pid = appInfo.process?.pid;
+    if (typeof pid === "number") {
+      pairs.push({ appId, pid });
+    }
+  }
+  return pairs;
+}
+
+/** Module-level because the functions below name their child `process`. */
+function isWindows(): boolean {
+  return process.platform === "win32";
+}
 
 /**
  * Kills a running process with its child processes
@@ -109,6 +179,84 @@ export function killProcess(process: ChildProcess): Promise<void> {
 }
 
 /**
+ * Escalate to SIGKILL for a tree that outlived `killProcess`'s SIGTERM window,
+ * and wait (bounded) for it to actually close.
+ *
+ * `killProcess` resolves on its own 5s timeout with the tree still alive, which
+ * is fine for a caller that only needs the port back. It is not fine for one
+ * that is about to delete the directory the tree is running in: a survivor
+ * keeps serving, and on Windows keeps the directory locked.
+ *
+ * Resolves to whether the tree is CONFIRMED closed, which is narrower than
+ * "the signal was sent". Confirmation comes from the root's `close` event, so
+ * a root that had already exited resolves `false` — its descendants may have
+ * been reparented beyond anything this pid can reach or observe. A caller that
+ * needs certainty in that case must check something a survivor would still be
+ * holding, such as the port it was serving on.
+ */
+export function forceKillProcessTree(
+  process: ChildProcess,
+  timeoutMs = 5000,
+): Promise<boolean> {
+  const pid = process.pid;
+  if (!pid) {
+    return Promise.resolve(false);
+  }
+  // Deliberately NOT short-circuited on the root having exited. The E2E runtime
+  // spawns a shell, and a shell that has exited says nothing about the dev
+  // server it started: `npm run dev` forks a child that routinely outlives its
+  // parent. Reporting "closed" from the root's exit code alone would skip the
+  // SIGKILL for exactly the survivor that still holds the sandbox directory.
+  // `tree-kill` walks the tree from this pid, and a pid whose whole tree is
+  // already gone makes it a no-op that resolves on the timeout below.
+  const rootAlreadyExited =
+    process.exitCode !== null || process.signalCode !== null;
+  // The exception is Windows, where that walk cannot start from a dead root:
+  // `taskkill /T` finds descendants through the live process, so it can only
+  // fail with "not found". Or worse, the pid has been reused and it force-kills
+  // an unrelated tree. Same verdict as a failed signal, without the risk.
+  if (rootAlreadyExited && isWindows()) {
+    logger.info(
+      `Not signalling exited process tree root (PID: ${pid}): Windows cannot reach its descendants.`,
+    );
+    return Promise.resolve(false);
+  }
+  return new Promise<boolean>((resolve) => {
+    const timeout = setTimeout(() => {
+      logger.warn(
+        `Process tree (PID: ${pid}) survived SIGKILL within ${timeoutMs}ms.`,
+      );
+      resolve(false);
+    }, timeoutMs);
+    const settle = (closed: boolean) => {
+      clearTimeout(timeout);
+      resolve(closed);
+    };
+    if (!rootAlreadyExited) {
+      // `close` fires after the root's stdio has drained, which is the closest
+      // signal Node gives that its descendants sharing those pipes are gone.
+      process.once("close", () => settle(true));
+      process.once("error", () => settle(false));
+    }
+    logger.info(`Escalating to SIGKILL for process tree at PID ${pid}.`);
+    treeKill(pid, "SIGKILL", (err: Error | undefined) => {
+      if (err) {
+        logger.warn(`tree-kill SIGKILL error for PID ${pid}: ${err.message}`);
+        settle(false);
+      }
+      // An exited root has already emitted its `close`, so there is nothing
+      // left here to observe — and a descendant that daemonized or was
+      // reparented is no longer reachable from this pid at all, so tree-kill's
+      // own success says nothing about it either. Report "not confirmed" rather
+      // than waiting out the timeout for an event that cannot arrive; a caller
+      // that needs certainty has to check something the survivor would still be
+      // holding.
+      if (rootAlreadyExited) settle(false);
+    });
+  });
+}
+
+/**
  * Gracefully stops a Docker container by name. Resolves even if the container doesn't exist.
  */
 export function stopDockerContainer(containerName: string): Promise<void> {
@@ -137,33 +285,66 @@ export function removeDockerVolumesForApp(appId: number): Promise<void> {
 
 /**
  * Stops an app based on its RunningAppInfo (container vs host) and removes it from the running map.
+ *
+ * Pass `recordingOwnedRestart` when the stop is part of a recording's own
+ * lifecycle (isolation setup and teardown restart the app they are recording).
+ * The process's `close` listener sees the map entry as still current, so
+ * otherwise the restart would be read as the app going away and end the session
+ * it is preparing.
  */
 export async function stopAppByInfo(
   appId: number,
   appInfo: RunningAppInfo,
+  options: { recordingOwnedRestart?: boolean } = {},
 ): Promise<void> {
-  stopCloudSandboxFileSync(appId);
+  appInfo.proxyAbortController?.abort();
+  appInfo.previewAuthRegistration?.controller.abort();
+  if (options.recordingOwnedRestart) {
+    appInfo.recordingOwnedRestart = true;
+  }
+  try {
+    if (appInfo.previewAuthRegistration)
+      await appInfo.previewAuthRegistration.settled;
+    stopCloudSandboxFileSync(appId);
 
-  if (appInfo.mode === "cloud") {
-    if (appInfo.cloudSandboxId) {
-      await destroyCloudSandbox(appInfo.cloudSandboxId);
+    if (appInfo.mode === "cloud") {
+      if (appInfo.cloudSandboxId) {
+        await destroyCloudSandbox(appInfo.cloudSandboxId);
+      }
+    } else if (appInfo.mode === "docker") {
+      const containerName = appInfo.containerName || `dyad-app-${appId}`;
+      await stopDockerContainer(containerName);
+    } else if (appInfo.process) {
+      await killProcess(appInfo.process);
     }
-  } else if (appInfo.mode === "docker") {
-    const containerName = appInfo.containerName || `dyad-app-${appId}`;
-    await stopDockerContainer(containerName);
-  } else if (appInfo.process) {
-    await killProcess(appInfo.process);
-  }
 
-  if (appInfo.proxyWorker) {
-    await appInfo.proxyWorker.terminate();
-    appInfo.proxyWorker = undefined;
-  }
+    if (appInfo.proxyWorker) {
+      await appInfo.proxyWorker.terminate();
+      appInfo.proxyWorker = undefined;
+    }
 
-  appInfo.cloudLogAbortController?.abort();
-  appInfo.cloudLogAbortController = undefined;
-  unregisterRunningCloudSandbox({ appId });
-  runningApps.delete(appId);
+    appInfo.cloudLogAbortController?.abort();
+    appInfo.cloudLogAbortController = undefined;
+    unregisterRunningCloudSandbox({ appId });
+    runningApps.delete(appId);
+  } catch (error) {
+    // A failed cloud teardown retains the running app. Drain the cancelled
+    // startup before allowing later URL output/restart to rebuild its proxy.
+    await appInfo.proxyStartup;
+    if (runningApps.get(appId) === appInfo) {
+      appInfo.proxyAbortController = new AbortController();
+      appInfo.previewAuthRegistration = undefined;
+      appInfo.proxyStartupError = undefined;
+    }
+    throw error;
+  } finally {
+    // The marker only has to outlive the kill, whose `close` listener runs
+    // inside the await above. Left latched on a stop that threw, it would sit
+    // on an entry still in `runningApps` and suppress a later, legitimate
+    // `app-stopped` — holding the session's claim until the 30-minute cap with
+    // no preview left to record.
+    appInfo.recordingOwnedRestart = false;
+  }
 }
 
 /**
@@ -177,6 +358,8 @@ export function removeAppIfCurrentProcess(
 ): void {
   const currentAppInfo = runningApps.get(appId);
   if (currentAppInfo && currentAppInfo.process === process) {
+    currentAppInfo.proxyAbortController?.abort();
+    currentAppInfo.previewAuthRegistration?.controller.abort();
     if (currentAppInfo.proxyWorker) {
       void currentAppInfo.proxyWorker.terminate();
       currentAppInfo.proxyWorker = undefined;
@@ -189,6 +372,30 @@ export function removeAppIfCurrentProcess(
     logger.info(
       `Removed app ${appId} (processId ${currentAppInfo.processId}) from running map. Current size: ${runningApps.size}`,
     );
+    // The dev server went away on its own — a crash, or the user killing it
+    // outside Dyad. Stop/Restart/Delete end a recording explicitly, but this
+    // path had nothing watching it, so isolation and the session's whole-app
+    // claim would have been held until the 30-minute cap with no preview left
+    // to record.
+    //
+    // A recording's own restart is the one deliberate stop that does reach
+    // here: `stopAppByInfo` only deletes the map entry after the kill resolves,
+    // and this listener runs first, so isolation setup would otherwise cancel
+    // the session it is preparing. That caller marks its entry instead.
+    //
+    // `skipRestart` because there is no process to put back — teardown must
+    // restore `.env.local`, not resurrect an app the user didn't ask to start.
+    // Fire-and-forget: this is a lifecycle callback, and teardown reports its
+    // own failures to the recorder bar.
+    if (!currentAppInfo.recordingOwnedRestart) {
+      void endRecordingForApp(appId, "app-stopped", {
+        skipRestart: true,
+      }).catch((error) => {
+        logger.error(
+          `Failed to end app ${appId}'s recording after its process exited: ${error}`,
+        );
+      });
+    }
   } else {
     logger.info(
       `App ${appId} process was already removed or replaced in running map. Ignoring.`,
@@ -271,27 +478,34 @@ export async function garbageCollectIdleApps(): Promise<void> {
   // Stop idle apps (acquire per-app lock to avoid racing with runApp/stopApp/restartApp)
   for (const appId of appsToStop) {
     try {
-      await withLock(appId, async () => {
-        // Re-check: the user may have selected this app while we were stopping others
-        if (appId === currentlySelectedAppId) {
-          logger.info(
-            `Skipping GC for app ${appId}: it became the selected app during this GC cycle`,
-          );
-          return;
-        }
-        const appInfo = runningApps.get(appId);
-        if (!appInfo) return;
-        // Re-check idle time under lock in case the app was viewed/restarted
-        const recheckIdle = Date.now() - appInfo.lastViewedAt;
-        if (recheckIdle < IDLE_TIMEOUT_MS) {
-          logger.info(
-            `Skipping GC for app ${appId}: idle time refreshed during lock wait`,
-          );
-          return;
-        }
-        logger.info(`Garbage collecting idle app ${appId}`);
-        await stopAppByInfo(appId, appInfo);
-      });
+      await appOperationCoordinator.run(
+        {
+          appId,
+          operation: "garbage-collect-app-runtime",
+          resources: ["runtime"],
+        },
+        async () => {
+          // Re-check: the user may have selected this app while we were stopping others
+          if (appId === currentlySelectedAppId) {
+            logger.info(
+              `Skipping GC for app ${appId}: it became the selected app during this GC cycle`,
+            );
+            return;
+          }
+          const appInfo = runningApps.get(appId);
+          if (!appInfo) return;
+          // Re-check idle time under lock in case the app was viewed/restarted
+          const recheckIdle = Date.now() - appInfo.lastViewedAt;
+          if (recheckIdle < IDLE_TIMEOUT_MS) {
+            logger.info(
+              `Skipping GC for app ${appId}: idle time refreshed during lock wait`,
+            );
+            return;
+          }
+          logger.info(`Garbage collecting idle app ${appId}`);
+          await stopAppByInfo(appId, appInfo);
+        },
+      );
     } catch (error) {
       logger.error(`Failed to garbage collect app ${appId}:`, error);
     }
@@ -361,6 +575,8 @@ export function stopAllAppsSync(): void {
     const appInfo = runningApps.get(appId);
     if (!appInfo) continue;
 
+    appInfo.proxyAbortController?.abort();
+    appInfo.previewAuthRegistration?.controller.abort();
     if (appInfo.proxyWorker) {
       void appInfo.proxyWorker.terminate();
       appInfo.proxyWorker = undefined;
@@ -395,15 +611,14 @@ export function stopAllAppsSync(): void {
       logger.info(`Sent docker stop for app ${appId} (${containerName})`);
     } else if (appInfo.process?.pid) {
       const pid = appInfo.process.pid;
-      // treeKill sends SIGTERM synchronously
-      treeKill(pid, "SIGTERM", (err: Error | undefined) => {
-        if (err) {
-          logger.warn(
-            `tree-kill error for app ${appId} (PID ${pid}): ${err.message}`,
-          );
-        }
-      });
-      logger.info(`Sent SIGTERM to app ${appId} (PID ${pid})`);
+      if (killProcessTreeSync(pid)) {
+        logger.info(`Sent SIGTERM to app ${appId} (PID ${pid})`);
+      } else {
+        logger.warn(
+          `Failed to synchronously terminate app ${appId} (PID ${pid}) during quit`,
+        );
+        continue;
+      }
     }
     runningApps.delete(appId);
   }

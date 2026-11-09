@@ -1,23 +1,48 @@
 import { X } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
+/**
+ * "info" is the default nudge (an opt-in the user can ignore forever).
+ * "warning" is for something that will break if it stays ignored, and carries
+ * the same amber the rest of the app uses for that.
+ */
+type SkippableBannerVariant = "info" | "warning";
+
 interface SkippableBannerProps {
   icon: LucideIcon;
   message: React.ReactNode;
   enableLabel: string;
   onEnable: () => void;
   onSkip: () => void;
+  variant?: SkippableBannerVariant;
+  /** Blocks the action while it's already running. */
+  enableDisabled?: boolean;
+  dismissLabel?: string;
   "data-testid"?: string;
 }
 
-const colors = {
-  container: "bg-indigo-50/60 dark:bg-indigo-900/30",
-  ring: "ring-black/5 dark:ring-white/10",
-  icon: "text-indigo-600 dark:text-indigo-200 bg-indigo-100 dark:bg-white/15",
-  text: "text-indigo-900 dark:text-indigo-100",
-  enableBtn: "bg-white/90 hover:bg-white text-indigo-800 shadow font-semibold",
-  skipBtn:
-    "text-indigo-600 dark:text-indigo-200 hover:text-indigo-800 dark:hover:text-indigo-100",
+const colors: Record<SkippableBannerVariant, Record<string, string>> = {
+  info: {
+    container: "bg-indigo-50/60 dark:bg-indigo-900/30",
+    ring: "ring-black/5 dark:ring-white/10",
+    icon: "text-indigo-600 dark:text-indigo-200 bg-indigo-100 dark:bg-white/15",
+    text: "text-indigo-900 dark:text-indigo-100",
+    enableBtn:
+      "bg-white/90 hover:bg-white text-indigo-800 shadow font-semibold",
+    skipBtn:
+      "text-indigo-600 dark:text-indigo-200 hover:text-indigo-800 dark:hover:text-indigo-100",
+    dismissBg: "bg-white dark:bg-indigo-800",
+  },
+  warning: {
+    container: "bg-amber-50 dark:bg-amber-900/40",
+    ring: "ring-amber-500/30 dark:ring-amber-300/20",
+    icon: "text-amber-700 dark:text-amber-200 bg-amber-100 dark:bg-white/15",
+    text: "text-amber-900 dark:text-amber-100",
+    enableBtn: "bg-white/90 hover:bg-white text-amber-900 shadow font-semibold",
+    skipBtn:
+      "text-amber-700 dark:text-amber-200 hover:text-amber-900 dark:hover:text-amber-100",
+    dismissBg: "bg-white dark:bg-amber-800",
+  },
 };
 
 export function SkippableBanner({
@@ -26,25 +51,31 @@ export function SkippableBanner({
   enableLabel,
   onEnable,
   onSkip,
+  variant = "info",
+  enableDisabled = false,
+  dismissLabel = "Dismiss",
   "data-testid": testId,
 }: SkippableBannerProps) {
-  const c = colors;
+  const c = colors[variant];
 
   return (
-    <div className="px-3 pt-1 flex justify-center" data-testid={testId}>
+    <div
+      className="@container px-3 pt-1 flex justify-center"
+      data-testid={testId}
+    >
       <div
         className={`max-w-3xl w-full mb-2 rounded-lg ${c.container} ring-1 ring-inset ${c.ring} relative`}
       >
         <button
           type="button"
           onClick={onSkip}
-          className={`absolute -top-2 -right-2 inline-flex items-center justify-center rounded-full p-1 transition-colors duration-150 ${c.skipBtn} cursor-pointer bg-white dark:bg-indigo-800 ring-1 ring-inset ${c.ring} shadow-sm`}
-          aria-label="Dismiss"
+          className={`absolute -top-2 -right-2 inline-flex items-center justify-center rounded-full p-1 transition-colors duration-150 ${c.skipBtn} cursor-pointer ${c.dismissBg} ring-1 ring-inset ${c.ring} shadow-sm`}
+          aria-label={dismissLabel}
         >
           <X className="h-3.5 w-3.5" />
         </button>
 
-        <div className="flex items-center gap-3 px-3 py-2 pr-8">
+        <div className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-x-3 gap-y-2 px-3 py-2 pr-8 @max-sm:grid-cols-[auto_minmax(0,1fr)]">
           {/* Icon badge */}
           <div className={`shrink-0 rounded-lg p-2 ${c.icon}`}>
             <Icon className="h-5 w-5" />
@@ -61,7 +92,8 @@ export function SkippableBanner({
           <button
             type="button"
             onClick={onEnable}
-            className={`inline-flex items-center shrink-0 rounded-lg px-4 py-1.5 text-sm font-semibold transition-all duration-150 ${c.enableBtn} cursor-pointer`}
+            disabled={enableDisabled}
+            className={`inline-flex items-center justify-self-start rounded-lg px-4 py-1.5 text-sm font-semibold transition-all duration-150 ${c.enableBtn} cursor-pointer disabled:opacity-60 disabled:cursor-default @max-sm:col-start-2`}
           >
             {enableLabel}
           </button>

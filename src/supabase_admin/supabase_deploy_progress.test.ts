@@ -1,5 +1,4 @@
 import fs from "node:fs/promises";
-import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -15,8 +14,7 @@ import {
   deploySupabaseFunction,
   listSupabaseFunctions,
 } from "@/supabase_admin/supabase_management_client";
-
-const require = createRequire(import.meta.url);
+import { runSupabaseDependencyAnalysis } from "@/ipc/processors/supabase_dependency_analysis";
 
 vi.mock("@/supabase_admin/supabase_management_client", async () => {
   const actual = await vi.importActual<
@@ -31,6 +29,13 @@ vi.mock("@/supabase_admin/supabase_management_client", async () => {
     listSupabaseFunctions: vi.fn(),
   };
 });
+
+vi.mock("@/ipc/processors/supabase_dependency_analysis", () => ({
+  runSupabaseDependencyAnalysis: vi.fn(async () => ({
+    kind: "partial" as const,
+    functionNames: ["alpha"],
+  })),
+}));
 
 async function waitForAssertion(assertion: () => void) {
   const startedAt = Date.now();
@@ -111,6 +116,67 @@ describe("deployAllSupabaseFunctions progress", () => {
     await expect(deployment).resolves.toEqual([]);
 
     expect(progressEvents.at(-1)?.phase).toBe("finished");
+  });
+
+  it("captures the entire batch before upload and keeps shared bytes stable across later edits", async () => {
+    const sharedPath = path.join(appPath, "supabase/functions/_shared");
+    await fs.mkdir(sharedPath, { recursive: true });
+    await fs.writeFile(path.join(sharedPath, "common.ts"), "original shared");
+    for (const name of ["gamma", "delta", "epsilon", "zeta"]) {
+      await fs.mkdir(path.join(appPath, "supabase/functions", name));
+      await fs.writeFile(
+        path.join(appPath, "supabase/functions", name, "index.ts"),
+        "original function",
+      );
+    }
+    await deployAllSupabaseFunctions({
+      appPath,
+      supabaseProjectId: "project-id",
+      supabaseOrganizationSlug: null,
+      skipPruneEdgeFunctions: true,
+      onSnapshotCaptured: async () => {
+        expect(deploySupabaseFunction).not.toHaveBeenCalled();
+        await fs.rm(path.join(appPath, "supabase"), { recursive: true });
+      },
+    });
+    const captured = vi
+      .mocked(deploySupabaseFunction)
+      .mock.calls.map(([args]) => args.snapshot!);
+    expect(captured).toHaveLength(6);
+    const shared = captured[0].files.find(
+      (file) => file.relativePath === "_shared/common.ts",
+    )!;
+    expect(await shared.content.text()).toBe("original shared");
+    for (const snapshot of captured) {
+      expect(
+        snapshot.files.find(
+          (file) => file.relativePath === "_shared/common.ts",
+        ),
+      ).toBe(shared);
+      expect(
+        snapshot.files.some(
+          (file) => file.relativePath === snapshot.entrypointPath,
+        ),
+      ).toBe(true);
+    }
+  });
+
+  it("never activates or prunes a batch cancelled after snapshot capture", async () => {
+    const controller = new AbortController();
+    await expect(
+      deployAllSupabaseFunctions({
+        appPath,
+        supabaseProjectId: "project-id",
+        supabaseOrganizationSlug: null,
+        skipPruneEdgeFunctions: false,
+        signal: controller.signal,
+        onSnapshotCaptured: () => controller.abort(new Error("Stopped")),
+      }),
+    ).rejects.toThrow("Stopped");
+    expect(deploySupabaseFunction).not.toHaveBeenCalled();
+    expect(bulkUpdateFunctions).not.toHaveBeenCalled();
+    expect(listSupabaseFunctions).not.toHaveBeenCalled();
+    expect(deleteSupabaseFunction).not.toHaveBeenCalled();
   });
 
   it("emits failed instead of finished when bulk activation fails", async () => {
@@ -213,6 +279,84 @@ describe("deployAllSupabaseFunctions progress", () => {
       functionName: "old-fn",
       organizationSlug: "org",
     });
+  });
+
+  it("does not prune remote functions when a manual sync has no valid local functions", async () => {
+    let summary: {
+      functionCount: number;
+      prunedFunctionNames: string[];
+    } | null = null;
+    await fs.rm(path.join(appPath, "supabase", "functions", "alpha"), {
+      recursive: true,
+    });
+    await fs.rm(path.join(appPath, "supabase", "functions", "beta"), {
+      recursive: true,
+    });
+    vi.mocked(listSupabaseFunctions).mockResolvedValue([
+      { slug: "old-fn" },
+    ] as any);
+
+    await expect(
+      deployAllSupabaseFunctions({
+        appPath,
+        supabaseProjectId: "project-id",
+        supabaseOrganizationSlug: "org",
+        skipPruneEdgeFunctions: false,
+        onSummary: (nextSummary) => {
+          summary = nextSummary;
+        },
+      }),
+    ).resolves.toEqual([]);
+
+    expect(deploySupabaseFunction).not.toHaveBeenCalled();
+    expect(listSupabaseFunctions).not.toHaveBeenCalled();
+    expect(deleteSupabaseFunction).not.toHaveBeenCalled();
+    expect(summary).toEqual({
+      functionCount: 0,
+      prunedFunctionNames: [],
+    });
+  });
+
+  it("does not prune remote functions when the functions directory is missing", async () => {
+    await fs.rm(path.join(appPath, "supabase", "functions"), {
+      recursive: true,
+    });
+    vi.mocked(listSupabaseFunctions).mockResolvedValue([
+      { slug: "old-fn" },
+    ] as any);
+
+    await expect(
+      deployAllSupabaseFunctions({
+        appPath,
+        supabaseProjectId: "project-id",
+        supabaseOrganizationSlug: null,
+        skipPruneEdgeFunctions: false,
+      }),
+    ).resolves.toEqual([]);
+
+    expect(listSupabaseFunctions).not.toHaveBeenCalled();
+    expect(deleteSupabaseFunction).not.toHaveBeenCalled();
+  });
+
+  it("keeps remote functions when empty manual sync pruning is disabled", async () => {
+    await fs.rm(path.join(appPath, "supabase", "functions"), {
+      recursive: true,
+    });
+    vi.mocked(listSupabaseFunctions).mockResolvedValue([
+      { slug: "old-fn" },
+    ] as any);
+
+    await expect(
+      deployAllSupabaseFunctions({
+        appPath,
+        supabaseProjectId: "project-id",
+        supabaseOrganizationSlug: null,
+        skipPruneEdgeFunctions: true,
+      }),
+    ).resolves.toEqual([]);
+
+    expect(listSupabaseFunctions).not.toHaveBeenCalled();
+    expect(deleteSupabaseFunction).not.toHaveBeenCalled();
   });
 
   it("returns an error when a non-empty requested subset has no valid local functions", async () => {
@@ -322,14 +466,33 @@ describe("deployAllSupabaseFunctions progress", () => {
     );
   });
 
-  it("deploys the union of shared-affected functions and pending functions", async () => {
-    const nodeModulesPath = path.join(appPath, "node_modules");
-    await fs.mkdir(nodeModulesPath, { recursive: true });
-    await fs.symlink(
-      path.dirname(require.resolve("typescript/package.json")),
-      path.join(nodeModulesPath, "typescript"),
-      process.platform === "win32" ? "junction" : "dir",
+  it("falls back to all functions when dependency analysis fails", async () => {
+    vi.mocked(runSupabaseDependencyAnalysis).mockRejectedValueOnce(
+      new Error("worker crashed"),
     );
+
+    await expect(
+      deployAffectedSupabaseFunctions({
+        appPath,
+        supabaseProjectId: "project-id",
+        supabaseOrganizationSlug: null,
+        skipPruneEdgeFunctions: true,
+        sharedModulesChanged: true,
+        changedSharedModulePaths: ["supabase/functions/_shared/foo.ts"],
+        pendingFunctionDeploys: [],
+      }),
+    ).resolves.toEqual([]);
+
+    expect(deploySupabaseFunction).toHaveBeenCalledTimes(2);
+    expect(deploySupabaseFunction).toHaveBeenCalledWith(
+      expect.objectContaining({ functionName: "alpha" }),
+    );
+    expect(deploySupabaseFunction).toHaveBeenCalledWith(
+      expect.objectContaining({ functionName: "beta" }),
+    );
+  });
+
+  it("deploys the union of shared-affected functions and pending functions", async () => {
     await fs.mkdir(path.join(appPath, "supabase", "functions", "_shared"), {
       recursive: true,
     });

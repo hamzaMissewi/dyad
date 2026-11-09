@@ -1,152 +1,161 @@
-import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { useSetAtom, useStore } from "jotai";
-import { ipc } from "@/ipc/types";
-import type { ImageThemeMode } from "@/ipc/types";
-import { queryKeys } from "@/lib/queryKeys";
+import { useCallback, useRef } from "react";
+import { useMachineMutation } from "@/distributed_machines/use_machine_mutation";
+import type { RequestId } from "@/distributed_machines/request_identity";
 import { showError } from "@/lib/toast";
 import {
-  imageGenerationJobsAtom,
-  type ImageGenerationJob,
-} from "@/atoms/imageGenerationAtoms";
-import {
-  showImageGeneratingToast,
-  showImageSuccessToast,
-  dismissImageGenerationToast,
-} from "@/components/ImageGenerationToast";
+  useImageGenerationActor,
+  useImageGenerationRequestActor,
+} from "@/image_generation/hooks";
+import type {
+  ImageGenerationJobView,
+  ImageGenerationOperationOutcome,
+  StartImageGenerationParams,
+} from "@/image_generation/state";
+import type { PreparedRequest } from "@/distributed_machines/prepared_request";
+import type {
+  ImageGenerationAdmission,
+  ImageGenerationAdmissionRefusal,
+} from "@/image_generation/hooks";
 
-interface StartGenerationParams {
-  requestId: string;
-  prompt: string;
-  themeMode: ImageThemeMode;
-  targetAppId: number;
-  targetAppName: string;
-  source?: "chat" | "media-library";
+interface StartMutationInput {
+  readonly params: StartImageGenerationParams;
+  readonly jobId: string;
+  readonly requestId: RequestId;
+  readonly operationId: string;
 }
 
-// Track cancelled job IDs so onError can skip them when the abort error arrives.
-// Each entry is auto-cleaned after CANCEL_CLEANUP_MS to prevent unbounded growth.
-const cancelledJobIds = new Set<string>();
-const CANCEL_CLEANUP_MS = 2 * 60 * 1000; // 2 minutes
+type ImagePreparedRequest = PreparedRequest<
+  ImageGenerationAdmission,
+  ImageGenerationOperationOutcome,
+  ImageGenerationAdmissionRefusal
+>;
 
-function markCancelled(jobId: string) {
-  cancelledJobIds.add(jobId);
-  setTimeout(() => cancelledJobIds.delete(jobId), CANCEL_CLEANUP_MS);
+function classifyOutcome(outcome: ImageGenerationOperationOutcome) {
+  switch (outcome.kind) {
+    case "succeeded":
+      return { kind: "succeeded" as const };
+    case "cancelled":
+    case "disposed":
+      return { kind: "cancelled" as const };
+    case "failed":
+    case "rejected":
+      return { kind: "failed" as const, error: outcome };
+    default: {
+      const exhaustive: never = outcome;
+      return exhaustive;
+    }
+  }
 }
 
 export function useGenerateImage() {
-  const queryClient = useQueryClient();
-  const setJobs = useSetAtom(imageGenerationJobsAtom);
-  const store = useStore();
+  const remote = useImageGenerationActor();
+  const requestActor = useImageGenerationRequestActor();
+  const latestStart = useRef<ImagePreparedRequest | undefined>(undefined);
+  const latestCancellation = useRef<ImagePreparedRequest | undefined>(
+    undefined,
+  );
 
-  const addJob = (job: ImageGenerationJob) => {
-    setJobs((prev) => [...prev, job]);
-  };
-
-  const updateJob = (id: string, patch: Partial<ImageGenerationJob>) => {
-    setJobs((prev) =>
-      prev.map((job) => (job.id === id ? { ...job, ...patch } : job)),
-    );
-  };
-
-  const getPendingCount = () =>
-    store.get(imageGenerationJobsAtom).filter((j) => j.status === "pending")
-      .length;
-
-  return useMutation({
-    mutationFn: (params: StartGenerationParams) => {
-      return ipc.imageGeneration.generateImage({
-        prompt: params.prompt,
-        themeMode: params.themeMode,
-        targetAppId: params.targetAppId,
-        requestId: params.requestId,
-      });
+  const startMutation = useMachineMutation({
+    connection: remote.connection,
+    snapshot: remote.snapshot,
+    request: (input: StartMutationInput, observedRevision) => {
+      const prepared = requestActor.request(
+        {
+          type: "SUBMIT",
+          job: {
+            ...input.params,
+            id: input.jobId,
+            startedAt: Date.now(),
+          },
+          requestId: input.requestId,
+          operationId: input.operationId,
+        },
+        observedRevision,
+      );
+      latestStart.current = prepared;
+      return prepared;
     },
-    onMutate: (params) => {
-      addJob({
-        id: params.requestId,
-        prompt: params.prompt,
-        themeMode: params.themeMode,
-        targetAppId: params.targetAppId,
-        targetAppName: params.targetAppName,
-        status: "pending",
-        startedAt: Date.now(),
-        source: params.source,
-      });
-
-      // Show / update the single generating toast with the new pending count
-      showImageGeneratingToast(getPendingCount());
-
-      return { jobId: params.requestId };
-    },
-    onSuccess: (result, _params, context) => {
-      if (!context) return;
-      // If this job was already cancelled before the response arrived, ignore the success
-      if (cancelledJobIds.has(context.jobId)) {
-        cancelledJobIds.delete(context.jobId);
-        return;
-      }
-      updateJob(context.jobId, {
-        status: "success",
-        result,
-      });
-      queryClient.invalidateQueries({ queryKey: queryKeys.media.all });
-
-      // Show success toast (replaces the shared generating toast).
-      // If there are still pending jobs, the toast's dismiss/close will
-      // restore the generating toast via restoreGeneratingToastIfNeeded.
-      showImageSuccessToast(result);
-    },
-    onError: (error, _params, context) => {
-      if (!context) return;
-      // If this job was cancelled, the abort error is expected — don't show it
-      if (cancelledJobIds.has(context.jobId)) {
-        cancelledJobIds.delete(context.jobId);
-        return;
-      }
-      updateJob(context.jobId, {
-        status: "error",
-        error: error instanceof Error ? error.message : String(error),
-      });
-
-      const remaining = getPendingCount();
-      if (remaining > 0) {
-        // Other jobs still running — update count
-        showImageGeneratingToast(remaining);
-      } else {
-        dismissImageGenerationToast();
-      }
-      showError(error);
-    },
+    classifyOutcome,
   });
-}
 
-export function useCancelImageGeneration() {
-  const setJobs = useSetAtom(imageGenerationJobsAtom);
-  const store = useStore();
+  const cancelMutation = useMachineMutation({
+    connection: remote.connection,
+    snapshot: remote.snapshot,
+    request: (job: ImageGenerationJobView, observedRevision) => {
+      if (!job.activeInvocationRef) {
+        throw new Error("Image generation is no longer cancellable");
+      }
+      const prepared = requestActor.cancel(
+        {
+          type: "CANCEL_REQUESTED",
+          jobId: job.id,
+          activeInvocationRef: job.activeInvocationRef,
+        },
+        job.requestId,
+        observedRevision,
+      );
+      latestCancellation.current = prepared;
+      return prepared;
+    },
+    classifyOutcome,
+  });
 
-  return async (jobId: string) => {
-    markCancelled(jobId);
-    setJobs((prev) =>
-      prev.map((job) =>
-        job.id === jobId ? { ...job, status: "cancelled" as const } : job,
-      ),
-    );
+  const start = useCallback(
+    async (params: StartImageGenerationParams): Promise<string | null> => {
+      const input: StartMutationInput = {
+        jobId: `image-generation-job:${globalThis.crypto.randomUUID()}`,
+        requestId:
+          `image-generation-request:${globalThis.crypto.randomUUID()}` as RequestId,
+        operationId: `image-generation-runtime:${globalThis.crypto.randomUUID()}`,
+        params,
+      };
+      const settlement = startMutation.mutate(input);
+      const prepared = latestStart.current;
+      if (!prepared)
+        throw new Error("Image generation request was not prepared");
+      void settlement.catch(() => undefined);
+      try {
+        const admission = await prepared.admission;
+        if (admission.kind === "admitted") return input.jobId;
+        prepared.detach();
+      } catch {
+        prepared.detach();
+        // The existing failure presentation below covers unexpected admission.
+      }
+      showError(
+        "Image generation is temporarily unavailable. Please try again.",
+      );
+      return null;
+    },
+    [startMutation.mutate],
+  );
 
-    // Update or dismiss the generating toast based on remaining pending jobs
-    const remaining = store
-      .get(imageGenerationJobsAtom)
-      .filter((j) => j.status === "pending").length;
-    if (remaining > 0) {
-      showImageGeneratingToast(remaining);
-    } else {
-      dismissImageGenerationToast();
-    }
-
-    // Signal the backend to abort the request
-    try {
-      await ipc.imageGeneration.cancelImageGeneration({ requestId: jobId });
-    } catch {
-      // Best-effort cancellation
-    }
-  };
+  const cancel = useCallback(
+    (jobId: string) => {
+      const job = remote.state.jobs.find((candidate) => candidate.id === jobId);
+      if (!job?.activeInvocationRef) return;
+      const settlement = cancelMutation.mutate(job);
+      const prepared = latestCancellation.current;
+      void settlement.catch(() => undefined);
+      void (async () => {
+        try {
+          if (!prepared) {
+            throw new Error("Image cancellation request was not prepared");
+          }
+          const admission = await prepared.admission;
+          if (admission.kind !== "admitted") {
+            prepared?.detach();
+            showError("Could not cancel image generation. Please try again.");
+            return;
+          }
+          await settlement;
+        } catch {
+          prepared?.detach();
+          showError("Could not cancel image generation. Please try again.");
+        }
+      })();
+    },
+    [cancelMutation.mutate, remote.state.jobs],
+  );
+  return { start, cancel };
 }

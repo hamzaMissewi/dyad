@@ -1,10 +1,4 @@
-import { useAtomValue, useSetAtom } from "jotai";
-import {
-  clearPackageManagerWarningForAppAtom,
-  currentPackageManagerWarningAtom,
-  dismissPackageManagerWarningsAtom,
-  type PackageManagerWarning,
-} from "@/atoms/previewRuntimeAtoms";
+import type { PackageManagerWarning } from "@/package_manager_warnings/store";
 import { Button } from "@/components/ui/button";
 import {
   Tooltip,
@@ -13,8 +7,8 @@ import {
 } from "@/components/ui/tooltip";
 import { ipc } from "@/ipc/types";
 import { useSettings } from "@/hooks/useSettings";
-import { useRebuildAppAfterPnpmInstall } from "@/hooks/useRunApp";
-import { useQuery } from "@tanstack/react-query";
+import { useRebuildAppAfterPnpmInstall, useRunApp } from "@/hooks/useRunApp";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { queryKeys } from "@/lib/queryKeys";
 import { isVersionAtLeast } from "@/shared/version_utils";
 import {
@@ -26,6 +20,12 @@ import {
   X,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import {
+  usePackageManagerWarning,
+  usePackageManagerWarningStore,
+} from "@/package_manager_warnings/PackageManagerWarningProvider";
+import { useAtomValue } from "jotai";
+import { selectedAppIdAtom } from "@/atoms/appAtoms";
 
 type InstallStatus = "idle" | "installing" | "success" | "error";
 
@@ -40,7 +40,8 @@ function getInstallErrorMessage(error: unknown): string {
 }
 
 export function PackageManagerWarningBanner() {
-  const warning = useAtomValue(currentPackageManagerWarningAtom);
+  const selectedAppId = useAtomValue(selectedAppIdAtom);
+  const warning = usePackageManagerWarning(selectedAppId);
 
   if (!warning) {
     return null;
@@ -61,10 +62,11 @@ function PackageManagerWarningBannerContent({
 }: {
   warning: PackageManagerWarning;
 }) {
-  const clearWarning = useSetAtom(clearPackageManagerWarningForAppAtom);
-  const dismissWarnings = useSetAtom(dismissPackageManagerWarningsAtom);
+  const warningStore = usePackageManagerWarningStore();
   const rebuildAppAfterPnpmInstall = useRebuildAppAfterPnpmInstall();
+  const { loading: appRunLoading, restartApp, stopApp } = useRunApp();
   const { updateSettings } = useSettings();
+  const queryClient = useQueryClient();
   const [installStatus, setInstallStatus] = useState<InstallStatus>("idle");
   const [installErrorMessage, setInstallErrorMessage] = useState<string>();
   const clearTimerRef = useRef<number | undefined>(undefined);
@@ -80,8 +82,14 @@ function PackageManagerWarningBannerContent({
   const suppressFutureWarnings = () =>
     updateSettings({ hidePnpmMinimumReleaseAgeWarning: true });
 
+  const isPnpmMigrationWarning = warning.kind === "pnpm-migration";
+
   const handleOpenDocs = () => {
-    void ipc.system.openExternalUrl("https://pnpm.io/installation");
+    void ipc.system.openExternalUrl(
+      isPnpmMigrationWarning
+        ? "https://dyad.sh/docs/upgrades/pnpm-migration"
+        : "https://pnpm.io/installation",
+    );
   };
 
   const handleDownloadNode = () => {
@@ -101,7 +109,7 @@ function PackageManagerWarningBannerContent({
       await rebuildAppAfterPnpmInstall(warning.appId);
       setInstallStatus("success");
       clearTimerRef.current = window.setTimeout(
-        () => clearWarning(warning.appId),
+        () => warningStore.clear(warning.appId),
         2_000,
       );
     } catch (error) {
@@ -112,10 +120,37 @@ function PackageManagerWarningBannerContent({
     }
   };
 
+  const handleMigratePnpm = async () => {
+    setInstallStatus("installing");
+    setInstallErrorMessage(undefined);
+
+    try {
+      await stopApp(warning.appId);
+      await ipc.upgrade.executeAppUpgrade({
+        appId: warning.appId,
+        upgradeId: "pnpm-version-migration",
+      });
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: queryKeys.appUpgrades.byApp({ appId: warning.appId }),
+        }),
+        queryClient.invalidateQueries({
+          queryKey: queryKeys.versions.list({ appId: warning.appId }),
+        }),
+      ]);
+      setInstallStatus("success");
+      await restartApp();
+    } catch (error) {
+      setInstallStatus("error");
+      setInstallErrorMessage(getInstallErrorMessage(error));
+    }
+  };
+
   const isInstalling = installStatus === "installing";
   const isSuccess = installStatus === "success";
   const isError = installStatus === "error";
   const needsNodeUpgrade =
+    !isPnpmMigrationWarning &&
     nodeSystemInfo !== undefined &&
     (!nodeSystemInfo.nodeVersion ||
       !isVersionAtLeast(
@@ -123,13 +158,14 @@ function PackageManagerWarningBannerContent({
         PNPM_11_MINIMUM_NODE_VERSION,
       ));
   const displayMessage = isSuccess
-    ? "pnpm installed. Rebuilding preview..."
+    ? isPnpmMigrationWarning
+      ? "pnpm migration applied. Restarting preview..."
+      : "pnpm installed. Rebuilding preview..."
     : isError
       ? `${installErrorMessage}.`
       : needsNodeUpgrade
         ? `pnpm v11 requires Node.js ${PNPM_11_MINIMUM_NODE_VERSION} or newer. Download and install the latest Node.js first.`
         : warning.message;
-
   return (
     <div
       className="flex min-h-10 items-center gap-3 border-b border-amber-200/80 bg-amber-50/80 px-3 py-2 text-sm text-amber-950 dark:border-amber-500/20 dark:bg-amber-500/10 dark:text-amber-100"
@@ -145,11 +181,26 @@ function PackageManagerWarningBannerContent({
           }
         />
         <TooltipContent side="bottom" align="start" className="max-w-md">
-          Install the latest pnpm for better security and less disk space
+          {displayMessage}
         </TooltipContent>
       </Tooltip>
       <div className="flex shrink-0 items-center gap-1.5">
-        {isError ? (
+        {isPnpmMigrationWarning ? (
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={handleMigratePnpm}
+            disabled={isInstalling || isSuccess || appRunLoading}
+            data-testid="package-manager-warning-run-upgrade"
+          >
+            {isInstalling ? (
+              <Loader2 className="size-3.5 animate-spin" />
+            ) : (
+              <PackageCheck className="size-3.5" />
+            )}
+            {isInstalling ? "Migrating" : "Migrate"}
+          </Button>
+        ) : isError ? (
           <Button size="sm" variant="ghost" onClick={handleOpenDocs}>
             <ExternalLink className="size-3.5" />
             Docs
@@ -183,7 +234,7 @@ function PackageManagerWarningBannerContent({
           size="icon"
           variant="ghost"
           className="size-7"
-          onClick={dismissWarnings}
+          onClick={() => warningStore.dismiss(warning.appId)}
           aria-label="Dismiss pnpm warning"
         >
           <X className="size-3.5" />

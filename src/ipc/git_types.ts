@@ -14,6 +14,12 @@ export interface GitBaseParams {
 export interface GitCommitParams extends GitBaseParams {
   message: string;
   amend?: boolean;
+  /**
+   * Paths (relative to the repo root) to commit. When set, git makes a partial
+   * commit: it records the working-tree state of exactly these paths and leaves
+   * everything else staged in the index. Omit to commit the whole index.
+   */
+  paths?: string[];
 }
 export interface GitFileParams extends GitBaseParams {
   filepath: string;
@@ -29,15 +35,31 @@ export interface GitBranchRenameParams extends GitBaseParams {
   oldBranch: string;
   newBranch: string;
 }
+/**
+ * Credentials for git network operations, bound to the host they are for.
+ *
+ * Git receives them as an `http.<hostUrl>/.extraheader` config entry for the
+ * duration of one command, so they never reach `.git/config`. The basic-auth
+ * pair differs per provider: GitHub takes the token as the user name, GitLab
+ * takes it as the password of a fixed user.
+ */
+export interface GitRemoteAuth {
+  /** Origin, plus an optional path prefix, that the header applies to. */
+  hostUrl: string;
+  username: string;
+  password: string;
+}
+
 export interface GitCloneParams {
   path: string; // destination
   url: string;
   depth?: number | null;
   singleBranch?: boolean;
-  accessToken?: string;
+  auth?: GitRemoteAuth;
 }
 export interface GitLogParams extends GitBaseParams {
   depth?: number;
+  ref?: string;
 }
 
 export interface GitResult {
@@ -46,7 +68,7 @@ export interface GitResult {
 }
 export interface GitPushParams extends GitBaseParams {
   branch: string;
-  accessToken: string;
+  auth: GitRemoteAuth;
   force?: boolean;
   forceWithLease?: boolean;
 }
@@ -65,11 +87,22 @@ export interface GitListChangedFilesParams extends GitBaseParams {
 export interface GitSetRemoteUrlParams extends GitBaseParams {
   remoteUrl: string;
 }
+/**
+ * What `origin`'s fetch refspec looked like when the remote URL was set:
+ * the standard one, some other one left as the user configured it, none
+ * (so the standard one was added), or unreadable / not repairable.
+ */
+export type FetchRefspecState = "standard" | "custom" | "added" | "unknown";
 export interface GitInitParams extends GitBaseParams {
   ref?: string; // branch name, default = "main"
 }
 export interface GitStageToRevertParams extends GitBaseParams {
   targetOid: string;
+  onBeforeReset?: (progress: {
+    preRestoreHead: string;
+    targetHead: string;
+    nextStep: "hard-reset" | "soft-reset";
+  }) => void;
 }
 export interface GitAuthorParam {
   name: string;
@@ -80,13 +113,15 @@ export interface GitAuthorParam {
 
 export interface GitFetchParams extends GitBaseParams {
   remote?: string;
-  accessToken?: string;
+  auth?: GitRemoteAuth;
+  /** Drop remote-tracking refs for branches that no longer exist on the remote. */
+  prune?: boolean;
 }
 
 export interface GitPullParams extends GitBaseParams {
   remote?: string;
   branch?: string;
-  accessToken?: string;
+  auth?: GitRemoteAuth;
   author?: GitAuthorParam;
   rebase?: boolean;
 }
@@ -103,4 +138,22 @@ export interface GitCreateBranchParams extends GitBaseParams {
 
 export interface GitDeleteBranchParams extends GitBaseParams {
   branch: string;
+}
+
+export type AgentGitDiffScope = "unstaged" | "staged" | "all";
+
+export interface AgentGitStatus {
+  branch: string | null;
+  head: string | null;
+  detached: boolean;
+  staged: string[];
+  unstaged: string[];
+  untracked: string[];
+  conflicted: string[];
+  truncated: boolean;
+}
+
+export interface AgentGitTextResult {
+  content: string;
+  truncated: boolean;
 }

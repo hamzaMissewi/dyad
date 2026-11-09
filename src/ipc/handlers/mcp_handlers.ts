@@ -1,18 +1,27 @@
 import log from "electron-log";
+import { getRemoteMcpCatalog } from "@/ipc/shared/remote_mcp_catalog";
+import { isRequiredInput, userSuppliedInputs } from "@/ipc/types/mcp_catalog";
 import { db } from "../../db";
 import { mcpServers, mcpToolConsents } from "../../db/schema";
-import { eq, and } from "drizzle-orm";
+import { eq, and, isNotNull } from "drizzle-orm";
 import { createTypedHandler } from "./base";
 import { DyadError, DyadErrorKind } from "../../errors/dyad_error";
 
-import { resolveConsent } from "../utils/mcp_consent";
 import { getStoredConsent } from "../utils/mcp_consent";
 import { mcpManager } from "../utils/mcp_manager";
-import { disconnectOAuth, runOAuthFlow } from "../utils/mcp_oauth_flow";
+import { safeGithubOpsErrorMessage } from "../services/github_ops_safe_error";
 import {
+  disconnectOAuth,
+  runOAuthFlow,
+  withMcpOAuthServerMutation,
+} from "../utils/mcp_oauth_flow";
+import { getOAuthStateStatus } from "../utils/mcp_oauth_provider";
+import { syncVendoredOAuthClient } from "../utils/vendored_oauth_client";
+import {
+  encryptSecretMap,
   encryptToString,
-  oauthStateHasTokens,
-} from "../utils/mcp_oauth_provider";
+  readServerSecretMap,
+} from "../utils/secret_storage";
 import {
   mcpContracts,
   DEFAULT_OAUTH_CALLBACK_PORT,
@@ -21,6 +30,7 @@ import {
   type McpConsentValue,
 } from "../types/mcp";
 import { findAvailablePort } from "../utils/port_utils";
+import { readSettings, tryWriteSettings } from "../../main/settings";
 import net from "node:net";
 import { safeStorage } from "electron";
 import {
@@ -29,6 +39,28 @@ import {
 } from "./mcp_error_classifiers";
 
 const logger = log.scope("mcp_handlers");
+
+// Adding a plugin by hand is a clear signal the user wants it, so a stored
+// "don't suggest again" for it no longer applies. The chat card never
+// reaches this for such a plugin, because opted-out plugins are not offered.
+// Best-effort: the add has already succeeded by the time this runs, so a
+// settings problem here must not turn it into a failure.
+function clearNeverSuggestPlugin(slug: string) {
+  try {
+    const slugs = readSettings().neverSuggestPluginSlugs;
+    if (!slugs?.includes(slug)) return;
+    tryWriteSettings(
+      {
+        neverSuggestPluginSlugs: slugs.filter(
+          (candidate) => candidate !== slug,
+        ),
+      },
+      "clearing a plugin's never-suggest choice",
+    );
+  } catch (error) {
+    logger.warn("Failed to clear a plugin's never-suggest choice", error);
+  }
+}
 
 // EADDRINUSE on either stack disqualifies the port; a stack that's
 // unavailable system-wide (e.g. IPv6 disabled) is OK if the other is
@@ -51,6 +83,16 @@ async function isPortFreeOnBothLoopbacks(port: number): Promise<boolean> {
   return v4 === "free" || v6 === "free";
 }
 
+function envsEqual(
+  a: Record<string, string>,
+  b: Record<string, string>,
+): boolean {
+  const keys = Object.keys(a);
+  return (
+    keys.length === Object.keys(b).length && keys.every((k) => a[k] === b[k])
+  );
+}
+
 // Parse a JSON string from the renderer and surface a clear error
 // instead of letting the main process see a raw SyntaxError. Returns
 // `null` if the input is falsy.
@@ -70,25 +112,57 @@ function parseJsonField<T>(
   }
 }
 
+// Parse a secret map that arrived as a JSON string. The schema allows
+// a raw string for these fields, so the values have to be checked
+// here: a map holding anything but strings encrypts fine and then
+// fails to read back, leaving the secret stuck as unreadable.
+function parseSecretMapField(
+  value: Record<string, string> | string | null | undefined,
+  field: string,
+): Record<string, string> | null {
+  const parsed =
+    typeof value === "string"
+      ? parseJsonField<unknown>(value, field)
+      : (value ?? null);
+  if (parsed === null) return null;
+  if (
+    typeof parsed !== "object" ||
+    Array.isArray(parsed) ||
+    !Object.values(parsed).every((v) => typeof v === "string")
+  ) {
+    throw new DyadError(
+      `"${field}" must be an object of string values.`,
+      DyadErrorKind.Validation,
+    );
+  }
+  return parsed as Record<string, string>;
+}
+
 // Convert a DB row into the shape sent to the UI. Drops the encrypted
 // `oauthState` / `oauthClientSecret`; sends `oauthConnected` instead.
 function toMcpServer(dbServer: typeof mcpServers.$inferSelect): McpServer {
+  const env = readServerSecretMap(dbServer.envEncrypted, dbServer.envJson);
+  const headers = readServerSecretMap(
+    dbServer.headersEncrypted,
+    dbServer.headersJson,
+  );
   return {
     id: dbServer.id,
     name: dbServer.name,
     transport: dbServer.transport as McpTransport,
     command: dbServer.command,
     args: dbServer.args,
-    envJson: dbServer.envJson,
-    headersJson: dbServer.headersJson,
+    envJson: env.status === "ok" ? env.value : null,
+    headersJson: headers.status === "ok" ? headers.value : null,
+    envUnreadable: env.status === "unreadable",
+    headersUnreadable: headers.status === "unreadable",
     url: dbServer.url,
     enabled: dbServer.enabled,
     oauthEnabled: dbServer.oauthEnabled,
-    // `oauthState` being set isn't enough -- it can hold just a
-    // registered client ID before any tokens exist.
-    // `oauthStateHasTokens` checks for a real access token.
-    oauthConnected: oauthStateHasTokens(dbServer.oauthState),
+    ...getOAuthStateStatus(dbServer.oauthState),
     oauthCallbackPort: dbServer.oauthCallbackPort,
+    oauthClientId: dbServer.oauthClientId,
+    catalogSlug: dbServer.catalogSlug,
     createdAt: dbServer.createdAt,
     updatedAt: dbServer.updatedAt,
   };
@@ -100,6 +174,148 @@ export function registerMcpHandlers() {
     const servers = await db.select().from(mcpServers);
     return servers.map(toMcpServer);
   });
+
+  createTypedHandler(mcpContracts.listCatalog, async () => {
+    // The catalog fetch and the added-slugs read are independent.
+    const [entries, rows] = await Promise.all([
+      getRemoteMcpCatalog(),
+      db
+        .select({ catalogSlug: mcpServers.catalogSlug })
+        .from(mcpServers)
+        .where(isNotNull(mcpServers.catalogSlug)),
+    ]);
+    const addedSlugs = rows
+      .map((r) => r.catalogSlug)
+      .filter((slug): slug is string => slug !== null);
+    return { entries, addedSlugs };
+  });
+
+  createTypedHandler(
+    mcpContracts.addFromCatalog,
+    async (_, { slug, expectedStdioConfig }) => {
+      const entries = await getRemoteMcpCatalog();
+      // The user reached this from a populated catalog, so an empty list
+      // here means the fetch failed rather than the slug being unknown.
+      // Surface that as a connectivity problem instead of a not-found.
+      if (entries.length === 0) {
+        throw new DyadError(
+          "Could not reach the plugin catalog. Please check your connection and try again.",
+          DyadErrorKind.Precondition,
+        );
+      }
+      const entry = entries.find((e) => e.slug === slug);
+      if (!entry) {
+        throw new DyadError(
+          `Unknown catalog entry: ${slug}`,
+          DyadErrorKind.NotFound,
+        );
+      }
+
+      // Adding the same entry twice returns the existing server. The
+      // unique index on catalog_slug makes this safe against concurrent
+      // adds: onConflictDoNothing skips the duplicate insert, and we read
+      // the winning row back.
+      const existing = await db
+        .select()
+        .from(mcpServers)
+        .where(eq(mcpServers.catalogSlug, slug));
+      if (existing.length > 0) {
+        clearNeverSuggestPlugin(slug);
+        // A row added before the entry had a vendored client, or before
+        // the client changed, still needs it.
+        if (await syncVendoredOAuthClient(existing[0].id)) {
+          void mcpManager.dispose(existing[0].id).catch(() => {});
+        }
+        const [refreshed] = await db
+          .select()
+          .from(mcpServers)
+          .where(eq(mcpServers.id, existing[0].id));
+        return toMcpServer(refreshed ?? existing[0]);
+      }
+
+      // A stdio add must run exactly the command the consent prompt showed.
+      // Abort if the fetched entry wasn't reviewed, no longer matches, or
+      // the slug changed transport since the prompt.
+      const stdioMatchesReview =
+        entry.transport === "stdio" &&
+        expectedStdioConfig != null &&
+        entry.command === expectedStdioConfig.command &&
+        entry.args.length === expectedStdioConfig.args.length &&
+        entry.args.every((arg, i) => arg === expectedStdioConfig.args[i]) &&
+        envsEqual(entry.env ?? {}, expectedStdioConfig.env ?? {});
+      const transportMismatch =
+        (entry.transport === "stdio") !== (expectedStdioConfig != null);
+      if (
+        (entry.transport === "stdio" && !stdioMatchesReview) ||
+        transportMismatch
+      ) {
+        throw new DyadError(
+          "The plugin catalog changed since you reviewed this plugin. Please try adding it again.",
+          DyadErrorKind.Precondition,
+        );
+      }
+
+      // An entry that declares required inputs needs the user to fill
+      // them on the setup page first, so it's added disabled and doesn't
+      // connect or spawn until configured. Optional-only inputs don't
+      // hold it back; they can be set later from the server's editor.
+      const needsSetup = userSuppliedInputs(entry.inputs).some(isRequiredInput);
+      // Only kept for an entry that uses OAuth, matching the sync, which
+      // leaves OAuth-disabled servers alone.
+      const vendoredClient =
+        entry.transport === "http" && entry.oauth
+          ? entry.inputs?.find((input) => input.kind === "vendoredOAuthClient")
+          : undefined;
+      const values =
+        entry.transport === "stdio"
+          ? {
+              name: entry.name,
+              transport: "stdio" as const,
+              command: entry.command,
+              args: entry.args,
+              envJson: null,
+              envEncrypted: encryptSecretMap(entry.env),
+              enabled: !needsSetup,
+              catalogSlug: entry.slug,
+            }
+          : {
+              name: entry.name,
+              transport: "http" as const,
+              url: entry.url,
+              headersJson: null,
+              headersEncrypted: encryptSecretMap(entry.headers),
+              enabled: !needsSetup,
+              oauthEnabled: entry.oauth != null,
+              oauthScope: entry.oauth?.scope ?? null,
+              oauthClientId: vendoredClient?.clientId ?? null,
+              oauthClientSecret: vendoredClient?.clientSecret
+                ? encryptToString(vendoredClient.clientSecret)
+                : null,
+              catalogSlug: entry.slug,
+            };
+      const [created] = await db
+        .insert(mcpServers)
+        .values(values)
+        .onConflictDoNothing({ target: mcpServers.catalogSlug })
+        .returning();
+      if (!created) {
+        const [row] = await db
+          .select()
+          .from(mcpServers)
+          .where(eq(mcpServers.catalogSlug, slug));
+        if (!row) {
+          throw new DyadError(
+            `Unknown catalog entry: ${slug}`,
+            DyadErrorKind.NotFound,
+          );
+        }
+        clearNeverSuggestPlugin(slug);
+        return toMcpServer(row);
+      }
+      clearNeverSuggestPlugin(slug);
+      return toMcpServer(created);
+    },
+  );
 
   createTypedHandler(mcpContracts.createServer, async (_, params) => {
     const {
@@ -122,16 +338,8 @@ export function registerMcpHandlers() {
       typeof args === "string"
         ? parseJsonField<string[]>(args, "args")
         : (args ?? null);
-    // Handle envJson: can be string (JSON), object, or null/undefined
-    const parsedEnvJson =
-      typeof envJson === "string"
-        ? parseJsonField<Record<string, string>>(envJson, "envJson")
-        : (envJson ?? null);
-    // Handle headersJson: can be string (JSON), object, or null/undefined
-    const parsedHeadersJson =
-      typeof headersJson === "string"
-        ? parseJsonField<Record<string, string>>(headersJson, "headersJson")
-        : (headersJson ?? null);
+    const parsedEnvJson = parseSecretMapField(envJson, "envJson");
+    const parsedHeadersJson = parseSecretMapField(headersJson, "headersJson");
     const result = await db
       .insert(mcpServers)
       .values({
@@ -139,8 +347,12 @@ export function registerMcpHandlers() {
         transport,
         command: command || null,
         args: parsedArgs,
-        envJson: parsedEnvJson,
-        headersJson: parsedHeadersJson,
+        // Secrets are written to the encrypted columns only. The
+        // plaintext columns stay NULL so nothing new lands there.
+        envJson: null,
+        envEncrypted: encryptSecretMap(parsedEnvJson),
+        headersJson: null,
+        headersEncrypted: encryptSecretMap(parsedHeadersJson),
         url: url || null,
         enabled: !!enabled,
         // OAuth only applies to HTTP transport.
@@ -169,19 +381,21 @@ export function registerMcpHandlers() {
     if (params.command !== undefined) update.command = params.command;
     if (params.args !== undefined)
       update.args = parseJsonField<string[]>(params.args, "args");
-    if (params.envJson !== undefined)
-      update.envJson =
-        typeof params.envJson === "string"
-          ? parseJsonField<Record<string, string>>(params.envJson, "envJson")
-          : (params.envJson ?? null);
-    if (params.headersJson !== undefined)
-      update.headersJson =
-        typeof params.headersJson === "string"
-          ? parseJsonField<Record<string, string>>(
-              params.headersJson,
-              "headersJson",
-            )
-          : (params.headersJson ?? null);
+    // Editing a secret clears the plaintext column rather than
+    // updating it, so the row can never hold a superseded value that
+    // a build reading the plaintext column would still use.
+    if (params.envJson !== undefined) {
+      update.envEncrypted = encryptSecretMap(
+        parseSecretMapField(params.envJson, "envJson"),
+      );
+      update.envJson = null;
+    }
+    if (params.headersJson !== undefined) {
+      update.headersEncrypted = encryptSecretMap(
+        parseSecretMapField(params.headersJson, "headersJson"),
+      );
+      update.headersJson = null;
+    }
     if (params.url !== undefined) update.url = params.url;
     if (params.enabled !== undefined) update.enabled = !!params.enabled;
     if (params.oauthEnabled !== undefined) {
@@ -198,31 +412,67 @@ export function registerMcpHandlers() {
         update.oauthCallbackPort = null;
       }
     }
+    // New client credentials must take effect: clear any persisted
+    // client-registration blob so the provider re-seeds from these
+    // columns instead of a stale registered client shadowing them.
+    if (
+      params.oauthClientId !== undefined ||
+      params.oauthClientSecret !== undefined
+    ) {
+      update.oauthState = null;
+    }
+    if (params.oauthClientId !== undefined)
+      update.oauthClientId = params.oauthClientId;
+    if (params.oauthClientSecret !== undefined)
+      update.oauthClientSecret = params.oauthClientSecret
+        ? encryptToString(params.oauthClientSecret)
+        : null;
+    if (params.oauthScope !== undefined) update.oauthScope = params.oauthScope;
 
-    const result = await db
-      .update(mcpServers)
-      .set(update)
-      .where(eq(mcpServers.id, params.id))
-      .returning();
-    if (!result[0])
-      throw new DyadError(
-        `MCP server not found: ${params.id}`,
-        DyadErrorKind.NotFound,
-      );
-    // Config may have changed; dispose the cached client so the next
-    // use rebuilds the transport with the updated row.
-    try {
-      mcpManager.dispose(params.id);
-    } catch {}
-    return toMcpServer(result[0]);
+    const mutate = async () => {
+      const result = await db
+        .update(mcpServers)
+        .set(update)
+        .where(eq(mcpServers.id, params.id))
+        .returning();
+      if (!result[0])
+        throw new DyadError(
+          `MCP server not found: ${params.id}`,
+          DyadErrorKind.NotFound,
+        );
+      // Config may have changed; dispose the cached client so the next
+      // use rebuilds the transport with the updated row. Fire-and-forget: a
+      // hung transport's close must not block the handler.
+      void mcpManager.dispose(params.id).catch(() => {});
+      return toMcpServer(result[0]);
+    };
+    const oauthRelevant =
+      params.enabled === false ||
+      params.transport !== undefined ||
+      params.url !== undefined ||
+      params.oauthEnabled !== undefined ||
+      params.oauthClientId !== undefined ||
+      params.oauthClientSecret !== undefined ||
+      params.oauthScope !== undefined;
+    return oauthRelevant
+      ? await withMcpOAuthServerMutation(
+          params.id,
+          "OAuth flow cancelled because its server configuration changed.",
+          mutate,
+        )
+      : await mutate();
   });
 
   createTypedHandler(mcpContracts.deleteServer, async (_, id) => {
-    try {
-      mcpManager.dispose(id);
-    } catch {}
-    await db.delete(mcpServers).where(eq(mcpServers.id, id));
-    return { success: true };
+    return await withMcpOAuthServerMutation(
+      id,
+      "OAuth flow cancelled because its server was deleted.",
+      async () => {
+        void mcpManager.dispose(id).catch(() => {});
+        await db.delete(mcpServers).where(eq(mcpServers.id, id));
+        return { success: true };
+      },
+    );
   });
 
   // Tools listing (dynamic)
@@ -230,12 +480,10 @@ export function registerMcpHandlers() {
     // Caps a hung server (often unconnected OAuth) so it doesn't
     // freeze the whole tools list.
     const LIST_TOOLS_TIMEOUT_MS = 8_000;
-    // Cleared after the race so a late reject stays unobserved.
-    let timeoutId: NodeJS.Timeout | undefined;
-    // Swallow a late `mainOp` reject after the timeout wins.
-    const mainOp = (async () => {
-      const client = await mcpManager.getClient(serverId);
-      const remoteTools = await client.tools();
+    try {
+      const remoteTools = await mcpManager.listToolsWithin(serverId, {
+        timeoutMs: LIST_TOOLS_TIMEOUT_MS,
+      });
       const tools = await Promise.all(
         Object.entries(remoteTools).map(async ([name, mcpTool]) => ({
           name,
@@ -246,32 +494,11 @@ export function registerMcpHandlers() {
         })),
       );
       return { tools, status: "ok" as const };
-    })();
-    mainOp.catch(() => undefined);
-    const timeoutPromise = new Promise<never>((_, reject) => {
-      timeoutId = setTimeout(
-        () =>
-          reject(
-            new Error(
-              `Timed out after ${LIST_TOOLS_TIMEOUT_MS / 1000}s waiting for tools from server ${serverId}.`,
-            ),
-          ),
-        LIST_TOOLS_TIMEOUT_MS,
-      );
-    });
-    // Same guard for a late timeout reject after the race resolves.
-    timeoutPromise.catch(() => undefined);
-    try {
-      const result = await Promise.race([mainOp, timeoutPromise]);
-      clearTimeout(timeoutId);
-      return result;
     } catch (e) {
-      clearTimeout(timeoutId);
       // Tear down the cached client so a hung transport doesn't leak
-      // an FD on every subsequent poll.
-      try {
-        mcpManager.dispose(serverId);
-      } catch {}
+      // an FD on every subsequent poll. Fire-and-forget: awaiting a hung
+      // transport's close would hang this handler.
+      void mcpManager.dispose(serverId).catch(() => {});
       const message =
         e instanceof Error ? `${e.name}: ${e.message}` : String(e);
       logger.error(`Failed to list tools for server ${serverId}: ${message}`);
@@ -280,7 +507,14 @@ export function registerMcpHandlers() {
       const status: "unauthorized" | "error" = looksLikeUnauthorized(message)
         ? "unauthorized"
         : "error";
-      return { tools: [], status };
+      // Transport errors may include response bodies, credentials, and local
+      // paths. Reuse the diagnostic redactor before crossing IPC. This denylist
+      // preserves unknown actionable errors; it is not a telemetry allowlist.
+      const errorMessage = safeGithubOpsErrorMessage(
+        e,
+        "Could not discover tools. Check the server configuration and logs.",
+      ).slice(0, 2_000);
+      return { tools: [], status, errorMessage };
     }
   });
 
@@ -334,19 +568,17 @@ export function registerMcpHandlers() {
     }
   });
 
-  // Tool consent request/response handshake
-  // Receive consent response from renderer
-  createTypedHandler(mcpContracts.respondToConsent, async (_, data) => {
-    resolveConsent(data.requestId, data.decision);
-  });
-
   // OAuth: kick off the full flow against the named MCP server. The
   // main-process loopback listener captures the redirect, the
   // `@ai-sdk/mcp` `auth()` function drives PKCE + token exchange, and
   // tokens land in the encrypted `oauth_state` column.
   createTypedHandler(mcpContracts.startOAuth, async (_, params) => {
+    if (await syncVendoredOAuthClient(params.serverId)) {
+      await mcpManager.dispose(params.serverId).catch(() => {});
+    }
     const result = await runOAuthFlow({
       serverId: params.serverId,
+      rendererMessageId: params.rendererMessageId,
       callbackPort: params.callbackPort,
     });
     if (result.success) {
@@ -392,9 +624,7 @@ export function registerMcpHandlers() {
       await client.tools();
       return { status: "ok" as const, error: null };
     } catch (err) {
-      try {
-        mcpManager.dispose(serverId);
-      } catch {}
+      void mcpManager.dispose(serverId).catch(() => {});
       const message = err instanceof Error ? err.message : String(err);
       if (looksLikeUnauthorized(message)) {
         return { status: "unauthorized" as const, error: message };

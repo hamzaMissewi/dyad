@@ -1,6 +1,5 @@
 import { IpcMainInvokeEvent } from "electron";
 import { DyadError, DyadErrorKind } from "@/errors/dyad_error";
-import { readSettings } from "../../main/settings";
 import {
   gitMergeAbort,
   gitFetch,
@@ -19,29 +18,57 @@ import {
   isGitRebaseInProgress,
   getGitUncommittedFilesWithStatus,
   gitDiscardAllChanges,
+  getFileAtCommit,
+  isMissingRemoteBranchError,
 } from "../utils/git_utils";
 import { gitService } from "../services/git_service";
 import { getDyadAppPath } from "../../paths/paths";
+import { safeJoin } from "../utils/path_utils";
+import { promises as fsPromises } from "node:fs";
 import { db } from "../../db";
 import { apps } from "../../db/schema";
 import { eq } from "drizzle-orm";
 import log from "electron-log";
-import { withLock } from "../utils/lock_utils";
-import { updateAppGithubRepo, ensureCleanWorkspace } from "./github_handlers";
+import {
+  appOperationCoordinator,
+  readAppResource,
+} from "../services/app_operation_coordinator";
+import { ensureCleanWorkspace } from "./github_handlers";
+import {
+  getAppGitRemoteAuth,
+  requireAppGitRemote,
+  resolveAppGitRemote,
+  type AppGitRemoteColumns,
+} from "../utils/app_git_remote";
+import { findAppOrThrow } from "../utils/find_app";
 import { createTypedHandler } from "./base";
-import { githubContracts, gitContracts } from "../types/github";
+import { githubContracts, gitContracts, gitEvents } from "../types/github";
 import { ensureDyadGitignored } from "./gitignoreUtils";
+import { safeSend } from "../utils/safe_sender";
 import type {
+  CancelCommitParams,
+  CommitChangesParams,
   GitBranchAppIdParams,
   CreateGitBranchParams,
   GitBranchParams,
   RenameGitBranchParams,
   UncommittedFile,
+  GetUncommittedFileDiffParams,
+  UncommittedFileDiff,
 } from "../types/github";
 
 const logger = log.scope("git_branch_handlers");
 
-async function handleAbortMerge(
+interface ActiveCommitOperation {
+  appId: number;
+  controller: AbortController;
+  cancellable: boolean;
+  senderId: number;
+}
+
+const activeCommitOperations = new Map<string, ActiveCommitOperation>();
+
+export async function handleAbortMerge(
   event: IpcMainInvokeEvent,
   { appId }: GitBranchAppIdParams,
 ): Promise<void> {
@@ -53,33 +80,24 @@ async function handleAbortMerge(
 }
 
 // --- GitHub Fetch Handler ---
-async function handleFetchFromGithub(
+export async function handleFetchFromGithub(
   event: IpcMainInvokeEvent,
   { appId }: GitBranchAppIdParams,
 ): Promise<void> {
-  const settings = readSettings();
-  const accessToken = settings.githubAccessToken?.value;
-  if (!accessToken) {
-    throw new DyadError("Not authenticated with GitHub.", DyadErrorKind.Auth);
-  }
-  const app = await db.query.apps.findFirst({ where: eq(apps.id, appId) });
-  if (!app || !app.githubOrg || !app.githubRepo) {
-    throw new DyadError(
-      "App is not linked to a GitHub repo.",
-      DyadErrorKind.Precondition,
-    );
-  }
+  const app = await findAppOrThrow(appId);
+  const auth = getAppGitRemoteAuth(requireAppGitRemote(app));
   const appPath = getDyadAppPath(app.path);
 
   await gitFetch({
     path: appPath,
     remote: "origin",
-    accessToken,
+    auth,
+    prune: true,
   });
 }
 
 // --- GitHub Branch Handlers ---
-async function handleCreateBranch(
+export async function handleCreateBranch(
   event: IpcMainInvokeEvent,
   { appId, branch, from }: CreateGitBranchParams,
 ): Promise<void> {
@@ -175,7 +193,42 @@ export async function handleDeleteBranch(
   }
 }
 
-async function handleSwitchBranch(
+/**
+ * Records the branch an app is now on, in the column its provider reads.
+ *
+ * Switching and renaming used to go through `updateAppGithubRepo`, which
+ * writes the GitHub columns and only those. A GitLab-linked app therefore
+ * kept the branch it was linked on while its `github_branch` moved, and
+ * `resolveAppGitRemote` — which reads `gitlabBranch` for a GitLab app — kept
+ * handing the old branch to push and pull. The result was a sync that
+ * reported success having pushed a branch the user had moved off.
+ *
+ * Only the branch is written. The old call also re-wrote the org and repo,
+ * which was a no-op for a GitHub app and wrote an empty string into
+ * `github_repo` for every other one.
+ */
+async function updateAppLinkedBranch({
+  app,
+  branch,
+}: {
+  app: { id: number } & AppGitRemoteColumns;
+  branch: string;
+}): Promise<void> {
+  const remote = resolveAppGitRemote(app);
+  await db
+    .update(apps)
+    .set(
+      // An app linked to nothing keeps writing github_branch, as it always
+      // has: nothing reads it until the app is linked, and linking writes
+      // the branch itself.
+      remote?.provider === "gitlab"
+        ? { gitlabBranch: branch }
+        : { githubBranch: branch },
+    )
+    .where(eq(apps.id, app.id));
+}
+
+export async function handleSwitchBranch(
   event: IpcMainInvokeEvent,
   { appId, branch }: GitBranchParams,
 ): Promise<void> {
@@ -199,43 +252,17 @@ async function handleSwitchBranch(
     );
   }
 
-  // Check for uncommitted changes
-  await withLock(appId, async () => {
-    await ensureCleanWorkspace(appPath, `switching to branch '${branch}'`);
+  await ensureCleanWorkspace(appPath, `switching to branch '${branch}'`);
+  await gitCheckout({
+    path: appPath,
+    ref: branch,
   });
-  try {
-    await gitCheckout({
-      path: appPath,
-      ref: branch,
-    });
-  } catch (checkoutError: any) {
-    const errorMessage = checkoutError?.message || "Failed to switch branch.";
-    // Check if error is about uncommitted changes (fallback in case check above missed it)
-    const lowerMessage = errorMessage.toLowerCase();
-    if (
-      lowerMessage.includes("local changes") ||
-      lowerMessage.includes("would be overwritten") ||
-      lowerMessage.includes("please commit or stash")
-    ) {
-      throw new DyadError(
-        `Failed to switch branch: uncommitted changes detected. ` +
-          "Please commit or stash your changes manually and try again.",
-        DyadErrorKind.Conflict,
-      );
-    }
-    throw checkoutError;
-  }
 
   // Update DB with new branch
-  await updateAppGithubRepo({
-    appId,
-    org: app.githubOrg || undefined,
-    repo: app.githubRepo || "",
-    branch,
-  });
+  await updateAppLinkedBranch({ app, branch });
 }
 
-async function handleRenameBranch(
+export async function handleRenameBranch(
   event: IpcMainInvokeEvent,
   { appId, oldBranch, newBranch }: RenameGitBranchParams,
 ): Promise<void> {
@@ -256,24 +283,11 @@ async function handleRenameBranch(
   // Only update DB if we were on oldBranch before renaming
   // (git branch -m renames the current branch if we're on it, so HEAD now points to newBranch)
   if (isRenamingCurrentBranch) {
-    await updateAppGithubRepo({
-      appId,
-      org: app.githubOrg || undefined,
-      repo: app.githubRepo || "",
-      branch: newBranch,
-    });
+    await updateAppLinkedBranch({ app, branch: newBranch });
   }
 }
 
-// Custom error class for merge conflicts (name kept for UI checks)
-class MergeConflictError extends DyadError {
-  constructor(message: string) {
-    super(message, DyadErrorKind.Conflict);
-    this.name = "MergeConflictError";
-  }
-}
-
-async function handleMergeBranch(
+export async function handleMergeBranch(
   event: IpcMainInvokeEvent,
   { appId, branch }: GitBranchParams,
 ): Promise<void> {
@@ -300,39 +314,11 @@ async function handleMergeBranch(
     mergeBranchRef = `origin/${branch}`;
   }
 
-  // Check for uncommitted changes
-  await withLock(appId, async () => {
-    await ensureCleanWorkspace(appPath, `merging branch '${branch}'`);
+  await ensureCleanWorkspace(appPath, `merging branch '${branch}'`);
+  await gitMerge({
+    path: appPath,
+    branch: mergeBranchRef,
   });
-  try {
-    await gitMerge({
-      path: appPath,
-      branch: mergeBranchRef,
-    });
-  } catch (mergeError: any) {
-    // Convert to MergeConflictError for component compatibility
-    if (mergeError?.name === "GitConflictError") {
-      throw new MergeConflictError(mergeError.message);
-    }
-
-    // Fallback: Check if error is about uncommitted changes
-    const errorMessage = mergeError?.message || "Failed to merge branch.";
-    const lowerMessage = errorMessage.toLowerCase();
-    if (
-      lowerMessage.includes("local changes") ||
-      lowerMessage.includes("would be overwritten") ||
-      lowerMessage.includes("please commit or stash")
-    ) {
-      throw new DyadError(
-        `Failed to merge branch: uncommitted changes detected. ` +
-          "Please commit or stash your changes manually and try again.",
-        DyadErrorKind.Conflict,
-      );
-    }
-
-    // Otherwise, throw the original error
-    throw mergeError;
-  }
 }
 
 async function handleListLocalBranches(
@@ -371,42 +357,205 @@ async function handleGetUncommittedFiles(
   return getGitUncommittedFilesWithStatus({ path: appPath });
 }
 
+async function handleGetUncommittedFileDiff(
+  _event: IpcMainInvokeEvent,
+  { appId, filePath }: GetUncommittedFileDiffParams,
+): Promise<UncommittedFileDiff> {
+  const app = await db.query.apps.findFirst({ where: eq(apps.id, appId) });
+  if (!app) throw new DyadError("App not found", DyadErrorKind.NotFound);
+  const appPath = getDyadAppPath(app.path);
+
+  // `filePath` comes from the renderer, so validate up front that it stays
+  // within the app directory before using it to read files or git objects. This
+  // rejects path-traversal attempts (e.g. "../../etc/passwd") with a clear error
+  // rather than silently returning an empty diff.
+  let resolvedPath: string;
+  try {
+    resolvedPath = safeJoin(appPath, filePath);
+  } catch {
+    throw new DyadError("Invalid file path", DyadErrorKind.Validation);
+  }
+
+  // "before" side: the file at HEAD. Missing (newly added file) → empty.
+  let oldContent =
+    (await getFileAtCommit({ path: appPath, filePath, commitHash: "HEAD" })) ??
+    "";
+
+  // A renamed file has no HEAD blob under its new path, so the lookup above
+  // returns empty and the diff would show the whole file as added. Recover the
+  // original path from status and read the HEAD content there instead, so the
+  // rename renders as an actual before/after diff.
+  if (!oldContent) {
+    const uncommitted = await getGitUncommittedFilesWithStatus({
+      path: appPath,
+    });
+    const renamed = uncommitted.find(
+      (file) =>
+        file.path === filePath && file.status === "renamed" && file.oldPath,
+    );
+    if (renamed?.oldPath) {
+      oldContent =
+        (await getFileAtCommit({
+          path: appPath,
+          filePath: renamed.oldPath,
+          commitHash: "HEAD",
+        })) ?? "";
+    }
+  }
+
+  // "after" side: the current working-tree contents. Missing (deleted) → empty.
+  let newContent = "";
+  try {
+    newContent = await fsPromises.readFile(resolvedPath, "utf-8");
+  } catch {
+    newContent = "";
+  }
+
+  return { path: filePath, oldContent, newContent };
+}
+
 async function withAppGitOp<T>(
   appId: number,
   operation: string,
   fn: (appPath: string) => Promise<T>,
 ): Promise<T> {
-  const app = await db.query.apps.findFirst({ where: eq(apps.id, appId) });
-  if (!app) throw new DyadError("App not found", DyadErrorKind.NotFound);
-  const appPath = getDyadAppPath(app.path);
+  return appOperationCoordinator.run(
+    {
+      appId,
+      operation: `git:${operation}`,
+      resources: [readAppResource("app-path"), "repository"],
+      refuseWhenRecording: operation,
+    },
+    async () => {
+      const app = await db.query.apps.findFirst({ where: eq(apps.id, appId) });
+      if (!app) throw new DyadError("App not found", DyadErrorKind.NotFound);
+      const appPath = getDyadAppPath(app.path);
 
-  return withLock(appId, async () => {
-    if (isGitMergeInProgress({ path: appPath })) {
-      throw GitStateError(
-        `Cannot ${operation}: merge in progress. Please complete or abort the merge first.`,
-        GIT_ERROR_CODES.MERGE_IN_PROGRESS,
-      );
-    }
+      if (isGitMergeInProgress({ path: appPath })) {
+        throw GitStateError(
+          `Cannot ${operation}: merge in progress. Please complete or abort the merge first.`,
+          GIT_ERROR_CODES.MERGE_IN_PROGRESS,
+        );
+      }
 
-    if (isGitRebaseInProgress({ path: appPath })) {
-      throw GitStateError(
-        `Cannot ${operation}: rebase in progress. Please complete or abort the rebase first.`,
-        GIT_ERROR_CODES.REBASE_IN_PROGRESS,
-      );
-    }
+      if (isGitRebaseInProgress({ path: appPath })) {
+        throw GitStateError(
+          `Cannot ${operation}: rebase in progress. Please complete or abort the rebase first.`,
+          GIT_ERROR_CODES.REBASE_IN_PROGRESS,
+        );
+      }
 
-    return fn(appPath);
-  });
+      return fn(appPath);
+    },
+  );
 }
 
 async function handleCommitChanges(
-  _event: IpcMainInvokeEvent,
-  { appId, message }: { appId: number; message: string },
+  event: IpcMainInvokeEvent,
+  { appId, message, operationId }: CommitChangesParams,
 ): Promise<string> {
-  return withAppGitOp(appId, "commit", async (appPath) => {
-    await ensureDyadGitignored(appPath);
-    return gitService.stageAllAndCommit({ path: appPath, message });
+  if (activeCommitOperations.has(operationId)) {
+    throw new DyadError(
+      "A commit operation with this identifier is already active.",
+      DyadErrorKind.Conflict,
+    );
+  }
+
+  const controller = new AbortController();
+  const abortWhenSenderIsDestroyed = () => controller.abort();
+  event.sender.once?.("destroyed", abortWhenSenderIsDestroyed);
+  if (event.sender.isDestroyed?.()) {
+    controller.abort();
+  }
+  activeCommitOperations.set(operationId, {
+    appId,
+    controller,
+    cancellable: true,
+    senderId: event.sender.id,
   });
+  let admitted = false;
+  try {
+    const commit = withAppGitOp(appId, "commit", async (appPath) => {
+      admitted = true;
+      if (controller.signal.aborted) {
+        throw GitStateError(
+          "The commit was cancelled.",
+          GIT_ERROR_CODES.COMMIT_CANCELLED,
+        );
+      }
+      await ensureDyadGitignored(appPath);
+      return gitService.stageAllAndCommitWithPreCommit({
+        path: appPath,
+        message,
+        signal: controller.signal,
+        onProgress: (phase) => {
+          if (phase === "committing") {
+            const active = activeCommitOperations.get(operationId);
+            if (active?.controller === controller) {
+              active.cancellable = false;
+            }
+          }
+          safeSend(event.sender, gitEvents.commitProgress.channel, {
+            appId,
+            operationId,
+            phase,
+          });
+        },
+      });
+    });
+
+    // Admission can sit in the coordinator queue for as long as whatever else
+    // holds the app's `repository` claim runs, and that queue has no timeout.
+    // A cancel that lands while the commit is still queued has to settle this
+    // invoke now: the renderer's `isCommitting` only clears when it does, so
+    // otherwise the dialog stays stuck on a disabled "Cancelling..." until the
+    // blocker releases. The queued admission still happens eventually, but its
+    // callback sees the aborted signal and commits nothing.
+    const cancelledBeforeAdmission = new Promise<never>((_resolve, reject) => {
+      const rejectAsCancelled = () => {
+        if (admitted) return;
+        reject(
+          GitStateError(
+            "The commit was cancelled.",
+            GIT_ERROR_CODES.COMMIT_CANCELLED,
+          ),
+        );
+      };
+      if (controller.signal.aborted) {
+        rejectAsCancelled();
+        return;
+      }
+      controller.signal.addEventListener("abort", rejectAsCancelled, {
+        once: true,
+      });
+    });
+    // Losing the race below leaves `commit` rejecting with nobody attached, so
+    // keep that rejection observed.
+    void commit.catch(() => {});
+    return await Promise.race([commit, cancelledBeforeAdmission]);
+  } finally {
+    event.sender.removeListener?.("destroyed", abortWhenSenderIsDestroyed);
+    const active = activeCommitOperations.get(operationId);
+    if (active?.controller === controller) {
+      activeCommitOperations.delete(operationId);
+    }
+  }
+}
+
+async function handleCancelCommit(
+  event: IpcMainInvokeEvent,
+  { appId, operationId }: CancelCommitParams,
+): Promise<boolean> {
+  const active = activeCommitOperations.get(operationId);
+  if (
+    active?.appId !== appId ||
+    active.senderId !== event.sender.id ||
+    !active.cancellable
+  ) {
+    return false;
+  }
+  active.controller.abort();
+  return true;
 }
 
 async function handleDiscardChanges(
@@ -419,22 +568,12 @@ async function handleDiscardChanges(
 }
 
 // --- GitHub Pull Handler ---
-async function handlePullFromGithub(
+export async function handlePullFromGithub(
   event: IpcMainInvokeEvent,
   { appId }: GitBranchAppIdParams,
 ): Promise<void> {
-  const settings = readSettings();
-  const accessToken = settings.githubAccessToken?.value;
-  if (!accessToken) {
-    throw new DyadError("Not authenticated with GitHub.", DyadErrorKind.Auth);
-  }
-  const app = await db.query.apps.findFirst({ where: eq(apps.id, appId) });
-  if (!app || !app.githubOrg || !app.githubRepo) {
-    throw new DyadError(
-      "App is not linked to a GitHub repo.",
-      DyadErrorKind.Precondition,
-    );
-  }
+  const app = await findAppOrThrow(appId);
+  const auth = getAppGitRemoteAuth(requireAppGitRemote(app));
   const appPath = getDyadAppPath(app.path);
   const currentBranch = await gitCurrentBranch({ path: appPath });
 
@@ -443,18 +582,12 @@ async function handlePullFromGithub(
       path: appPath,
       remote: "origin",
       branch: currentBranch || "main",
-      accessToken,
+      auth,
     });
   } catch (pullError: any) {
     // Check if it's a missing remote branch error
     const errorMessage = pullError?.message || "";
-    const isMissingRemoteBranch =
-      pullError?.code === "MissingRefError" ||
-      (pullError?.code === "NotFoundError" &&
-        (errorMessage.includes("remote ref") ||
-          errorMessage.includes("remote branch"))) ||
-      errorMessage.includes("couldn't find remote ref") ||
-      errorMessage.includes("Cannot read properties of null");
+    const isMissingRemoteBranch = isMissingRemoteBranchError(pullError);
 
     // If the remote branch doesn't exist yet, we can ignore this
     // (e.g., user hasn't pushed the branch yet)
@@ -471,14 +604,6 @@ async function handlePullFromGithub(
 
 // --- Registration ---
 export function registerGithubBranchHandlers() {
-  createTypedHandler(githubContracts.mergeAbort, handleAbortMerge);
-  createTypedHandler(githubContracts.fetch, handleFetchFromGithub);
-  createTypedHandler(githubContracts.pull, handlePullFromGithub);
-  createTypedHandler(githubContracts.createBranch, handleCreateBranch);
-  createTypedHandler(githubContracts.deleteBranch, handleDeleteBranch);
-  createTypedHandler(githubContracts.switchBranch, handleSwitchBranch);
-  createTypedHandler(githubContracts.renameBranch, handleRenameBranch);
-  createTypedHandler(githubContracts.mergeBranch, handleMergeBranch);
   createTypedHandler(
     githubContracts.listLocalBranches,
     handleListLocalBranches,
@@ -491,6 +616,11 @@ export function registerGithubBranchHandlers() {
     gitContracts.getUncommittedFiles,
     handleGetUncommittedFiles,
   );
+  createTypedHandler(
+    gitContracts.getUncommittedFileDiff,
+    handleGetUncommittedFileDiff,
+  );
   createTypedHandler(gitContracts.commitChanges, handleCommitChanges);
+  createTypedHandler(gitContracts.cancelCommit, handleCancelCommit);
   createTypedHandler(gitContracts.discardChanges, handleDiscardChanges);
 }

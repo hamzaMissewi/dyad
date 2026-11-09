@@ -12,13 +12,19 @@ import { DyadError, DyadErrorKind } from "@/errors/dyad_error";
 import { getExtraProviderOptionsForEngine } from "./thinking_utils";
 import { getTestFetchOption } from "./test_fetch_override";
 import { DYAD_INTERNAL_REQUEST_ID_HEADER } from "./provider_options";
-import type { UserSettings } from "../../lib/schemas";
+import {
+  describeRequestUrl,
+  fetchWithRequestLogging,
+} from "./model_request_logging";
+import type { ModelSelection, UserSettings } from "../../lib/schemas";
 import type { LanguageModel } from "ai";
 import {
   findInvalidProviderApiKeyCharacter,
   formatInvalidProviderApiKeyMessage,
   normalizeProviderApiKeyInput,
 } from "@/lib/providerApiKey";
+
+import { withAnthropicPreservedThinking } from "./anthropic_preserved_thinking";
 
 const logger = log.scope("llm_engine_provider");
 
@@ -58,6 +64,7 @@ or to provide a custom fetch implementation for e.g. testing.
     enableWebSearch?: boolean;
   };
   settings: UserSettings;
+  modelSelection?: ModelSelection;
 }
 
 export interface DyadEngineProvider {
@@ -81,11 +88,25 @@ Creates a chat model for text generation.
   anthropic(modelId: ExampleChatModelId, chatParams: ChatParams): LanguageModel;
 }
 
+// The Engine's free route only accepts text and image parts, so callers need
+// to know when a model uses it before sending files.
+const engineFreeModels = new WeakSet<object>();
+
+export function isDyadEngineFreeModel(model: LanguageModel) {
+  return typeof model === "object" && engineFreeModels.has(model);
+}
+
 export function createDyadEngine(
   options: ExampleProviderSettings,
 ): DyadEngineProvider {
+  const modelSelection =
+    options.modelSelection ??
+    ({
+      ...options.settings.selectedModel,
+      effortLevel: "medium",
+    } satisfies ModelSelection);
   const baseURL = withoutTrailingSlash(options.baseURL);
-  logger.info("creating dyad engine with baseURL", baseURL);
+  logger.debug("creating dyad engine with baseURL", baseURL);
 
   // Track request ID attempts
   const requestIdAttempts = new Map<string, number>();
@@ -164,7 +185,7 @@ export function createDyadEngine(
         // Parse the request body to manipulate it
         const parsedBody = {
           ...JSON.parse(init.body),
-          ...getExtraProviderOptionsForEngine(providerId, options.settings),
+          ...getExtraProviderOptionsForEngine(providerId, modelSelection),
         };
 
         const getDyadOption = (key: string) =>
@@ -251,7 +272,15 @@ export function createDyadEngine(
         };
 
         // Use the provided fetch or default fetch
-        return (options.fetch || fetch)(requestInput, modifiedInit);
+        const fetchFn =
+          providerId === "anthropic"
+            ? withAnthropicPreservedThinking(options.fetch)
+            : options.fetch || fetch;
+        return fetchWithRequestLogging(
+          modifiedRequestId ?? "engine",
+          describeRequestUrl(requestInput),
+          () => fetchFn(requestInput, modifiedInit),
+        );
       } catch (e) {
         logger.error("Error parsing request body", e);
         // If parsing fails, use original request
@@ -280,7 +309,11 @@ export function createDyadEngine(
   const createFreeChatModel = (
     modelId: ExampleChatModelId,
     chatParams: ChatParams,
-  ) => createChatModel(modelId, chatParams, "/free");
+  ) => {
+    const model = createChatModel(modelId, chatParams, "/free");
+    engineFreeModels.add(model);
+    return model;
+  };
 
   const createResponsesModel = (
     modelId: ExampleChatModelId,
@@ -374,9 +407,14 @@ export async function transcribeWithDyadEngine(
         : filename.endsWith(".m4a")
           ? "audio/mp4"
           : "audio/webm";
-  const blob = new Blob([new Uint8Array(audioBuffer)], { type: mimeType });
+  const audioBytes = new Uint8Array(
+    audioBuffer.buffer as ArrayBuffer,
+    audioBuffer.byteOffset,
+    audioBuffer.byteLength,
+  );
+  const blob = new Blob([audioBytes], { type: mimeType });
   formData.append("file", blob, filename);
-  formData.append("model", "gpt-4o-mini-transcribe");
+  formData.append("model", "dyad/transcribe");
 
   const fetchFn = options.fetch || getTestFetchOption().fetch || fetch;
   const response = await fetchFn(`${baseURL}/audio/transcriptions`, {

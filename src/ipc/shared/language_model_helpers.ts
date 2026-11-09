@@ -42,7 +42,7 @@ export async function getLanguageModelProviders(): Promise<
   }
 
   const builtinCatalog = await getBuiltinLanguageModelCatalog();
-  logger.info("Loaded builtin catalog for provider list", {
+  logger.debug("Loaded builtin catalog for provider list", {
     source: builtinCatalog.source,
     version: builtinCatalog.version,
     providerCount: builtinCatalog.providers.length,
@@ -145,7 +145,7 @@ export async function getLanguageModels({
   let hardcodedModels: LanguageModel[] = [];
   if (provider.type === "cloud") {
     const builtinCatalog = await getBuiltinLanguageModelCatalog();
-    logger.info("Loading cloud models from builtin catalog", {
+    logger.debug("Loading cloud models from builtin catalog", {
       providerId,
       source: builtinCatalog.source,
       version: builtinCatalog.version,
@@ -166,6 +166,7 @@ export async function getLanguageModels({
         contextWindow: model.contextWindow,
         temperature: model.temperature,
         dollarSigns: model.dollarSigns,
+        effortSettings: model.effortSettings,
         type: "cloud" as const,
       }));
     } else {

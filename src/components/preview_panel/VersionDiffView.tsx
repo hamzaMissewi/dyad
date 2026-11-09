@@ -1,23 +1,17 @@
-import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { cn } from "@/lib/utils";
 import { useVersionChanges } from "@/hooks/useVersionChanges";
 import type { VersionChangedFile } from "@/ipc/types";
 import { FileDiffEditor } from "./FileDiffEditor";
+import { STATUS_META } from "./versionChangeMeta";
+import { useVersionPreview } from "@/hooks/useVersionPreview";
+import { selectedDiffFileForState } from "@/version_preview/state";
+import { getDisplayedVersionDiffPath } from "./diffSelection";
 
 interface VersionDiffViewProps {
   appId: number;
   versionId: string;
 }
-
-const STATUS_META: Record<
-  VersionChangedFile["type"],
-  { label: string; className: string }
-> = {
-  added: { label: "A", className: "text-green-600 dark:text-green-400" },
-  modified: { label: "M", className: "text-amber-600 dark:text-amber-400" },
-  deleted: { label: "D", className: "text-red-600 dark:text-red-400" },
-};
 
 function StatusBadge({ type }: { type: VersionChangedFile["type"] }) {
   const meta = STATUS_META[type];
@@ -41,10 +35,16 @@ function StatusBadge({ type }: { type: VersionChangedFile["type"] }) {
 export function VersionDiffView({ appId, versionId }: VersionDiffViewProps) {
   const { t } = useTranslation("home");
   const { changes, loading, error } = useVersionChanges(appId, versionId);
-  // Tracks the file the user explicitly clicked. The displayed selection is
-  // derived during render (below) so switching versions never flashes the
-  // placeholder while waiting for an effect to reconcile a stale path.
-  const [userSelectedPath, setUserSelectedPath] = useState<string | null>(null);
+  // The selected file is held in a shared atom so external callers (e.g. the
+  // modified-files card in the chat) can open the diff at a specific file. The
+  // selection is scoped to a version, so it is only applied when it belongs to
+  // the version being shown (see below); this avoids a stale path from another
+  // version leaking in without needing an effect to reconcile it.
+  const { state: previewState, send: sendPreviewEvent } =
+    useVersionPreview(appId);
+  const selectedDiffFile = selectedDiffFileForState(previewState);
+  const selectedDiffPath =
+    selectedDiffFile?.versionId === versionId ? selectedDiffFile.path : null;
 
   if (loading) {
     return (
@@ -74,15 +74,12 @@ export function VersionDiffView({ appId, versionId }: VersionDiffViewProps) {
     );
   }
 
-  // Derive the displayed file from the user's explicit selection, falling back
-  // to the first changed file. Computing this during render (rather than via an
-  // effect) means a version switch immediately shows a valid selection even
-  // when the previously selected path is absent in the new version.
-  const selected =
-    (userSelectedPath
-      ? changes.find((c) => c.path === userSelectedPath)
-      : undefined) ?? changes[0];
-  const selectedPath = selected?.path ?? null;
+  // Derive the displayed file from the shared selection, falling back to the
+  // first changed file. Computing this during render (rather than via an effect)
+  // means a version switch immediately shows a valid selection even when the
+  // previously selected path is absent in the new version.
+  const selectedPath = getDisplayedVersionDiffPath(changes, selectedDiffPath);
+  const selected = changes.find((file) => file.path === selectedPath)!;
 
   return (
     <div
@@ -93,7 +90,12 @@ export function VersionDiffView({ appId, versionId }: VersionDiffViewProps) {
         {changes.map((file) => (
           <button
             key={file.path}
-            onClick={() => setUserSelectedPath(file.path)}
+            onClick={() =>
+              sendPreviewEvent({
+                type: "SELECT_DIFF_FILE",
+                file: { versionId, path: file.path },
+              })
+            }
             data-testid="version-diff-file"
             className={cn(
               "flex items-center gap-2 w-full px-3 py-1.5 text-left text-sm hover:bg-[var(--background-darkest)]",

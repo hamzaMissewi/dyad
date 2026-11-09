@@ -27,12 +27,11 @@ import { showError, showSuccess } from "@/lib/toast";
 import { useEffect } from "react";
 import { useStreamChat } from "@/hooks/useStreamChat";
 import { useCurrentBranch } from "@/hooks/useCurrentBranch";
-import { useCheckoutVersion } from "@/hooks/useCheckoutVersion";
+import { useVersionPreview } from "@/hooks/useVersionPreview";
+import { isMutatingState } from "@/version_preview/state";
 import { useRenameBranch } from "@/hooks/useRenameBranch";
-import { isAnyCheckoutVersionInProgressAtom } from "@/store/appAtoms";
 import { LoadingBar } from "../ui/LoadingBar";
 import { UncommittedFilesBanner } from "./UncommittedFilesBanner";
-import { useInitialChatMode } from "@/hooks/useInitialChatMode";
 import { terminalOpenByChatIdAtom } from "@/atoms/terminalAtoms";
 import { cn } from "@/lib/utils";
 
@@ -60,18 +59,18 @@ export function ChatHeader({
   const { invalidateChats } = useChats(appId);
   const { selectChat } = useSelectChat();
   const { isStreaming } = useStreamChat();
-  const initialChatMode = useInitialChatMode();
-  const isAnyCheckoutVersionInProgress = useAtomValue(
-    isAnyCheckoutVersionInProgressAtom,
-  );
-
   const {
     branchInfo,
     isLoading: branchInfoLoading,
     refetchBranchInfo,
   } = useCurrentBranch(appId);
 
-  const { checkoutVersion, isCheckingOutVersion } = useCheckoutVersion();
+  const {
+    state: versionPreviewState,
+    projection: versionPreviewProjection,
+    send: sendVersionPreviewEvent,
+  } = useVersionPreview(appId);
+  const isCheckingOutVersion = isMutatingState(versionPreviewState);
   const { renameBranch, isRenamingBranch } = useRenameBranch();
 
   useEffect(() => {
@@ -82,7 +81,7 @@ export function ChatHeader({
 
   const handleCheckoutMainBranch = async () => {
     if (!appId) return;
-    await checkoutVersion({ appId, versionId: "main" });
+    sendVersionPreviewEvent({ type: "SWITCH_BRANCH", appId, branch: "main" });
   };
 
   const handleRenameMasterToMain = async () => {
@@ -96,10 +95,7 @@ export function ChatHeader({
   const handleNewChat = async () => {
     if (appId) {
       try {
-        const chatId = await ipc.chat.createChat({
-          appId,
-          initialChatMode,
-        });
+        const chatId = await ipc.chat.createChat({ appId });
         await invalidateChats();
         selectChat({ chatId, appId });
       } catch (error) {
@@ -134,7 +130,7 @@ export function ChatHeader({
 
   return (
     <div className="flex flex-col w-full @container">
-      <LoadingBar isVisible={isAnyCheckoutVersionInProgress} />
+      <LoadingBar isVisible={isCheckingOutVersion} />
       {/* If the version pane is open, it's expected to not always be on the main branch. */}
       {isNotMainBranch && !isVersionPaneOpen && (
         <div className="flex flex-col @sm:flex-row items-center justify-between px-4 py-2 bg-amber-100 dark:bg-amber-900 text-amber-800 dark:text-amber-200">
@@ -147,7 +143,7 @@ export function ChatHeader({
                     <Tooltip>
                       <TooltipTrigger>
                         <span className="flex items-center  gap-1">
-                          {isAnyCheckoutVersionInProgress ? (
+                          {isCheckingOutVersion ? (
                             <>
                               <span>{t("header.switchingToLatest")}</span>
                             </>
@@ -164,7 +160,7 @@ export function ChatHeader({
                       </TooltipTrigger>
                       <TooltipContent>
                         <p>
-                          {isAnyCheckoutVersionInProgress
+                          {isCheckingOutVersion
                             ? t("header.checkoutInProgress")
                             : t("header.checkoutMainBranch")}
                         </p>
@@ -190,12 +186,15 @@ export function ChatHeader({
                 ? t("header.renaming")
                 : t("header.renameMasterToMain")}
             </Button>
-          ) : isAnyCheckoutVersionInProgress && !isCheckingOutVersion ? null : (
+          ) : (
             <Button
               variant="outline"
               size="sm"
               onClick={handleCheckoutMainBranch}
-              disabled={isCheckingOutVersion || branchInfoLoading}
+              disabled={
+                !versionPreviewProjection.capabilities.canSwitchBranch ||
+                branchInfoLoading
+              }
             >
               {isCheckingOutVersion
                 ? t("header.checkingOut")

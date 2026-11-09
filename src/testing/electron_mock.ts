@@ -10,7 +10,8 @@
  *     harness via the `DYAD_DEV_USER_DATA_DIR` env var (read at call time so the
  *     harness can set it after this mock is constructed);
  *   - `BrowserWindow` / `safeStorage` / `Notification` / `shell` / `dialog` /
- *     `net` are inert stand-ins so importing main-process code does not crash.
+ *     `net` / `session` / `utilityProcess` are inert stand-ins so importing
+ *     main-process code does not crash.
  *
  * Usage (must be hoisted so the vi.mock factory can see the shared Map):
  *
@@ -53,19 +54,24 @@ export interface RendererEvent {
  */
 export function createFakeIpcEvent(sink: RendererEvent[]): {
   sender: {
+    mainFrame: { url: string };
     isDestroyed: () => boolean;
     isCrashed: () => boolean;
     send: (channel: string, payload: unknown) => void;
   };
+  senderFrame: { url: string };
 } {
+  const frame = { url: "http://localhost:5173/" };
   return {
     sender: {
+      mainFrame: frame,
       isDestroyed: () => false,
       isCrashed: () => false,
       send: (channel: string, payload: unknown) => {
         sink.push({ channel, payload });
       },
     },
+    senderFrame: frame,
   };
 }
 
@@ -149,7 +155,19 @@ export function createElectronMock(shared: ElectronMockShared) {
     },
     BrowserWindow: {
       getAllWindows: vi.fn(() => []),
-      fromWebContents: vi.fn(() => null),
+      // Return the caller's own webContents so sends keep flowing to the
+      // bridge sink — a stub `send` here would silently swallow messages
+      // (e.g. main/settings.ts drains queued error toasts through this path).
+      fromWebContents: vi.fn((webContents: { send?: unknown }) => ({
+        isDestroyed: () => false,
+        webContents,
+      })),
+    },
+    nativeTheme: {
+      shouldUseDarkColors: false,
+      themeSource: "system",
+      on: vi.fn(),
+      off: vi.fn(),
     },
     safeStorage: {
       isEncryptionAvailable: vi.fn(() => false),
@@ -170,5 +188,65 @@ export function createElectronMock(shared: ElectronMockShared) {
       showMessageBox: vi.fn(() => Promise.resolve({ response: 0 })),
     },
     net: {},
+    session: {
+      defaultSession: {
+        cookies: {
+          get: vi.fn(() => Promise.resolve([])),
+          remove: vi.fn(() => Promise.resolve()),
+        },
+      },
+    },
+    utilityProcess: {
+      // Functional shim: forks the real worker bundle via child_process with
+      // a parentPort bridge (code_explorer_fork_wrapper.cjs), so utility-
+      // process consumers (code explorer) actually WORK headless instead of
+      // hanging on a ready-promise that an inert stub would never resolve.
+      fork: vi.fn((modulePath: string, _args?: string[], _opts?: unknown) => {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const { fork } =
+          require("node:child_process") as typeof import("node:child_process");
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const nodeFs = require("node:fs") as typeof import("node:fs");
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const nodePath = require("node:path") as typeof import("node:path");
+        const repoRoot = nodePath.resolve(__dirname, "..", "..");
+        const base = nodePath.basename(modulePath);
+        const candidates = [
+          modulePath,
+          nodePath.join(repoRoot, "dist", base),
+          nodePath.join(repoRoot, "dist", base.replace(/\.js$/, ".cjs")),
+        ];
+        const bundle = candidates.find((p) => nodeFs.existsSync(p));
+        if (!bundle) {
+          throw new Error(
+            `utilityProcess shim: worker bundle not found (tried ${candidates.join(", ")}). ` +
+              `Build it: npx vite build --config vite.code-explorer-worker.config.mts`,
+          );
+        }
+        const child = fork(
+          nodePath.join(__dirname, "code_explorer_fork_wrapper.cjs"),
+          [],
+          {
+            env: { ...process.env, DYAD_TEST_WORKER_BUNDLE: bundle },
+            // utilityProcess execArgv V8 flags aren't applied by Electron 40
+            // either (see code_explorer.ts) — drop them here too.
+            execArgv: [],
+            stdio: ["ignore", "ignore", "inherit", "ipc"],
+          },
+        );
+        return {
+          on: (event: string, cb: (...a: unknown[]) => void) => {
+            if (event === "error") {
+              child.on("error", (err) => cb("unknown", "spawn", String(err)));
+            } else {
+              child.on(event as "spawn" | "message" | "exit", cb);
+            }
+          },
+          postMessage: (m: unknown) => child.send(m as object),
+          kill: () => child.kill(),
+          pid: child.pid,
+        };
+      }),
+    },
   };
 }

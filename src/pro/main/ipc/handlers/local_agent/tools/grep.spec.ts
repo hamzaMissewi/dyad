@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { grepTool } from "./grep";
+import { grepTool, normalizeRipgrepMatchPath } from "./grep";
 import type { AgentContext } from "./types";
 
 // Mock electron-log
@@ -117,6 +117,8 @@ function deepHello() {
       todos: [],
       dyadRequestId: "test-request",
       fileEditTracker: {},
+      testingEnabled: true,
+      testRunAttempts: new Map(),
       onXmlStream: vi.fn(),
       onXmlComplete: vi.fn(),
       requireConsent: vi.fn().mockResolvedValue(true),
@@ -170,6 +172,14 @@ function deepHello() {
       expect(() =>
         schema.parse({ query: "createBooking({", literal: true }),
       ).not.toThrow();
+    });
+  });
+
+  describe("path normalization", () => {
+    it("normalizes Windows ripgrep paths to prompt-safe relative paths", () => {
+      expect(normalizeRipgrepMatchPath(".\\nested\\deep.ts")).toBe(
+        "nested/deep.ts",
+      );
     });
   });
 
@@ -367,6 +377,40 @@ function deepHello() {
       );
 
       expect(result).toContain(".dyad/backup.txt");
+    });
+
+    it("excludes dotenv matches when ignored files are included", async () => {
+      await fs.promises.writeFile(
+        path.join(testDir, ".env.local"),
+        "API_KEY=sk-123",
+      );
+      await fs.promises.writeFile(
+        path.join(testDir, ".envrc"),
+        "export ENVRC_KEY=sk-456",
+      );
+
+      const result = await grepTool.execute(
+        {
+          query: "API_KEY",
+          include_ignored: true,
+          include_pattern: ".env*",
+        },
+        mockContext,
+      );
+
+      expect(result).toBe("No matches found.");
+      expect(result).not.toContain("sk-123");
+
+      const envrcResult = await grepTool.execute(
+        {
+          query: "ENVRC_KEY",
+          include_ignored: true,
+          include_pattern: ".env*",
+        },
+        mockContext,
+      );
+      expect(envrcResult).toBe("No matches found.");
+      expect(envrcResult).not.toContain("sk-456");
     });
 
     it("keeps .git excluded when include_ignored is true", async () => {

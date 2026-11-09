@@ -6,7 +6,11 @@ import {
   createEventClient,
 } from "../contracts/core";
 import { ConsoleEntrySchema } from "./supabase";
+import { MAX_LOGS_PER_APP } from "../../shared/log_limits";
 import { ProblemReportSchema } from "./agent";
+import { ChatStreamInvocationRefSchema } from "./chat";
+import { AppRunInvocationRefSchema } from "./app";
+import { PreviewAuthStatusSchema } from "../../app_run/transport";
 
 // =============================================================================
 // Portal Schemas
@@ -48,7 +52,7 @@ export const SetAppEnvVarsParamsSchema = z.object({
  * Schema version for the session debug bundle format.
  * Bump this when making breaking changes to the schema.
  */
-export const SESSION_DEBUG_SCHEMA_VERSION = 2;
+export const SESSION_DEBUG_SCHEMA_VERSION = 4;
 
 // -- System info --
 
@@ -73,12 +77,14 @@ const DebugSystemInfoSchema = z.object({
 
 // -- Non-sensitive settings snapshot --
 
-const DebugSettingsSchema = z.object({
+export const DebugSettingsSchema = z.object({
   /** Currently selected language model */
   selectedModel: z.object({
     name: z.string(),
     provider: z.string(),
     customModelId: z.number().optional(),
+    /** How the model is routed: "subscription" | "pro" | "api-key" */
+    connection: z.string().optional(),
   }),
   /** Active chat mode for the session */
   selectedChatMode: z.string().nullable(),
@@ -88,14 +94,10 @@ const DebugSettingsSchema = z.object({
   autoApproveChanges: z.boolean().nullable(),
   /** Whether Dyad Pro is enabled */
   enableDyadPro: z.boolean().nullable(),
-  /** Thinking budget level: "low" | "medium" | "high" */
-  thinkingBudget: z.string().nullable(),
+  /** Model-specific effort level */
+  effortLevel: z.string(),
   /** Max chat turns kept in context window */
   maxChatTurnsInContext: z.number().nullable(),
-  /** Whether auto-fix problems is enabled */
-  enableAutoFixProblems: z.boolean().nullable(),
-  /** Whether native git is enabled */
-  enableNativeGit: z.boolean().nullable(),
   /** Whether auto-update is enabled */
   enableAutoUpdate: z.boolean(),
   /** Release channel: "stable" | "beta" */
@@ -126,7 +128,72 @@ const DebugSettingsSchema = z.object({
   customNodePath: z.string().nullable(),
   /** Map of provider ID -> whether configured (has API key). No secrets. */
   providerSetupStatus: z.record(z.string(), z.boolean()),
+  // Also reported through telemetry
+  autoApproveNonSchemaSql: z.boolean().nullable(),
+  autoApproveSafeMcpTools: z.boolean().nullable(),
+  enableShellTool: z.boolean().nullable(),
+  blockUnsafeNpmPackages: z.boolean().nullable(),
+  enableCodeExplorer: z.boolean().nullable(),
+  enableExplorerSubagent: z.boolean().nullable(),
+  enableImplementerSubagent: z.boolean().nullable(),
+  enableAdvancedSubagents: z.boolean().nullable(),
+  enableAutoReview: z.boolean().nullable(),
+  enableReviewButton: z.boolean().nullable(),
+  autoFixReviewIssues: z.boolean().nullable(),
+  enableContextCompaction: z.boolean().nullable(),
+  enableMcpToolSearch: z.boolean().nullable(),
+  enableSandboxScriptExecution: z.boolean().nullable(),
+  enableSuggestedPrompts: z.boolean().nullable(),
+  enableMultiWindow: z.boolean().nullable(),
+  enableOwnServerDeployment: z.boolean().nullable(),
+  enableGitlabPublishing: z.boolean().nullable(),
+  enableTestRunInPreview: z.boolean().nullable(),
+  disableSandboxedE2eTests: z.boolean().nullable(),
+  enableParallelTestRuns: z.boolean().nullable(),
+  maxConcurrentTestRuns: z.number().nullable(),
+  enableAppPreviewDomains: z.boolean().nullable(),
+  enablePreviewCookieIsolation: z.boolean().nullable(),
+  proModelUsage: z.string().nullable(),
+  chatgptFastMode: z.boolean().nullable(),
+  language: z.string().nullable(),
+  nodeRuntimePreference: z.string().nullable(),
+  disablePreviewNodeAutoInstall: z.boolean().nullable(),
+  previewIdleTimeoutPolicy: z.string().nullable(),
+  maxToolCallSteps: z.number().nullable(),
+  /** Whether a credential is stored. No secrets or account details. */
+  githubConnected: z.boolean(),
+  gitlabConnected: z.boolean(),
+  vercelConnected: z.boolean(),
+  cloudflareConnected: z.boolean(),
+  coolifyConnected: z.boolean(),
+  supabaseConnected: z.boolean(),
+  neonConnected: z.boolean(),
+  enableAppBlueprint: z.boolean().nullable(),
+  enableTestingForNewApps: z.boolean().nullable(),
+  enableClaudeCodeSubscription: z.boolean().nullable(),
+  /** Raw ID; community templates are "org/repo" */
+  selectedTemplateId: z.string(),
+  /** Raw ID; custom themes are "custom:<id>" */
+  selectedThemeId: z.string().nullable(),
+  // Chat sessions only
+  runTypeScriptForWholeProject: z.boolean().nullable(),
+  autoExpandPreviewPanel: z.boolean().nullable(),
+  testHeaded: z.boolean().nullable(),
+  testParallel: z.boolean().nullable(),
+  testSlowMo: z.boolean().nullable(),
+  skipPruneEdgeFunctions: z.boolean().nullable(),
+  enablePnpmMinimumReleaseAgeWarning: z.boolean().nullable(),
+  hidePnpmMinimumReleaseAgeWarning: z.boolean().nullable(),
+  acceptedCommunityCode: z.boolean().nullable(),
+  enableChatEventNotifications: z.boolean().nullable(),
+  isTestMode: z.boolean().nullable(),
+  /** Whether a custom apps folder is set. The path itself is excluded. */
+  hasCustomAppsFolder: z.boolean(),
+  /** Plugin catalog slugs the user asked never to be suggested */
+  neverSuggestPluginSlugs: z.array(z.string()).nullable(),
 });
+
+export type DebugSettings = z.infer<typeof DebugSettingsSchema>;
 
 // -- App metadata --
 
@@ -239,6 +306,203 @@ const DebugMcpServerSchema = z.object({
   // NOTE: envJson and headersJson are intentionally EXCLUDED (may contain secrets)
 });
 
+// -- Process memory diagnostics --
+
+export const ProcessMetricSchema = z.object({
+  pid: z.number(),
+  rssKb: z.number(),
+  command: z.string(),
+});
+
+export const ElectronProcessMetricSchema = z.object({
+  type: z.string(),
+  pid: z.number(),
+  workingSetSizeKb: z.number(),
+  creationTime: z.number(),
+  name: z.string().optional(),
+  serviceName: z.string().optional(),
+});
+
+export const ElectronProcessMetricsResultSchema = z.object({
+  processes: z.array(ElectronProcessMetricSchema),
+  totalWorkingSetSizeMb: z.number(),
+  mainProcess: z.object({
+    rssMb: z.number(),
+    heapTotalMb: z.number(),
+    heapUsedMb: z.number(),
+    externalMb: z.number(),
+  }),
+  v8Heap: z.object({
+    heapSizeLimitMb: z.number(),
+    totalHeapSizeMb: z.number(),
+    usedHeapSizeMb: z.number(),
+    mallocedMemoryMb: z.number(),
+    externalMemoryMb: z.number(),
+  }),
+  error: z.string().optional(),
+});
+
+export const AppProcessTreeSchema = z.object({
+  appId: z.number(),
+  rootPid: z.number(),
+  processes: z.array(ProcessMetricSchema),
+  totalRssMb: z.number(),
+  note: z.string().optional(),
+});
+
+export const AppProcessTreesResultSchema = z.object({
+  supported: z.boolean(),
+  trees: z.array(AppProcessTreeSchema),
+  error: z.string().optional(),
+});
+
+export const VmStatSummarySchema = z.object({
+  pageSizeBytes: z.number(),
+  freePages: z.number(),
+  activePages: z.number(),
+  inactivePages: z.number(),
+  speculativePages: z.number(),
+  wiredPages: z.number(),
+  purgeablePages: z.number(),
+  compressorPages: z.number(),
+  pageouts: z.number(),
+});
+
+export const SystemMemorySignalsSchema = z.object({
+  platform: z.string(),
+  totalMemoryMb: z.number(),
+  appMemoryMb: z.number().optional(),
+  reclaimableMb: z.number().optional(),
+  freeMb: z.number().optional(),
+  swapUsedMb: z.number().optional(),
+  swapTotalMb: z.number().optional(),
+  pressureDetected: z.boolean().optional(),
+  vmStat: VmStatSummarySchema.optional(),
+  fallback: z
+    .object({
+      usedMemoryMb: z.number(),
+      freeMemoryMb: z.number(),
+      usagePercent: z.number(),
+    })
+    .optional(),
+  error: z.string().optional(),
+});
+
+export const TopProcessesResultSchema = z.object({
+  captured: z.boolean(),
+  reason: z.string(),
+  processes: z.array(ProcessMetricSchema).optional(),
+  error: z.string().optional(),
+});
+
+export const ProcessMemoryDiagnosticsSchema = z.object({
+  collectedAt: z.string(),
+  platform: z.string(),
+  electron: ElectronProcessMetricsResultSchema,
+  appProcessTrees: AppProcessTreesResultSchema,
+  systemMemory: SystemMemorySignalsSchema,
+  topProcesses: TopProcessesResultSchema,
+});
+
+export type ProcessMetric = z.infer<typeof ProcessMetricSchema>;
+export type ElectronProcessMetric = z.infer<typeof ElectronProcessMetricSchema>;
+export type ElectronProcessMetricsResult = z.infer<
+  typeof ElectronProcessMetricsResultSchema
+>;
+export type AppProcessTree = z.infer<typeof AppProcessTreeSchema>;
+export type AppProcessTreesResult = z.infer<typeof AppProcessTreesResultSchema>;
+export type VmStatSummary = z.infer<typeof VmStatSummarySchema>;
+export type SystemMemorySignals = z.infer<typeof SystemMemorySignalsSchema>;
+export type TopProcessesResult = z.infer<typeof TopProcessesResultSchema>;
+export type ProcessMemoryDiagnostics = z.infer<
+  typeof ProcessMemoryDiagnosticsSchema
+>;
+
+// -- Native crash dumps --
+
+/**
+ * One candidate frame: an offset into `modules[module]`, or "unknown" when a
+ * thread's instruction pointer fell outside every module (e.g. JIT code).
+ * Frames after the first come from scanning the stack for values that point
+ * into code, so some are stale return addresses or function pointers held in
+ * locals rather than real calls. Resolve them against symbols with
+ * `node scripts/resolve-crash-frames.mjs --bundle <file.json>`, which also
+ * drops the values that are not return addresses.
+ */
+const CrashStackFrameSchema = z.union([
+  z.object({ module: z.number(), offset: z.string() }),
+  z.literal("unknown"),
+]);
+
+const CrashStackSchema = z.object({
+  /** Modules the frames reference, by index. */
+  modules: z.array(
+    z.object({
+      /** Basename with control characters removed, capped at 128 characters. */
+      name: z.string(),
+      /** With debugId, keys the module's symbol file (e.g. on symbols.electronjs.org). */
+      debugFile: z.string(),
+      /** Breakpad debug id. Absent when the module has no CodeView record. */
+      debugId: z.string().optional(),
+    }),
+  ),
+  /** The crashing thread first, then the main thread if another one crashed. */
+  threads: z.array(
+    z.object({
+      crashing: z.boolean(),
+      /** The process's first thread: the UI thread, for the browser process. */
+      main: z.boolean(),
+      /** Instruction pointer first, then stack order (callers last). */
+      frames: z.array(CrashStackFrameSchema),
+    }),
+  ),
+});
+
+/**
+ * A native crash dump kept on the reporter's machine, reduced to what a stack
+ * trace needs. No stack memory, absolute address, or file path is included.
+ */
+const CrashDumpSchema = z.object({
+  /** Retained file name, e.g. crash-2026-06-07T20-41-55-123Z-9ac4d4e8.dmp */
+  file: z.string(),
+  /** ISO 8601 time of the crash (the dump's modification time). */
+  crashedAt: z.string(),
+  /** False when the file could not be parsed as a minidump; nothing else is set then. */
+  readable: z.boolean(),
+  /** Crashing process type: "browser" (main), "renderer", "gpu-process", "utility", ... */
+  ptype: z.string().optional(),
+  /** Signal, Mach exception, or NTSTATUS name, e.g. "SIGSEGV". */
+  crashReason: z.string().optional(),
+  exceptionCode: z.number().optional(),
+  /** Exact only near null; "non-null" otherwise. */
+  faultAddress: z.string().optional(),
+  accessType: z.enum(["read", "write", "execute"]).optional(),
+  inPageErrorStatus: z.string().optional(),
+  oomAllocationSizeBytes: z.number().optional(),
+  fastFailCode: z.number().optional(),
+  /** Crashpad annotations, limited to the keys crash telemetry keeps (app version, V8 heap, ...). */
+  annotations: z.record(z.string(), z.string()).optional(),
+  stack: CrashStackSchema.optional(),
+});
+
+export const CrashDumpsSchema = z.object({
+  /** Every dump kept on the machine (up to 5), newest first. */
+  dumps: z.array(CrashDumpSchema),
+  /**
+   * Set only on a report started from the crash dialog: the `file` of the
+   * dump the crash left, or null when no readable dump was tied to it (a
+   * force kill, the OOM killer, power loss, or a dump too damaged to read,
+   * which is still listed in `dumps`). The named dump may have been pruned since. A dump
+   * labelled "browser" is certain; one with no process label is matched only
+   * because the app did not quit cleanly, as with a main-process V8 OOM,
+   * and could instead be a child that ran out of memory.
+   */
+  triggeringDump: z.string().nullable().optional(),
+});
+
+export type CrashDump = z.infer<typeof CrashDumpSchema>;
+export type CrashDumps = z.infer<typeof CrashDumpsSchema>;
+
 // -- Top-level bundle --
 
 /**
@@ -275,6 +539,19 @@ export const SessionDebugBundleSchema = z.object({
   logs: z.string(),
   /** Auto-updater failure details (last in-process error + Squirrel log tail on Windows). Null if none. */
   updaterLogs: z.string().nullable(),
+  /**
+   * Process-level memory diagnostics: Electron process metrics, per-app child
+   * process tree RSS, and real system memory-pressure signals (darwin).
+   * Best-effort — sections may carry an `error` field instead of data. The
+   * shape is owned by src/utils/process_memory_diagnostics.ts. Each section
+   * can carry an error field so diagnostics failures never break the export.
+   */
+  memoryDiagnostics: ProcessMemoryDiagnosticsSchema.nullable(),
+  /**
+   * Stack traces from the native crash dumps kept on the machine. Absent when
+   * the reporter unticked them, and in bundles from older versions.
+   */
+  crashDumps: CrashDumpsSchema.optional(),
 });
 
 export type SessionDebugBundle = z.infer<typeof SessionDebugBundleSchema>;
@@ -297,6 +574,7 @@ export type { DeepLinkData } from "../deep_link_data";
 // =============================================================================
 
 export const AppOutputSchema = z.object({
+  previewAuth: PreviewAuthStatusSchema.optional(),
   type: z.enum([
     "stdout",
     "stderr",
@@ -307,12 +585,22 @@ export const AppOutputSchema = z.object({
     "sync-error",
     "sync-recovered",
     "app-exit",
+    "agent-lifecycle-started",
+    "agent-lifecycle-succeeded",
+    "agent-lifecycle-failed",
   ]),
   message: z.string(),
   appId: z.number(),
+  /** Correlation identity of the process/lifecycle producer when available. */
+  invocationRef: AppRunInvocationRefSchema.optional(),
+  warningKind: z.enum(["release-age", "pnpm-migration"]).optional(),
   timestamp: z.number().optional(),
   exitCode: z.number().nullable().optional(),
   signal: z.string().nullable().optional(),
+  lifecycleRequestId: z.string().optional(),
+  lifecycleOperation: z.enum(["restart", "rebuild"]).optional(),
+  lifecycleRuntimeMayBeLive: z.boolean().optional(),
+  runtimeBoundary: z.enum(["start", "restart", "rebuild"]).optional(),
 });
 
 export type AppOutput = z.infer<typeof AppOutputSchema>;
@@ -352,7 +640,11 @@ export const miscContracts = {
   // Session debug bundle
   getSessionDebugBundle: defineContract({
     channel: "get-session-debug-bundle",
-    input: z.number(), // chatId
+    input: z.object({
+      chatId: z.number(),
+      /** The report was started from the crash dialog. */
+      fromCrash: z.boolean(),
+    }),
     output: SessionDebugBundleSchema,
   }),
 
@@ -360,6 +652,17 @@ export const miscContracts = {
   addLog: defineContract({
     channel: "add-log",
     input: ConsoleEntrySchema,
+    output: z.void(),
+  }),
+
+  // Batched form for high-volume sources such as the preview console. The
+  // main store keeps only MAX_LOGS_PER_APP entries per app, so a larger
+  // batch would be trimmed anyway.
+  addLogs: defineContract({
+    channel: "add-logs",
+    input: z.object({
+      entries: z.array(ConsoleEntrySchema).max(MAX_LOGS_PER_APP),
+    }),
     output: z.void(),
   }),
 
@@ -415,7 +718,11 @@ export const miscEvents = {
 
   chatStreamStart: defineEvent({
     channel: "chat:stream:start",
-    payload: z.object({ chatId: z.number() }),
+    payload: z.object({
+      chatId: z.number(),
+      invocationRef: ChatStreamInvocationRefSchema.optional(),
+      streamId: z.number().optional(),
+    }),
   }),
 
   chatStreamEnd: defineEvent({
@@ -427,6 +734,8 @@ export const miscEvents = {
     channel: "toast:error",
     payload: z.object({
       message: z.string(),
+      persist: z.boolean().optional(),
+      toastId: z.string().optional(),
       action: z
         .object({
           label: z.string(),
@@ -434,6 +743,11 @@ export const miscEvents = {
         })
         .optional(),
     }),
+  }),
+
+  dismissToast: defineEvent({
+    channel: "toast:dismiss",
+    payload: z.object({ toastId: z.string() }),
   }),
 } as const;
 

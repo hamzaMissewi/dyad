@@ -1,7 +1,16 @@
-import { safeJoin } from "@/ipc/utils/path_utils";
+import {
+  assertMutationPathAllowed,
+  prepareDeletePath,
+  safeJoin,
+} from "@/ipc/utils/path_utils";
 import { describe, it, expect } from "vitest";
+import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
+
+function toPosixPath(value: string): string {
+  return value.replace(/\\/g, "/");
+}
 
 describe("safeJoin", () => {
   const testBaseDir = "/app/workspace";
@@ -51,13 +60,17 @@ describe("safeJoin", () => {
     it("should handle Windows-style relative paths with backslashes", () => {
       const result = safeJoin(testBaseDir, "src\\components\\Button.tsx");
       // safeJoin normalizes backslashes to forward slashes
-      expect(result).toBe("/app/workspace/src/components/Button.tsx");
+      expect(toPosixPath(result)).toBe(
+        "/app/workspace/src/components/Button.tsx",
+      );
     });
 
     it("should handle mixed forward/backslashes in relative paths", () => {
       const result = safeJoin(testBaseDir, "src/components\\ui/button.tsx");
       // safeJoin normalizes backslashes to forward slashes
-      expect(result).toBe("/app/workspace/src/components/ui/button.tsx");
+      expect(toPosixPath(result)).toBe(
+        "/app/workspace/src/components/ui/button.tsx",
+      );
     });
 
     it("should handle Windows-style nested directories", () => {
@@ -66,13 +79,15 @@ describe("safeJoin", () => {
         "pages\\home\\components\\index.tsx",
       );
       // safeJoin normalizes backslashes to forward slashes
-      expect(result).toBe("/app/workspace/pages/home/components/index.tsx");
+      expect(toPosixPath(result)).toBe(
+        "/app/workspace/pages/home/components/index.tsx",
+      );
     });
 
     it("should handle relative paths starting with dot and backslash", () => {
       const result = safeJoin(testBaseDir, ".\\src\\file.txt");
       // safeJoin normalizes backslashes to forward slashes
-      expect(result).toBe("/app/workspace/src/file.txt");
+      expect(toPosixPath(result)).toBe("/app/workspace/src/file.txt");
     });
   });
 
@@ -180,17 +195,19 @@ describe("safeJoin", () => {
       // These look like they could be problematic but are actually safe relative paths
       // safeJoin normalizes backslashes to forward slashes
       const result1 = safeJoin(testBaseDir, "C_drive\\file.txt");
-      expect(result1).toBe("/app/workspace/C_drive/file.txt");
+      expect(toPosixPath(result1)).toBe("/app/workspace/C_drive/file.txt");
 
       const result2 = safeJoin(testBaseDir, "src\\C-file.txt");
-      expect(result2).toBe("/app/workspace/src/C-file.txt");
+      expect(toPosixPath(result2)).toBe("/app/workspace/src/C-file.txt");
     });
 
     it("should handle Windows paths with multiple backslashes (not UNC)", () => {
       // Single backslashes in the middle are fine - it's only \\ at the start that's UNC
       // safeJoin normalizes backslashes to forward slashes
       const result = safeJoin(testBaseDir, "src\\\\components\\\\Button.tsx");
-      expect(result).toBe("/app/workspace/src/components/Button.tsx");
+      expect(toPosixPath(result)).toBe(
+        "/app/workspace/src/components/Button.tsx",
+      );
     });
 
     it("should provide descriptive error messages", () => {
@@ -227,5 +244,162 @@ describe("safeJoin", () => {
         /would escape the base directory/,
       );
     });
+  });
+});
+
+describe("assertMutationPathAllowed", () => {
+  it("canonicalizes contained aliases and rejects escaping symlinks", async () => {
+    const appPath = await fs.mkdtemp(path.join(os.tmpdir(), "dyad-app-"));
+    const outsidePath = await fs.mkdtemp(
+      path.join(os.tmpdir(), "dyad-outside-"),
+    );
+    try {
+      await fs.writeFile(path.join(appPath, "file.txt"), "in-app");
+      await fs.mkdir(path.join(appPath, "src"));
+      await fs.symlink(".", path.join(appPath, "self"), "dir");
+      await fs.symlink("file.txt", path.join(appPath, "in-app-file-link.txt"));
+      await fs.symlink(
+        path.join(outsidePath, "target.txt"),
+        path.join(appPath, "file-link.txt"),
+      );
+      await fs.symlink(outsidePath, path.join(appPath, "dir-link"), "dir");
+
+      await expect(
+        assertMutationPathAllowed({ appPath, relativePath: "file.txt" }),
+      ).resolves.toBe("file.txt");
+      await expect(
+        assertMutationPathAllowed({
+          appPath,
+          relativePath: "new/nested/file.txt",
+        }),
+      ).resolves.toBe("new/nested/file.txt");
+      await expect(
+        assertMutationPathAllowed({
+          appPath,
+          relativePath: "self/src/new-file.txt",
+        }),
+      ).resolves.toBe("src/new-file.txt");
+      await expect(
+        assertMutationPathAllowed({
+          appPath,
+          relativePath: "in-app-file-link.txt",
+        }),
+      ).resolves.toBe("file.txt");
+      await expect(
+        assertMutationPathAllowed({
+          appPath,
+          relativePath: "self/in-app-file-link.txt",
+          followFinalSymlink: false,
+        }),
+      ).resolves.toBe("in-app-file-link.txt");
+      await expect(
+        assertMutationPathAllowed({
+          appPath,
+          relativePath: "file-link.txt",
+        }),
+      ).rejects.toThrow("symlink");
+      await expect(
+        assertMutationPathAllowed({
+          appPath,
+          relativePath: "dir-link/new.txt",
+        }),
+      ).rejects.toThrow("outside the app");
+    } finally {
+      await fs.rm(appPath, { recursive: true, force: true });
+      await fs.rm(outsidePath, { recursive: true, force: true });
+    }
+  });
+
+  it.runIf(process.platform !== "win32")(
+    "rejects slash-terminated app-root and dangling symlink aliases",
+    async () => {
+      const appPath = await fs.mkdtemp(path.join(os.tmpdir(), "dyad-app-"));
+      const missingOutsidePath = path.join(
+        os.tmpdir(),
+        `dyad-missing-${Date.now()}`,
+      );
+      try {
+        await fs.symlink(".", path.join(appPath, "self"), "dir");
+        await fs.symlink(
+          missingOutsidePath,
+          path.join(appPath, "dangling"),
+          "dir",
+        );
+
+        await expect(
+          assertMutationPathAllowed({
+            appPath,
+            relativePath: "self/",
+          }),
+        ).rejects.toThrow("app root");
+        await expect(
+          assertMutationPathAllowed({
+            appPath,
+            relativePath: "dangling/",
+          }),
+        ).rejects.toThrow("symlink");
+      } finally {
+        await fs.rm(appPath, { recursive: true, force: true });
+        await fs.rm(missingOutsidePath, { recursive: true, force: true });
+      }
+    },
+  );
+});
+
+describe.runIf(process.platform !== "win32")("prepareDeletePath", () => {
+  it("preserves final symlinks but canonicalizes their ancestors", async () => {
+    const appPath = await fs.mkdtemp(path.join(os.tmpdir(), "dyad-delete-"));
+    try {
+      const functionPath = path.join(
+        appPath,
+        "supabase/functions/hello/index.ts",
+      );
+      await fs.mkdir(path.dirname(functionPath), { recursive: true });
+      await fs.writeFile(functionPath, "export default {};\n");
+      await fs.symlink(".", path.join(appPath, "self"), "dir");
+      await fs.symlink(
+        "supabase/functions/hello/index.ts",
+        path.join(appPath, "function-link"),
+      );
+      const realAppPath = await fs.realpath(appPath);
+
+      await expect(
+        prepareDeletePath(appPath, "self/supabase/functions/hello/index.ts"),
+      ).resolves.toEqual({
+        relativePath: "supabase/functions/hello/index.ts",
+        fullPath: path.join(realAppPath, "supabase/functions/hello/index.ts"),
+      });
+      await expect(
+        prepareDeletePath(appPath, "self/function-link/"),
+      ).resolves.toEqual({
+        relativePath: "function-link",
+        fullPath: path.join(realAppPath, "function-link"),
+      });
+    } finally {
+      await fs.rm(appPath, { recursive: true, force: true });
+    }
+  });
+
+  it("allows final symlinks but rejects symlinked ancestors that escape", async () => {
+    const appPath = await fs.mkdtemp(path.join(os.tmpdir(), "dyad-delete-"));
+    const outsidePath = await fs.mkdtemp(
+      path.join(os.tmpdir(), "dyad-outside-"),
+    );
+    try {
+      await fs.symlink(".", path.join(appPath, "self"), "dir");
+      await fs.symlink(outsidePath, path.join(appPath, "outside"), "dir");
+
+      const realAppPath = await fs.realpath(appPath);
+      await expect(prepareDeletePath(appPath, "self/")).resolves.toEqual({
+        relativePath: "self",
+        fullPath: path.join(realAppPath, "self"),
+      });
+      await expect(
+        prepareDeletePath(appPath, "outside/victim.txt"),
+      ).rejects.toThrow("outside the app");
+    } finally {
+      await fs.rm(appPath, { recursive: true, force: true });
+      await fs.rm(outsidePath, { recursive: true, force: true });
+    }
   });
 });

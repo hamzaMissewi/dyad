@@ -2,8 +2,36 @@ import fs from "node:fs/promises";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, it, expect } from "vitest";
+import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
+
+vi.mock("@/ipc/processors/supabase_dependency_analysis", async () => {
+  const { analyzeSupabaseDependencies } =
+    await import("../../workers/supabase_dependency_analysis/analyze");
+  const { resolveTypeScriptPackageJsonPathSync } =
+    await import("../../shared/node_module_resolution");
+  return {
+    runSupabaseDependencyAnalysis: async (input: {
+      appPath: string;
+      changedSharedModulePaths: string[];
+    }) => {
+      try {
+        resolveTypeScriptPackageJsonPathSync(input.appPath);
+      } catch {
+        return {
+          kind: "all" as const,
+          reason: { code: "typescript_not_installed" as const },
+        };
+      }
+      return analyzeSupabaseDependencies(
+        require("typescript"),
+        input.appPath,
+        input.changedSharedModulePaths,
+      );
+    },
+  };
+});
 import {
+  deployAffectedSupabaseFunctions,
   getSupabaseFunctionsAffectedBySharedModules,
   isServerFunction,
   isSharedServerModule,
@@ -238,6 +266,25 @@ describe("getSupabaseFunctionsAffectedBySharedModules", () => {
     expect(impact).toEqual({ kind: "partial", functionNames: ["alpha"] });
   });
 
+  it("ignores Node built-ins when finding affected functions", async () => {
+    await writeAppFile(
+      "supabase/functions/_shared/foo.ts",
+      "export const foo = 1;",
+    );
+    await writeFunction(
+      "alpha",
+      "import { text } from 'node:stream/consumers'; import '../_shared/foo.ts';",
+    );
+    await writeFunction("beta", "export const beta = 1;");
+
+    const impact = await getSupabaseFunctionsAffectedBySharedModules({
+      appPath,
+      changedSharedModulePaths: ["supabase/functions/_shared/foo.ts"],
+    });
+
+    expect(impact).toEqual({ kind: "partial", functionNames: ["alpha"] });
+  });
+
   it("follows transitive imports and re-exports", async () => {
     await writeAppFile(
       "supabase/functions/_shared/foo.ts",
@@ -355,6 +402,27 @@ describe("getSupabaseFunctionsAffectedBySharedModules", () => {
     expect(impact.kind).toBe("all");
   });
 
+  it("falls back when a function contains invalid syntax", async () => {
+    await writeAppFile(
+      "supabase/functions/_shared/foo.ts",
+      "export const foo = 1;",
+    );
+    await writeFunction("alpha", "import { from '../_shared/foo.ts';");
+
+    const impact = await getSupabaseFunctionsAffectedBySharedModules({
+      appPath,
+      changedSharedModulePaths: ["supabase/functions/_shared/foo.ts"],
+    });
+
+    expect(impact).toEqual({
+      kind: "all",
+      reason: {
+        code: "parse_failure",
+        filePath: "supabase/functions/alpha/index.ts",
+      },
+    });
+  });
+
   it("falls back for unsupported changed shared file extensions", async () => {
     await writeAppFile("supabase/functions/_shared/data.json", "{}");
     await writeFunction("alpha", "export const alpha = 1;");
@@ -364,7 +432,55 @@ describe("getSupabaseFunctionsAffectedBySharedModules", () => {
       changedSharedModulePaths: ["supabase/functions/_shared/data.json"],
     });
 
-    expect(impact).toMatchObject({ kind: "all" });
+    expect(impact).toEqual({
+      kind: "all",
+      reason: {
+        code: "unsupported_changed_shared_path",
+        filePath: "supabase/functions/_shared/data.json",
+      },
+    });
+  });
+
+  it("reports the importing file and specifier for unresolved imports", async () => {
+    await writeAppFile(
+      "supabase/functions/_shared/foo.ts",
+      "export const foo = 1;",
+    );
+    await writeFunction("alpha", "import '../_shared/missing.ts';");
+
+    const impact = await getSupabaseFunctionsAffectedBySharedModules({
+      appPath,
+      changedSharedModulePaths: ["supabase/functions/_shared/foo.ts"],
+    });
+
+    expect(impact).toEqual({
+      kind: "all",
+      reason: {
+        code: "unresolved_relative_import",
+        filePath: "supabase/functions/alpha/index.ts",
+        specifier: "../_shared/missing.ts",
+      },
+    });
+  });
+
+  it("falls back when the changed shared path is a directory", async () => {
+    await fs.mkdir(path.join(appPath, "supabase/functions/_shared/group.ts"), {
+      recursive: true,
+    });
+    await writeFunction("alpha", "export const alpha = 1;");
+
+    const impact = await getSupabaseFunctionsAffectedBySharedModules({
+      appPath,
+      changedSharedModulePaths: ["supabase/functions/_shared/group.ts"],
+    });
+
+    expect(impact).toEqual({
+      kind: "all",
+      reason: {
+        code: "changed_shared_directory",
+        filePath: "supabase/functions/_shared/group.ts",
+      },
+    });
   });
 
   it("falls back when app-local TypeScript is unavailable", async () => {
@@ -385,7 +501,68 @@ describe("getSupabaseFunctionsAffectedBySharedModules", () => {
 
     expect(impact).toEqual({
       kind: "all",
-      reason: "typescript_not_installed",
+      reason: { code: "typescript_not_installed" },
+    });
+  });
+});
+
+describe("deployAffectedSupabaseFunctions scope", () => {
+  let appPath: string;
+
+  beforeEach(async () => {
+    appPath = await fs.mkdtemp(path.join(os.tmpdir(), "dyad-deploy-scope-"));
+    await fs.mkdir(path.join(appPath, "node_modules"), { recursive: true });
+    await fs.symlink(
+      path.dirname(require.resolve("typescript/package.json")),
+      path.join(appPath, "node_modules", "typescript"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+  });
+
+  afterEach(async () => {
+    await fs.rm(appPath, { recursive: true, force: true });
+  });
+
+  it("reports a fallback when the changed shared paths are unknown", async () => {
+    const onScopeResolved = vi.fn();
+    await deployAffectedSupabaseFunctions({
+      appPath,
+      supabaseProjectId: "project-id",
+      supabaseOrganizationSlug: null,
+      skipPruneEdgeFunctions: true,
+      sharedModulesChanged: true,
+      changedSharedModulePaths: [],
+      pendingFunctionDeploys: [],
+      onScopeResolved,
+    });
+
+    expect(onScopeResolved).toHaveBeenCalledWith({
+      kind: "all",
+      reason: { code: "changed_shared_paths_missing" },
+    });
+  });
+
+  it("reports the shared-module trigger for targeted deploys", async () => {
+    const onScopeResolved = vi.fn();
+    await deployAffectedSupabaseFunctions({
+      appPath,
+      supabaseProjectId: "project-id",
+      supabaseOrganizationSlug: null,
+      skipPruneEdgeFunctions: true,
+      sharedModulesChanged: true,
+      changedSharedModulePaths: [
+        "supabase/functions/_shared/foo.ts",
+        "supabase/functions/_shared/foo.ts",
+      ],
+      pendingFunctionDeploys: ["alpha"],
+      onScopeResolved,
+    });
+
+    expect(onScopeResolved).toHaveBeenCalledWith({
+      kind: "affected",
+      changedSharedModulePaths: ["supabase/functions/_shared/foo.ts"],
+      affectedFunctionNames: [],
+      editedFunctionNames: ["alpha"],
     });
   });
 });

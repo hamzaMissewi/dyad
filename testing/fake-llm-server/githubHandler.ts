@@ -2,6 +2,9 @@ import { Request, Response } from "express";
 import * as path from "path";
 import * as fs from "fs";
 import * as os from "os";
+import { execFileSync, spawn } from "child_process";
+import { fakeLlmLog } from "./log";
+import { gzipSync } from "node:zlib";
 
 const gitHttpMiddlewareFactory = require("git-http-mock-server/middleware");
 
@@ -16,6 +19,105 @@ interface PushEvent {
 
 const pushEvents: PushEvent[] = [];
 
+// Parse the git receive-pack protocol body for ref updates
+// ("old-sha new-sha refs/heads/branch-name") and record them for the
+// /github/api/test/push-events endpoint.
+function recordPushEvents(repoName: string, body: string): PushEvent[] {
+  const events: PushEvent[] = [];
+  try {
+    const lines = body.split("\n");
+    lines.forEach((line) => {
+      const refMatch = line.match(
+        // eslint-disable-next-line
+        /([0-9a-f]{40})\s+([0-9a-f]{40})\s+refs\/heads\/([^\s\u0000]+)/,
+      );
+      if (refMatch) {
+        const [, oldSha, newSha, branchName] = refMatch;
+        const isDelete = newSha === "0".repeat(40);
+        const isCreate = oldSha === "0".repeat(40);
+
+        let operation: "push" | "create" | "delete" = "push";
+        if (isDelete) operation = "delete";
+        else if (isCreate) operation = "create";
+
+        const event: PushEvent = {
+          timestamp: new Date(),
+          repo: repoName,
+          branch: branchName,
+          operation,
+          commitSha: isDelete ? oldSha : newSha,
+        };
+
+        events.push(event);
+        pushEvents.push(event);
+
+        fakeLlmLog(
+          `* Recorded ${operation} to ${repoName}/${branchName}, commit: ${isDelete ? oldSha : newSha}`,
+        );
+      }
+    });
+  } catch (error) {
+    console.error("* Error parsing git protocol:", error);
+  }
+  return events;
+}
+
+function ensureBareRepoHeadTracksCreatedBranch(
+  bareRepoPath: string,
+  events: PushEvent[],
+) {
+  const createdBranch = events.find(
+    (event) => event.operation === "create",
+  )?.branch;
+  if (!createdBranch) {
+    return;
+  }
+
+  let headRef: string;
+  try {
+    headRef = execFileSync(
+      "git",
+      ["--git-dir", bareRepoPath, "symbolic-ref", "--quiet", "HEAD"],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    )
+      .toString()
+      .trim();
+  } catch {
+    return;
+  }
+
+  try {
+    execFileSync(
+      "git",
+      ["--git-dir", bareRepoPath, "show-ref", "--verify", "--quiet", headRef],
+      { stdio: "ignore" },
+    );
+    return;
+  } catch {
+    // Continue below: HEAD points at a default branch ref that has not been
+    // created, so clones need it retargeted to the first pushed branch.
+  }
+
+  try {
+    execFileSync(
+      "git",
+      [
+        "--git-dir",
+        bareRepoPath,
+        "symbolic-ref",
+        "HEAD",
+        `refs/heads/${createdBranch}`,
+      ],
+      { stdio: "pipe" },
+    );
+  } catch (error) {
+    console.warn(
+      "* Warning: failed to set symbolic-ref HEAD on bare repo",
+      error,
+    );
+  }
+}
+
 // Mock data for testing
 const mockAccessToken = "fake_access_token_12345";
 const mockDeviceCode = "fake_device_code_12345";
@@ -28,13 +130,13 @@ const mockUser = {
 
 let mockReposRoot = fs.mkdtempSync(path.join(os.tmpdir(), "dyad-git-mock-"));
 
-const mockRepos = [
+const initialMockRepos = [
   {
     id: 1,
     name: "test-repo-1",
     full_name: "testuser/test-repo-1",
     private: false,
-    owner: { login: "testuser" },
+    owner: { login: "testuser", id: 12345 },
     default_branch: "main",
   },
   {
@@ -42,7 +144,7 @@ const mockRepos = [
     name: "test-repo-2",
     full_name: "testuser/test-repo-2",
     private: true,
-    owner: { login: "testuser" },
+    owner: { login: "testuser", id: 12345 },
     default_branch: "main",
   },
   {
@@ -50,7 +152,7 @@ const mockRepos = [
     name: "existing-app",
     full_name: "testuser/existing-app",
     private: false,
-    owner: { login: "testuser" },
+    owner: { login: "testuser", id: 12345 },
     default_branch: "main",
   },
   // A repo that is pre-seeded with real content (Vite app) so it can be
@@ -61,10 +163,12 @@ const mockRepos = [
     name: "existing-vite-app",
     full_name: "testuser/existing-vite-app",
     private: false,
-    owner: { login: "testuser" },
+    owner: { login: "testuser", id: 12345 },
     default_branch: "main",
   },
 ];
+
+let mockRepos = structuredClone(initialMockRepos);
 
 const mockBranches = [
   { name: "main", commit: { sha: "abc123" } },
@@ -79,6 +183,33 @@ const repoCollaborators: Record<
 > = {};
 
 // Store device flow state
+let deviceFlowResponseMode: "plain" | "gzip-chunked" = "plain";
+let deviceFlowOutcome: "success" | "pending" | "access_denied" = "success";
+
+export function handleDeviceFlowConfig(req: Request, res: Response) {
+  deviceFlowResponseMode =
+    req.body.mode === "gzip-chunked" ? "gzip-chunked" : "plain";
+  deviceFlowOutcome =
+    req.body.outcome === "pending" || req.body.outcome === "access_denied"
+      ? req.body.outcome
+      : "success";
+  res.json({ mode: deviceFlowResponseMode, outcome: deviceFlowOutcome });
+}
+
+function sendDeviceFlowJson(res: Response, body: unknown) {
+  if (deviceFlowResponseMode === "plain") return res.json(body);
+  const compressed = gzipSync(JSON.stringify(body));
+  res.setHeader("Content-Type", "application/json");
+  res.setHeader("Content-Encoding", "gzip");
+  // write/end (rather than send) deliberately avoids Content-Length. Flush
+  // headers and send two chunks across event-loop turns, including the gzip
+  // trailer, so real clients must decompress and finish reading the stream.
+  res.setHeader("Transfer-Encoding", "chunked");
+  res.flushHeaders();
+  res.write(compressed.subarray(0, compressed.length - 8));
+  setImmediate(() => res.end(compressed.subarray(compressed.length - 8)));
+}
+
 let deviceFlowState = {
   deviceCode: mockDeviceCode,
   userCode: mockUserCode,
@@ -88,7 +219,7 @@ let deviceFlowState = {
 
 // GitHub Device Flow - Step 1: Get device code
 export function handleDeviceCode(req: Request, res: Response) {
-  console.log("* GitHub Device Code requested");
+  fakeLlmLog("* GitHub Device Code requested");
 
   // Reset state for new flow
   deviceFlowState = {
@@ -98,7 +229,7 @@ export function handleDeviceCode(req: Request, res: Response) {
     pollCount: 0,
   };
 
-  res.json({
+  sendDeviceFlowJson(res, {
     device_code: mockDeviceCode,
     user_code: mockUserCode,
     verification_uri: "https://github.com/login/device",
@@ -110,14 +241,14 @@ export function handleDeviceCode(req: Request, res: Response) {
 
 // GitHub Device Flow - Step 2: Poll for access token
 export function handleAccessToken(req: Request, res: Response) {
-  console.log("* GitHub Access Token polling", {
+  fakeLlmLog("* GitHub Access Token polling", {
     pollCount: deviceFlowState.pollCount,
   });
 
   const { device_code } = req.body;
 
   if (device_code !== mockDeviceCode) {
-    return res.status(400).json({
+    return sendDeviceFlowJson(res.status(400), {
       error: "invalid_request",
       error_description: "Invalid device code",
     });
@@ -125,10 +256,17 @@ export function handleAccessToken(req: Request, res: Response) {
 
   deviceFlowState.pollCount++;
 
+  if (deviceFlowOutcome === "access_denied") {
+    return sendDeviceFlowJson(res, {
+      error: "access_denied",
+      error_description: "The user denied authorization",
+    });
+  }
+
   // Simulate authorization after 3 polls (for testing)
-  if (deviceFlowState.pollCount >= 3) {
+  if (deviceFlowState.pollCount >= 3 && deviceFlowOutcome !== "pending") {
     deviceFlowState.authorized = true;
-    return res.json({
+    return sendDeviceFlowJson(res, {
       access_token: mockAccessToken,
       token_type: "bearer",
       scope: "repo,user,workflow",
@@ -136,7 +274,7 @@ export function handleAccessToken(req: Request, res: Response) {
   }
 
   // Return pending status
-  res.status(400).json({
+  sendDeviceFlowJson(res.status(400), {
     error: "authorization_pending",
     error_description: "The authorization request is still pending",
   });
@@ -144,7 +282,7 @@ export function handleAccessToken(req: Request, res: Response) {
 
 // Get authenticated user info
 export function handleUser(req: Request, res: Response) {
-  console.log("* GitHub User info requested");
+  fakeLlmLog("* GitHub User info requested");
 
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.includes(mockAccessToken)) {
@@ -158,7 +296,7 @@ export function handleUser(req: Request, res: Response) {
 
 // Get user emails
 export function handleUserEmails(req: Request, res: Response) {
-  console.log("* GitHub User emails requested");
+  fakeLlmLog("* GitHub User emails requested");
 
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.includes(mockAccessToken)) {
@@ -179,7 +317,7 @@ export function handleUserEmails(req: Request, res: Response) {
 
 // List user repositories
 export function handleUserRepos(req: Request, res: Response) {
-  console.log("* GitHub User repos requested");
+  fakeLlmLog("* GitHub User repos requested");
 
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.includes(mockAccessToken)) {
@@ -194,7 +332,7 @@ export function handleUserRepos(req: Request, res: Response) {
   } else if (req.method === "POST") {
     // Create repo
     const { name, private: isPrivate } = req.body;
-    console.log("* Creating repository:", name);
+    fakeLlmLog("* Creating repository:", name);
 
     // Check if repo already exists
     const existingRepo = mockRepos.find((repo) => repo.name === name);
@@ -217,7 +355,7 @@ export function handleUserRepos(req: Request, res: Response) {
       name,
       full_name: `${mockUser.login}/${name}`,
       private: !!isPrivate,
-      owner: { login: mockUser.login },
+      owner: { login: mockUser.login, id: mockUser.id },
       default_branch: "main",
     };
 
@@ -236,7 +374,7 @@ export function handleUserRepos(req: Request, res: Response) {
 
 // Get repository info
 export function handleRepo(req: Request, res: Response) {
-  console.log("* GitHub Repo info requested");
+  fakeLlmLog("* GitHub Repo info requested");
 
   const { owner, repo } = req.params;
   const authHeader = req.headers.authorization;
@@ -259,8 +397,34 @@ export function handleRepo(req: Request, res: Response) {
 }
 
 // Get repository branches
+export function handleRepoBranch(req: Request, res: Response) {
+  const { owner, repo, branch } = req.params;
+  if (!req.headers.authorization?.includes(mockAccessToken)) {
+    return res.status(401).json({ message: "Bad credentials" });
+  }
+  if (!mockRepos.some((item) => item.full_name === `${owner}/${repo}`)) {
+    return res.status(404).json({ message: "Not Found" });
+  }
+  try {
+    const sha = execFileSync(
+      "git",
+      [
+        "--git-dir",
+        path.join(mockReposRoot, `${repo}.git`),
+        "rev-parse",
+        "--verify",
+        `refs/heads/${branch}`,
+      ],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+    ).trim();
+    return res.json({ name: branch, commit: { sha } });
+  } catch {
+    return res.status(404).json({ message: "Branch not found" });
+  }
+}
+
 export function handleRepoBranches(req: Request, res: Response) {
-  console.log("* GitHub Repo branches requested");
+  fakeLlmLog("* GitHub Repo branches requested");
 
   const { owner, repo } = req.params;
   const authHeader = req.headers.authorization;
@@ -284,7 +448,7 @@ export function handleRepoBranches(req: Request, res: Response) {
 
 // Create repository for organization (not implemented in mock)
 export function handleOrgRepos(req: Request, res: Response) {
-  console.log("* GitHub Org repos requested");
+  fakeLlmLog("* GitHub Org repos requested");
 
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.includes(mockAccessToken)) {
@@ -298,7 +462,7 @@ export function handleOrgRepos(req: Request, res: Response) {
 }
 
 export function handleRepoCollaborators(req: Request, res: Response) {
-  console.log("* GitHub Repo collaborators requested");
+  fakeLlmLog("* GitHub Repo collaborators requested");
 
   const { owner, repo } = req.params;
   const authHeader = req.headers.authorization;
@@ -349,7 +513,7 @@ export function handleRepoCollaborators(req: Request, res: Response) {
 
 // Push event management functions for testing
 export function handleGetPushEvents(req: Request, res: Response) {
-  console.log("* Getting push events");
+  fakeLlmLog("* Getting push events");
   const { repo } = req.query;
 
   const events = repo ? pushEvents.filter((e) => e.repo === repo) : pushEvents;
@@ -358,34 +522,43 @@ export function handleGetPushEvents(req: Request, res: Response) {
 }
 
 export function handleClearPushEvents(req: Request, res: Response) {
-  console.log("* Clearing push events");
+  fakeLlmLog("* Clearing push events");
   pushEvents.length = 0;
   res.json({ cleared: true, timestamp: new Date() });
 }
 
 export function handleResetRepos(req: Request, res: Response) {
-  console.log("* Resetting repos root");
+  fakeLlmLog("* Resetting repos root");
   try {
     fs.rmSync(mockReposRoot, { recursive: true, force: true });
   } catch (err) {
     console.warn("* Warning: failed to remove old repos root", err);
   }
   mockReposRoot = fs.mkdtempSync(path.join(os.tmpdir(), "dyad-git-mock-"));
-  console.log(`* New repos root: ${mockReposRoot}`);
+  // Retries reuse the server process. Reset the API catalog alongside the
+  // bare repositories so names created by a previous attempt are available.
+  mockRepos = structuredClone(initialMockRepos);
+  deployKeysByRepo.clear();
+  for (const repo of Object.keys(repoCollaborators)) {
+    delete repoCollaborators[repo];
+  }
+  pushEvents.length = 0;
+  fakeLlmLog(`* New repos root: ${mockReposRoot}`);
   res.json({ reset: true, timestamp: new Date() });
 }
 
 // Handle Git operations (push, pull, clone, etc.) using git-http-mock-server
 export function handleGitPush(req: Request, res: Response, next?: Function) {
-  console.log("* GitHub Git operation requested:", req.method, req.url);
+  const requestReposRoot = mockReposRoot;
+  fakeLlmLog("* GitHub Git operation requested:", req.method, req.url);
   // Log request headers to see git operation details
-  console.log("* Git Headers:", {
+  fakeLlmLog("* Git Headers:", {
     "git-protocol": req.headers["git-protocol"],
     "content-type": req.headers["content-type"],
     "user-agent": req.headers["user-agent"],
   });
 
-  console.error(`* Using git repos directory: ${mockReposRoot}`);
+  fakeLlmLog(`* Using git repos directory: `);
   // Create git middleware instance for this request
   const gitHttpMiddleware = gitHttpMiddlewareFactory({
     root: mockReposRoot,
@@ -399,57 +572,11 @@ export function handleGitPush(req: Request, res: Response, next?: Function) {
   const repoName = match?.[1];
 
   if (repoName) {
-    console.log(`* Git operation for repo: ${repoName}`);
-    // Track push events if this is a git-receive-pack (push) operation
-    if (req.url.includes("/git-receive-pack") && req.method === "POST") {
-      console.log("* Git PUSH operation detected for repo:", repoName);
-      // Collect request body to parse git protocol
-      let body = "";
-      req.on("data", (chunk) => {
-        body += chunk.toString();
-      });
-      req.on("end", () => {
-        try {
-          // Parse git pack protocol for branch refs
-          // Git protocol sends refs in format: "old-sha new-sha refs/heads/branch-name"
-          const lines = body.split("\n");
-          lines.forEach((line) => {
-            // Look for lines containing refs/heads/
-            const refMatch = line.match(
-              // eslint-disable-next-line
-              /([0-9a-f]{40})\s+([0-9a-f]{40})\s+refs\/heads\/([^\s\u0000]+)/,
-            );
-            if (refMatch) {
-              const [, oldSha, newSha, branchName] = refMatch;
-              const isDelete = newSha === "0".repeat(40);
-              const isCreate = oldSha === "0".repeat(40);
-
-              let operation: "push" | "create" | "delete" = "push";
-              if (isDelete) operation = "delete";
-              else if (isCreate) operation = "create";
-
-              pushEvents.push({
-                timestamp: new Date(),
-                repo: repoName,
-                branch: branchName,
-                operation,
-                commitSha: isDelete ? oldSha : newSha,
-              });
-
-              console.log(
-                `* Recorded ${operation} to ${repoName}/${branchName}, commit: ${isDelete ? oldSha : newSha}`,
-              );
-            }
-          });
-        } catch (error) {
-          console.error("* Error parsing git protocol:", error);
-        }
-      });
-    }
+    fakeLlmLog(`* Git operation for repo: ${repoName}`);
     // Ensure the bare git repository exists for this repo
     const bareRepoPath = path.join(mockReposRoot, `${repoName}.git`);
     if (!fs.existsSync(bareRepoPath)) {
-      console.log(`* Creating bare git repository at: ${bareRepoPath}`);
+      fakeLlmLog(`* Creating bare git repository at: ${bareRepoPath}`);
       try {
         fs.mkdirSync(bareRepoPath, { recursive: true });
         const { execSync } = require("child_process");
@@ -528,7 +655,7 @@ export function handleGitPush(req: Request, res: Response, next?: Function) {
           }
         }
 
-        console.log(
+        fakeLlmLog(
           `* Successfully created bare git repository: ${repoName}.git`,
         );
       } catch (error) {
@@ -539,6 +666,75 @@ export function handleGitPush(req: Request, res: Response, next?: Function) {
         });
       }
     }
+    // Handle pushes (git-receive-pack POST) ourselves against the REAL bare
+    // repo. The git-http-mock-server middleware would run receive-pack against
+    // a throwaway fixturez COPY of it, so pushes over HTTP would never update
+    // the repo — later clones/pulls would see stale (usually empty) history.
+    // Buffering the body also lets us parse push events without racing the
+    // middleware's own `req.pipe(...)` for the stream.
+    if (req.url.includes("/git-receive-pack") && req.method === "POST") {
+      fakeLlmLog("* Git PUSH operation detected for repo:", repoName);
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk) => {
+        chunks.push(Buffer.from(chunk));
+      });
+      req.on("end", () => {
+        // A reset can run while the request body is arriving. Never record
+        // events or start receive-pack for a discarded repository generation.
+        if (requestReposRoot !== mockReposRoot) {
+          res.status(409).end();
+          return;
+        }
+        const rawBody = Buffer.concat(chunks);
+        const recordedEvents = recordPushEvents(
+          repoName,
+          rawBody.toString("latin1"),
+        );
+
+        const env = req.headers["git-protocol"]
+          ? {
+              ...process.env,
+              GIT_PROTOCOL: String(req.headers["git-protocol"]),
+            }
+          : process.env;
+        res.setHeader("content-type", "application/x-git-receive-pack-result");
+        const ps = spawn(
+          "git-receive-pack",
+          ["--stateless-rpc", bareRepoPath],
+          { env },
+        );
+        ps.on("error", (error) => {
+          console.error("* git-receive-pack failed to spawn:", error);
+          if (!res.headersSent) {
+            res.status(500);
+          }
+          res.end();
+        });
+        // If the child exits before consuming its whole stdin (bad pack,
+        // spawn race), the pending write EPIPEs; without a handler that's an
+        // uncaught stream error that takes down the whole fake server.
+        ps.stdin.on("error", (error) => {
+          console.error("* git-receive-pack stdin error:", error);
+        });
+        ps.stdin.write(rawBody);
+        ps.stdin.end();
+        ps.stdout.pipe(res);
+        ps.on("close", (code) => {
+          if (code === 0 && requestReposRoot === mockReposRoot) {
+            ensureBareRepoHeadTracksCreatedBranch(bareRepoPath, recordedEvents);
+          }
+        });
+        // Deliberately NOT killing the child on client disconnect: its input
+        // is fully buffered above, so it always terminates on its own, and
+        // killing receive-pack mid-ref-update is what would leave stale locks
+        // in the bare repo.
+        fakeLlmLog(
+          `* [git-http-server] 200 POST    ${req.url} (persistent receive-pack)`,
+        );
+      });
+      return;
+    }
+
     // Rewrite the URL to match what the middleware expects
     // Change /github/git/testuser/test-repo.git/... to /github/git/test-repo.git/...
     const rewrittenUrl = req.url.replace(
@@ -546,7 +742,7 @@ export function handleGitPush(req: Request, res: Response, next?: Function) {
       "/github/git/",
     );
     req.url = rewrittenUrl;
-    console.log(`* Rewritten URL from ${urlPath} to ${rewrittenUrl}`);
+    fakeLlmLog(`* Rewritten URL from ${urlPath} to ${rewrittenUrl}`);
   }
   // Use git-http-mock-server middleware to handle the actual git operations
   gitHttpMiddleware(
@@ -555,7 +751,7 @@ export function handleGitPush(req: Request, res: Response, next?: Function) {
     next ||
       (() => {
         // Fallback if middleware doesn't handle the request
-        console.log(
+        fakeLlmLog(
           `* Git middleware did not handle request: ${req.method} ${req.url}`,
         );
         res.status(404).json({
@@ -565,4 +761,70 @@ export function handleGitPush(req: Request, res: Response, next?: Function) {
         });
       }),
   );
+}
+
+/**
+ * Deploy keys, per repository.
+ *
+ * A re-POST of the same key answers 422 "already in use", which is the branch
+ * the deploy pipeline takes when it re-deploys an app it has already set up.
+ */
+const deployKeysByRepo = new Map<
+  string,
+  Array<{ id: number; title: string; key: string; read_only: boolean }>
+>();
+let nextDeployKeyId = 1;
+
+/** Material only: GitHub returns a key without its trailing comment. */
+function keyMaterial(key: string): string {
+  return key.trim().split(/\s+/).slice(0, 2).join(" ");
+}
+
+export function handleListDeployKeys(req: Request, res: Response) {
+  const { owner, repo } = req.params;
+  if (!req.headers.authorization?.includes(mockAccessToken)) {
+    return res.status(401).json({ message: "Bad credentials" });
+  }
+  const known = mockRepos.some((r) => r.full_name === `${owner}/${repo}`);
+  if (!known) {
+    // As every other repository endpoint does. Without this a test against a
+    // deleted or inaccessible repository reads as a successful registration.
+    return res.status(404).json({ message: "Not Found" });
+  }
+  return res.json(deployKeysByRepo.get(`${owner}/${repo}`) ?? []);
+}
+
+export function handleCreateDeployKey(req: Request, res: Response) {
+  const { owner, repo } = req.params;
+  if (!req.headers.authorization?.includes(mockAccessToken)) {
+    return res.status(401).json({ message: "Bad credentials" });
+  }
+  const known = mockRepos.some((r) => r.full_name === `${owner}/${repo}`);
+  if (!known) {
+    // As every other repository endpoint does. Without this a test against a
+    // deleted or inaccessible repository reads as a successful registration.
+    return res.status(404).json({ message: "Not Found" });
+  }
+  const fullName = `${owner}/${repo}`;
+  const material = keyMaterial(String(req.body?.key ?? ""));
+  const existing = deployKeysByRepo.get(fullName) ?? [];
+  if (existing.some((k) => keyMaterial(k.key) === material)) {
+    return res.status(422).json({
+      message: "Validation Failed",
+      errors: [{ message: "key is already in use" }],
+    });
+  }
+  const created = {
+    id: nextDeployKeyId++,
+    title: String(req.body?.title ?? ""),
+    key: String(req.body?.key ?? ""),
+    read_only: req.body?.read_only !== false,
+  };
+  deployKeysByRepo.set(fullName, [...existing, created]);
+  return res.status(201).json(created);
+}
+
+export function handleClearDeployKeys(_req: Request, res: Response) {
+  deployKeysByRepo.clear();
+  return res.json({ ok: true });
 }

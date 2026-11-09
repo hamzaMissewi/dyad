@@ -5,11 +5,16 @@
 import { z } from "zod";
 import { IpcMainInvokeEvent } from "electron";
 import { jsonrepair } from "jsonrepair";
-import { AgentToolConsent } from "@/lib/schemas";
+import { AgentToolConsent, type UserSettings } from "@/lib/schemas";
 import { AgentTodo } from "@/ipc/types";
+import type { SubagentPersona } from "@/ipc/types";
 import type { AppFrameworkType } from "@/lib/framework_constants";
+import { resolveLinkedDatabaseProvider } from "@/shared/database_provider";
 import type { SqlConsentMetadata } from "@/shared/sqlConsentMetadata";
 import type { McpToolDef } from "./mcp_type_defs";
+import type { SuggestablePlugin } from "./suggest_plugin";
+import type { MutationActivityOwner } from "../subagents/mutation_activity_tracker";
+import type { McpTranscriptBudget } from "@/ipc/utils/mcp_transcript_preview";
 
 // ============================================================================
 // XML Escape Helpers
@@ -39,7 +44,48 @@ export interface FileEditTracker {
   };
 }
 
+/**
+ * Tools beyond write_file/search_replace whose invocation still changes the
+ * app or its data, so a `run_tests` rerun after one of them is meaningful.
+ * Feeds `AgentContext.mutationCount` after successful execution (including
+ * sandbox write_file host calls).
+ * Turn-scoped bookkeeping tools (update_todos, plan/blueprint tools) and
+ * run_tests itself are deliberately excluded — they can't change a test's
+ * outcome.
+ */
+export const APP_MUTATING_TOOL_NAMES = [
+  "copy_file",
+  "delete_file",
+  "rename_file",
+  "add_dependency",
+  "execute_sql",
+  "add_integration",
+  "enable_nitro",
+  "generate_image",
+  "generate_test_assertions",
+  "git_restore_file",
+  "reinstall_and_restart_app",
+] as const;
+export type AppMutatingToolName = (typeof APP_MUTATING_TOOL_NAMES)[number];
+
 export interface AgentContext {
+  /** Refresh the final callable inventory immediately before safety review. */
+  refreshShellReviewTools?: () => void;
+  /** Recovery journal is needed only for Claude-owned conversations. */
+  persistQuestionnaireRecovery?: boolean;
+  /** Host-recorded evidence for mandatory shell review, shared across tool calls. */
+  shellReviewContext?: {
+    tools: { name: string; description: string; available: boolean }[];
+    history: {
+      tool: string;
+      args: string;
+      outcome: "returned" | "execution_failed" | "not_executed_or_denied";
+    }[];
+  };
+  /** Accepted root settings, including resolved mode and billing account. */
+  inferenceSettings?: UserSettings;
+  /** Owner-scoped identity used to join only this root turn's mutations. */
+  mutationActivityOwner?: MutationActivityOwner;
   event: IpcMainInvokeEvent;
   appId: number;
   appPath: string;
@@ -51,7 +97,9 @@ export interface AgentContext {
    * absolute app path.
    */
   referencedApps: Map<string, string>;
+  referencedAppIds?: Map<string, number>;
   chatId: number;
+  planAcceptInNewChat?: boolean;
   supabaseProjectId: string | null;
   supabaseOrganizationSlug: string | null;
   neonProjectId: string | null;
@@ -63,6 +111,10 @@ export interface AgentContext {
   sharedServerModulePaths: string[];
   /** Function deploys skipped because a shared module had already changed. */
   pendingFunctionDeploys: string[];
+  /** Remote function deletions deferred until root-owned finalization. */
+  pendingFunctionDeletes?: string[];
+  /** Preserve remote Supabase functions that are absent from local files. */
+  skipPruneEdgeFunctions?: boolean;
   chatSummary?: string;
   /** Turn-scoped todo list for agent task tracking */
   todos: Todo[];
@@ -70,11 +122,95 @@ export interface AgentContext {
   dyadRequestId: string;
   /** Tracks file edit tool usage per file for telemetry */
   fileEditTracker: FileEditTracker;
+  /** True after a tool has successfully changed workspace contents this turn. */
+  workspaceMutated?: boolean;
+  /** True after any directly registered or sandbox-hosted MCP tool succeeds. */
+  mcpToolRan?: boolean;
+  /** Turn-scoped allowance for MCP payloads copied into the transcript. */
+  mcpTranscriptBudget?: McpTranscriptBudget;
+  /**
+   * Featured catalog plugins the user has not added, resolved once per turn.
+   * Drives `suggest_plugin`'s availability and description.
+   */
+  suggestablePlugins?: SuggestablePlugin[];
+  /** Lazily refreshes provider context and prompt for writable Implementers. */
+  refreshImplementerContext?: () => Promise<{
+    systemPrompt: string;
+    supabaseProjectId: string | null;
+    supabaseOrganizationSlug: string | null;
+    neonProjectId: string | null;
+    neonActiveBranchId: string | null;
+    supabaseProviderToolsAvailable: boolean;
+    neonProviderToolsAvailable: boolean;
+    frameworkType: AppFrameworkType | null;
+    testingEnabled: boolean;
+  }>;
+  /** Capability-aware provider-less prompt used if context refresh fails. */
+  implementerFallbackSystemPrompt?: string;
+  /** Whether Supabase metadata/schema reads are currently authenticated. */
+  supabaseProviderToolsAvailable?: boolean;
+  /** Whether Neon metadata/schema reads are currently authenticated. */
+  neonProviderToolsAvailable?: boolean;
+  /** Successful workspace-file mutations completed during this turn. */
+  fileMutationCount?: number;
+  /**
+   * Turn-scoped count of successfully completed tool invocations that change
+   * the app or its data: file edits (including sandbox write_file host calls)
+   * plus the tools in `APP_MUTATING_TOOL_NAMES`. This is the
+   * signal for `run_tests`' require-a-change guards, which must see fixes made
+   * through ANY mutating tool — not just write_file/search_replace.
+   */
+  mutationCount?: number;
+  /** Propagates successful child-tool mutations to the owning root turn. */
+  onWorkspaceMutation?: (didMutateFile?: boolean) => void;
+  /** Whether Git had an executable pre-commit hook when this turn started. */
+  preCommitHookAvailable?: boolean;
+  /** Actual pre-commit hook processes started during this turn. */
+  preCommitRunCount?: number;
+  /** File mutation count observed when the last pre-commit run started. */
+  preCommitFileMutationCountAtLastRun?: number;
+  /** Git snapshot after the last completed pre-commit run, when measurable. */
+  preCommitGitStateFingerprintAtLastRun?: string;
+  /** Whether the last completed pre-commit run passed. */
+  preCommitLastRunPassed?: boolean;
   /**
    * If true, the user has Dyad Pro enabled.
    * Engine-dependent tools require this to access the Dyad Pro API.
    */
   isDyadPro: boolean;
+  /** The durable child thread currently executing this tool, if any. */
+  subagentThreadId?: string;
+  /** Persona for a child tool invocation. Root turns leave this undefined. */
+  subagentPersona?: "explorer" | "reviewer" | "implementer";
+  /** Advisory path focus projected into an Implementer's assignment; not enforced at runtime. */
+  subagentPathScope?: string[];
+  /** Child threads spawned by this root turn, joined before deploy/commit. */
+  spawnedSubagentThreadIds?: string[];
+  /** Implementer children that must finish before root deploy/commit. */
+  spawnedImplementerThreadIds?: string[];
+  /** Successfully cancelled Implementers whose preserved edits need a warning. */
+  cancelledImplementerNames?: string[];
+  /** Explorer reports already returned directly to the root as tool results. */
+  deliveredExplorerThreadIds?: string[];
+  /**
+   * Whether file tools may deploy server functions immediately. Implementer
+   * children disable this so deployment stays owned by the root turn.
+   */
+  allowDeploySideEffects?: boolean;
+  /** Propagates child shared-module edits to the root turn's deploy tracker. */
+  onSharedServerModuleChange?: (relativePath: string) => void;
+  /** Propagates child function deploy work to the root turn. */
+  onDeferredFunctionDeploy?: (functionName: string) => void;
+  /** Propagates child function deletion work to the root turn. */
+  onDeferredFunctionDelete?: (functionName: string) => void;
+  /** Turn-scoped schema gates for root orchestration tools. */
+  canUseExplorerSubagent?: boolean;
+  /** True when settings or the selected Auto Sidekick model enables it. */
+  canUseImplementerSubagent?: boolean;
+  /** Whether root turns may manage and message existing child threads. */
+  canUseAdvancedSubagentTools?: boolean;
+  /** Whether run_type_checks accepts no paths and reports the whole project. */
+  runTypeScriptForWholeProject?: boolean;
   /**
    * If true, this turn is using a Dyad Free model. Some Pro-enabled
    * conveniences, such as MCP auto-approval, should stay disabled.
@@ -90,11 +226,40 @@ export interface AgentContext {
    * Call this once when the tool's XML output is complete.
    */
   onXmlComplete: (finalXml: string) => void;
+  /**
+   * Optional durable presentation sink used by sub-agents. The generic tool
+   * wrapper calls it with the AI SDK call identity so parallel child tools
+   * cannot overwrite one another's UI activity.
+   */
+  onToolActivity?: (activity: {
+    toolCallId: string;
+    toolName: string;
+    status: "pending" | "completed" | "error" | "aborted";
+    presentationXml: string;
+    inputJson?: Record<string, unknown>;
+    outputText?: string;
+    error?: string;
+  }) => Promise<void>;
+  /**
+   * Re-read this turn's assistant message from the DB and adopt it as the
+   * in-progress response. Only for a tool that blocks while something outside
+   * the stream rewrites a card it already committed (the assertion review
+   * card's approval latch): without this the turn's stale in-memory copy is
+   * written back over that rewrite by the next append.
+   */
+  resyncResponseFromDb?: () => Promise<void>;
   requireConsent: (params: {
     toolName: string;
+    confirmation?: "shell-approval" | "shell-review-retry";
     toolDescription?: string | null;
     inputPreview?: string | null;
     metadata?: SqlConsentMetadata | null;
+    abortSignal?: AbortSignal;
+    subagent?: {
+      threadId: string;
+      persona: Extract<SubagentPersona, "explorer" | "implementer">;
+      taskName: string;
+    };
   }) => Promise<boolean>;
   /**
    * Append a user message to be sent after the tool result.
@@ -153,6 +318,17 @@ export interface AgentContext {
    */
   enableAppBlueprint?: boolean;
   /**
+   * True after planning_questionnaire successfully returns user answers during
+   * this or a prior persisted turn. The initial app blueprint requires this
+   * latch so an invalid or dismissed questionnaire cannot be skipped by the
+   * model without forcing duplicate questions across turns.
+   */
+  appBlueprintQuestionnaireCompleted?: boolean;
+  /** Whether planning_questionnaire is exposed in this turn's tool set. */
+  planningQuestionnaireAvailable?: boolean;
+  /** True after write_app_blueprint persists a blueprint during this turn. */
+  appBlueprintWrittenThisTurn?: boolean;
+  /**
    * Whether MCP tool search may be used this turn. Gates registration of the
    * search_mcp_tools and get_mcp_tool_schema tools. The handler sets this to
    * true if both of the following are true:
@@ -161,6 +337,126 @@ export interface AgentContext {
    * When false, the sandbox inlines every tool declaration instead.
    */
   isMcpToolSearchAvailable?: boolean;
+  /**
+   * Whether the app has opted into E2E testing (apps.testingEnabled). Gates the
+   * `run_tests` tool, mirroring how `testingEnabled` gates the test-writing
+   * guidance in the system prompt.
+   */
+  testingEnabled: boolean;
+  /**
+   * Turn-scoped `run_tests` attempt tracking, keyed by normalized spec path.
+   * Created fresh per turn like `fileEditTracker`, so the 4-attempt fix cap
+   * resets each turn.
+   */
+  testRunAttempts: Map<string, TestRunAttemptState>;
+  /**
+   * Batches started by `run_tests` during this turn, across all specs. Includes
+   * infrastructure failures; preflight/dev-server refusals do not increment it.
+   */
+  testRunCount?: number;
+  /** Whether reinstall_and_restart_app is registered in this turn's effective tool set. */
+  reinstallAndRestartAppToolAvailable?: boolean;
+  /** Turn-scoped production-build attempts and unchanged-rerun guard. */
+  buildAttemptState?: {
+    count: number;
+    mutationCountAtLastRun?: number;
+    mutationCountAtLastSetupFailure?: number;
+  };
+}
+
+export function canUseSupabaseTools<
+  T extends Pick<
+    AgentContext,
+    "supabaseProjectId" | "supabaseProviderToolsAvailable"
+  >,
+>(ctx: T): ctx is T & { supabaseProjectId: string } {
+  return !!ctx.supabaseProjectId && ctx.supabaseProviderToolsAvailable === true;
+}
+
+export function canUseNeonTools<
+  T extends Pick<
+    AgentContext,
+    "neonProjectId" | "neonActiveBranchId" | "neonProviderToolsAvailable"
+  >,
+>(ctx: T): ctx is T & { neonProjectId: string; neonActiveBranchId: string } {
+  return (
+    !!ctx.neonProjectId &&
+    !!ctx.neonActiveBranchId &&
+    ctx.neonProviderToolsAvailable === true
+  );
+}
+
+export function canUseLinkedDatabaseTools(
+  ctx: Pick<
+    AgentContext,
+    | "supabaseProjectId"
+    | "supabaseProviderToolsAvailable"
+    | "neonProjectId"
+    | "neonActiveBranchId"
+    | "neonProviderToolsAvailable"
+  >,
+): boolean {
+  const provider = resolveLinkedDatabaseProvider({
+    hasSupabaseProject: Boolean(ctx.supabaseProjectId),
+    hasNeonProject: Boolean(ctx.neonProjectId),
+  });
+  return provider === "neon"
+    ? canUseNeonTools(ctx)
+    : provider === "supabase"
+      ? canUseSupabaseTools(ctx)
+      : false;
+}
+
+export function getUnavailableDatabaseProviderMessage(
+  ctx: Pick<
+    AgentContext,
+    | "supabaseProjectId"
+    | "neonProjectId"
+    | "neonActiveBranchId"
+    | "supabaseProviderToolsAvailable"
+    | "neonProviderToolsAvailable"
+  >,
+  operation: "SQL execution" | "schema inspection",
+): string {
+  const provider = resolveLinkedDatabaseProvider({
+    hasSupabaseProject: Boolean(ctx.supabaseProjectId),
+    hasNeonProject: Boolean(ctx.neonProjectId),
+  });
+  if (provider === "neon") {
+    if (!ctx.neonActiveBranchId) {
+      return `Neon is linked, but no active branch is configured for ${operation}. Select an active branch in the Neon integration settings.`;
+    }
+    return `Neon is linked, but its credentials are unavailable for ${operation}. Reconnect the Neon account.`;
+  }
+  if (provider === "supabase") {
+    return `Supabase is linked, but its organization credentials are unavailable for ${operation}. Reconnect the Supabase organization.`;
+  }
+  return `No database provider is available for ${operation}`;
+}
+
+/** Per-spec fix-loop state for the `run_tests` tool, tracked across one turn. */
+export interface TestRunAttemptState {
+  /** Failed runs counted toward the per-spec cap (infra/flake runs excluded). */
+  attempts: number;
+  /** Normalized failure signature of the last failing run, for no-progress detection. */
+  lastFailureSignature?: string;
+  /** `AgentContext.mutationCount` at the last run, for the require-a-change guard. */
+  fileEditCountAtLastRun?: number;
+  /**
+   * Canonical key for the tests targeted by the last run. Changing what's
+   * targeted is itself a meaningful change, so the require-a-change guard
+   * doesn't block e.g. widening from a subset to the whole file after a fix.
+   */
+  lastRunTargetKey?: string;
+  /** Whether the one free `flakeCheck` rerun has been used for this spec. */
+  flakeCheckUsed?: boolean;
+  /**
+   * `AgentContext.mutationCount` at the time each target last PASSED, keyed by
+   * canonical target ("" = whole file). Rerunning a target that already passed
+   * with no file changes since is refused — some models otherwise loop
+   * re-running already-green tests.
+   */
+  passedAtEditCount?: Record<string, number>;
 }
 
 // ============================================================================
@@ -199,19 +495,26 @@ export type UserMessageContentPart =
   | { type: "text"; text: string }
   | { type: "image-url"; url: string };
 
-/**
- * Tool result can be a simple string or a structured result with content parts
- */
+/** Tool result text returned to the model. */
 export type ToolResult = string;
 
 // ============================================================================
 // Tool Definition Interface
 // ============================================================================
 
+export type ToolDescriptionContext = Pick<
+  AgentContext,
+  "runTypeScriptForWholeProject" | "suggestablePlugins"
+> & { appPath?: string };
+
 export interface ToolDefinition<T = any> {
   readonly name: string;
   readonly description: string;
+  /** Build a turn-specific description when capabilities change tool behavior. */
+  readonly getDescription?: (ctx: ToolDescriptionContext) => string;
   readonly inputSchema: z.ZodType<T>;
+  /** Build a turn-specific schema when capabilities change the valid input. */
+  readonly getInputSchema?: (ctx: AgentContext) => z.ZodType<T>;
   readonly defaultConsent: AgentToolConsent;
   /**
    * If true, this tool modifies state (files, database, etc.).
@@ -221,6 +524,20 @@ export interface ToolDefinition<T = any> {
    */
   readonly modifiesState?: boolean | ((ctx: AgentContext) => boolean);
   /**
+   * Allows a state-modifying orchestration tool in Ask and Plan when its
+   * turn-scoped capabilities cannot mutate the app or external state.
+   */
+  readonly allowInReadOnlyModes?: boolean | ((ctx: AgentContext) => boolean);
+  /** Sub-agent capability; hidden and runtime-rejected for non-Pro users. */
+  readonly subagentOnly?: boolean;
+  /** How finalization tracks this tool's workspace mutation activity. */
+  readonly mutationTracking?: "automatic" | "internal" | "none";
+  /**
+   * Whether this state-modifying tool must wait for app-blueprint approval.
+   * Set false for durable orchestration metadata that cannot change the app.
+   */
+  readonly requiresBlueprintApproval?: boolean;
+  /**
    * If true, this tool calls a Dyad Engine endpoint outside the main model
    * generation endpoint.
    */
@@ -228,10 +545,12 @@ export interface ToolDefinition<T = any> {
   execute: (args: T, ctx: AgentContext) => Promise<ToolResult>;
 
   /**
-   * If defined, returns whether the tool should be available in the current context.
-   * If it returns false, the tool will be filtered out.
+   * Authorization/feature eligibility, enforced at discovery and invocation.
+   * Use isDiscoverable for operational readiness and routing preferences.
    */
   isEnabled?: (ctx: AgentContext) => boolean;
+  /** Discovery preference only, not authorization. Existing calls remain valid. */
+  isDiscoverable?: (ctx: AgentContext) => boolean;
 
   /**
    * Returns a preview string describing what the tool will do with the given args.
@@ -249,6 +568,28 @@ export interface ToolDefinition<T = any> {
   getConsentMetadata?: (args: T) => SqlConsentMetadata | null | undefined;
 
   /**
+   * For state-modifying tools, returns whether a successful execution actually
+   * changed app state. Required for tools in APP_MUTATING_TOOL_NAMES so handled
+   * failures and no-op results do not unblock run_tests. File-edit tools that
+   * return successfully default to true.
+   */
+  shouldTrackMutation?: (
+    args: T,
+    result: ToolResult,
+    ctx: AgentContext,
+  ) => boolean;
+
+  /**
+   * Overrides whether a successful app mutation changed Git-visible workspace
+   * files. Use for tools whose file impact depends on their result or context.
+   */
+  shouldTrackFileMutation?: (
+    args: T,
+    result: ToolResult,
+    ctx: AgentContext,
+  ) => boolean | Promise<boolean>;
+
+  /**
    * Build XML from parsed partial args.
    * Called by the handler during streaming and on completion.
    *
@@ -257,4 +598,12 @@ export interface ToolDefinition<T = any> {
    * @returns The XML string, or undefined if not enough args yet
    */
   buildXml?: (args: Partial<T>, isComplete: boolean) => string | undefined;
+}
+
+/** Resolve the description exposed for a tool in the current turn. */
+export function resolveToolDescription<T>(
+  tool: ToolDefinition<T>,
+  ctx: ToolDescriptionContext,
+): string {
+  return tool.getDescription?.(ctx) ?? tool.description;
 }

@@ -8,6 +8,10 @@ import {
   appendAttachmentManifestEntries,
   getDyadMediaDir,
 } from "@/ipc/utils/media_path_utils";
+import {
+  AGENT_READ_FILE_RESULT_LIMIT_BYTES,
+  AGENT_READ_FILE_TRUNCATION_NOTICE,
+} from "@/ipc/utils/bounded_text_file";
 
 // Mock electron-log
 vi.mock("electron-log", () => ({
@@ -89,6 +93,8 @@ line 5`;
       todos: [],
       dyadRequestId: "test-request",
       fileEditTracker: {},
+      testingEnabled: true,
+      testRunAttempts: new Map(),
       onXmlStream: vi.fn(),
       onXmlComplete: vi.fn(),
       requireConsent: vi.fn().mockResolvedValue(true),
@@ -109,6 +115,13 @@ line 5`;
 
     it("has defaultConsent set to always", () => {
       expect(readFileTool.defaultConsent).toBe("always");
+    });
+
+    it("recommends batching only concretely useful reads", () => {
+      expect(readFileTool.description).toContain(
+        "when several files are concretely likely to be useful",
+      );
+      expect(readFileTool.description).not.toContain("always better");
     });
 
     it("requires path", () => {
@@ -194,6 +207,96 @@ line 5`;
       expect(result).toBe("");
     });
 
+    it("redacts non-empty dotenv values while preserving empty values", async () => {
+      await fs.promises.writeFile(
+        path.join(testDir, ".env.local"),
+        [
+          "API_KEY=sk-123",
+          "EMPTY=",
+          "SPACED_EMPTY=   ",
+          'QUOTED_EMPTY=""',
+          "export TOKEN = secret",
+          "# dotenv comment",
+        ].join("\n"),
+      );
+
+      const result = await readFileTool.execute(
+        { path: ".env.local" },
+        mockContext,
+      );
+
+      expect(result).toBe(
+        [
+          "API_KEY=[redacted]",
+          "EMPTY=",
+          "SPACED_EMPTY=   ",
+          'QUOTED_EMPTY=""',
+          "export TOKEN = [redacted]",
+          "# dotenv comment",
+        ].join("\n"),
+      );
+      expect(result).not.toContain("sk-123");
+      expect(result).not.toContain("secret");
+    });
+
+    it("redacts dotenv values in .envrc files", async () => {
+      await fs.promises.writeFile(
+        path.join(testDir, ".envrc"),
+        "export API_KEY=sk-123",
+      );
+
+      await expect(
+        readFileTool.execute({ path: ".envrc" }, mockContext),
+      ).resolves.toBe("export API_KEY=[redacted]");
+    });
+
+    it("sanitizes the full dotenv file before selecting a line range", async () => {
+      await fs.promises.writeFile(
+        path.join(testDir, ".env"),
+        'SECRET="top\nc2VjcmV0=\nbottom"\nEMPTY=',
+      );
+
+      await expect(
+        readFileTool.execute(
+          {
+            path: ".env",
+            start_line_one_indexed: 2,
+            end_line_one_indexed_inclusive: 2,
+          },
+          mockContext,
+        ),
+      ).resolves.toBe("[redacted]");
+    });
+
+    it("keeps expanded dotenv redaction within the result byte limit", async () => {
+      await fs.promises.writeFile(
+        path.join(testDir, ".env"),
+        "x\n".repeat(AGENT_READ_FILE_RESULT_LIMIT_BYTES),
+      );
+
+      const result = await readFileTool.execute({ path: ".env" }, mockContext);
+
+      expect(Buffer.byteLength(result, "utf8")).toBeLessThanOrEqual(
+        AGENT_READ_FILE_RESULT_LIMIT_BYTES,
+      );
+      expect(result.endsWith(AGENT_READ_FILE_TRUNCATION_NOTICE)).toBe(true);
+    });
+
+    it.runIf(process.platform !== "win32")(
+      "redacts dotenv files reached through symlink aliases",
+      async () => {
+        await fs.promises.writeFile(path.join(testDir, ".env"), "TOKEN=secret");
+        await fs.promises.symlink(
+          path.join(testDir, ".env"),
+          path.join(testDir, "config.txt"),
+        );
+
+        await expect(
+          readFileTool.execute({ path: "config.txt" }, mockContext),
+        ).resolves.toBe("TOKEN=[redacted]");
+      },
+    );
+
     it("throws error for non-existent file", async () => {
       await expect(
         readFileTool.execute({ path: "nope.txt" }, mockContext),
@@ -211,6 +314,104 @@ line 5`;
       );
 
       expect(result).toBe("attachment line 2\n");
+    });
+
+    it("redacts dotenv attachments even under a suffixed name", async () => {
+      const mediaDir = getDyadMediaDir(testDir);
+      // An ordinary dotenv entry unpacked from an archive, a suffixed archive
+      // entry, and a suffixed plain upload stored without an extension.
+      await fs.promises.mkdir(path.join(mediaDir, "hash", "a"), {
+        recursive: true,
+      });
+      await fs.promises.writeFile(
+        path.join(mediaDir, "hash", "a", ".env"),
+        "ZIPPED=1",
+      );
+      await fs.promises.mkdir(path.join(mediaDir, "hash", "b"), {
+        recursive: true,
+      });
+      await fs.promises.writeFile(
+        path.join(mediaDir, "hash", "b", ".env"),
+        "ALIASED=1",
+      );
+      await fs.promises.writeFile(
+        path.join(mediaDir, "plainhash"),
+        "UPLOADED=1",
+      );
+      const entry = (
+        logicalName: string,
+        originalName: string,
+        storedFileName: string,
+      ) => ({
+        logicalName,
+        originalName,
+        storedFileName,
+        mimeType: "text/plain",
+        sizeBytes: 8,
+        createdAt: new Date("2026-04-22T00:00:00.000Z").toISOString(),
+      });
+      await appendAttachmentManifestEntries(testDir, [
+        entry("proj.zip/a/.env", "a/.env", "hash/a/.env"),
+        entry("proj.zip/a/.env-2", "b/.env", "hash/b/.env"),
+        entry(".env-2", ".env", "plainhash"),
+      ]);
+
+      for (const [logicalPath, expected] of [
+        ["attachments:proj.zip/a/.env", "ZIPPED=[redacted]"],
+        ["attachments:proj.zip/a/.env-2", "ALIASED=[redacted]"],
+        ["attachments:.env-2", "UPLOADED=[redacted]"],
+      ]) {
+        await expect(
+          readFileTool.execute({ path: logicalPath }, mockContext),
+        ).resolves.toBe(expected);
+      }
+    });
+
+    it("returns a bounded result with an explicit truncation notice", async () => {
+      await fs.promises.writeFile(
+        path.join(testDir, "large.txt"),
+        "a".repeat(AGENT_READ_FILE_RESULT_LIMIT_BYTES * 2),
+      );
+
+      const result = await readFileTool.execute(
+        { path: "large.txt" },
+        mockContext,
+      );
+
+      expect(Buffer.byteLength(result, "utf8")).toBeLessThanOrEqual(
+        AGENT_READ_FILE_RESULT_LIMIT_BYTES,
+      );
+      expect(result.endsWith(AGENT_READ_FILE_TRUNCATION_NOTICE)).toBe(true);
+    });
+
+    it("streams a narrow range from an oversized file without truncating it", async () => {
+      await fs.promises.writeFile(
+        path.join(testDir, "large-ranged.txt"),
+        `${"skip\n".repeat(100_000)}target line\n`,
+      );
+
+      const result = await readFileTool.execute(
+        {
+          path: "large-ranged.txt",
+          start_line_one_indexed: 100_001,
+          end_line_one_indexed_inclusive: 100_001,
+        },
+        mockContext,
+      );
+
+      expect(result).toBe("target line\n");
+      expect(result).not.toContain("Output truncated");
+    });
+
+    it("rejects binary files", async () => {
+      await fs.promises.writeFile(
+        path.join(testDir, "binary.dat"),
+        Buffer.from([0x61, 0x00, 0x62]),
+      );
+
+      await expect(
+        readFileTool.execute({ path: "binary.dat" }, mockContext),
+      ).rejects.toThrow("Cannot read binary file as UTF-8 text: binary.dat");
     });
   });
 
@@ -588,6 +789,28 @@ line 5`;
         ),
       ).rejects.toThrow(/Cannot read \.dyad\/ paths from referenced apps/);
     });
+
+    it.runIf(process.platform !== "win32")(
+      "blocks symlinks into a referenced app's protected .dyad directory",
+      async () => {
+        mockContext.referencedApps.set("other-app", otherAppDir);
+        const dyadDir = path.join(otherAppDir, ".dyad");
+        await fs.promises.mkdir(dyadDir, { recursive: true });
+        const privateFile = path.join(dyadDir, "private.txt");
+        await fs.promises.writeFile(privateFile, "private");
+        await fs.promises.symlink(
+          privateFile,
+          path.join(otherAppDir, "public-link.txt"),
+        );
+
+        await expect(
+          readFileTool.execute(
+            { path: "public-link.txt", app_name: "other-app" },
+            mockContext,
+          ),
+        ).rejects.toThrow(/Cannot read \.dyad\/ paths from referenced apps/);
+      },
+    );
 
     it("allows .dyad/ paths on the current app (no app_name)", async () => {
       const dyadDir = path.join(testDir, ".dyad");

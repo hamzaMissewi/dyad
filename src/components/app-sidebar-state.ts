@@ -7,7 +7,7 @@ export type AppSidebarHoverState =
 
 export type AppSidebarPanel = "Apps" | "Settings" | "Library";
 
-export type AppSidebarItemTitle = AppSidebarPanel | "Hub";
+export type AppSidebarItemTitle = AppSidebarPanel | "Templates" | "Plugins";
 
 export function getRouteSidebarPanel(pathname: string): AppSidebarPanel | null {
   if (
@@ -43,6 +43,22 @@ export function getHoverSidebarPanel(
     return "Library";
   }
   return null;
+}
+
+export function shouldExpandSidebarForHover({
+  hoverState,
+  sidebarState,
+  isPointerOverSidebar,
+}: {
+  hoverState: AppSidebarHoverState;
+  sidebarState: "expanded" | "collapsed";
+  isPointerOverSidebar: boolean;
+}) {
+  return (
+    isPointerOverSidebar &&
+    sidebarState === "collapsed" &&
+    hoverState.startsWith("start-hover")
+  );
 }
 
 export function getSelectedSidebarPanel({
@@ -82,7 +98,10 @@ export function isSidebarItemActive({
   if (title === "Library") {
     return pathname.startsWith("/library");
   }
-  return pathname.startsWith("/hub");
+  if (title === "Templates") {
+    return pathname.startsWith("/templates");
+  }
+  return pathname.startsWith("/plugins");
 }
 
 export function shouldShowSelectedAppChatList({

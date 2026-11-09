@@ -1,4 +1,6 @@
 import { z } from "zod";
+import { ClaudeCodeModelsSchema } from "../../shared/claude_code_models";
+import { ClaudeCodeUsageSchema } from "../../shared/claude_code_usage";
 import {
   defineContract,
   defineStream,
@@ -7,10 +9,21 @@ import {
 } from "../contracts/core";
 import {
   ChatModeSchema,
+  ModelSelectionSchema,
   StoredChatModeSchema,
   migrateStoredChatMode,
   type ChatMode,
 } from "../../lib/schemas";
+import {
+  CHAT_ATTACHMENT_COUNT_LIMIT_MESSAGE,
+  MAX_CHAT_ATTACHMENTS,
+  MAX_CHAT_COMPONENT_FIELD_CHARS,
+  MAX_CHAT_COMPONENT_SELECTIONS,
+  MAX_CHAT_PROMPT_CHARS,
+  MAX_CHAT_WIRE_ID_CHARS,
+  validateSerializedChatAttachments,
+} from "../../shared/chatAttachmentLimits";
+import type { ChatStreamInvocationRef } from "@/chat_stream/invocation";
 
 // =============================================================================
 // Chat Schemas
@@ -21,6 +34,7 @@ import {
  */
 export const MessageSchema = z.object({
   id: z.number(),
+  chatTurnIntentId: z.string().nullable().optional(),
   role: z.enum(["user", "assistant"]),
   content: z.string(),
   approvalState: z.enum(["approved", "rejected"]).nullable().optional(),
@@ -39,6 +53,13 @@ export const NullableChatModeSchema = StoredChatModeSchema.nullable().transform(
   (mode): ChatMode | null => migrateStoredChatMode(mode ?? undefined) ?? null,
 );
 
+export const ReferencedAppSchema = z.object({
+  id: z.number(),
+  name: z.string(),
+});
+
+export type ReferencedApp = z.infer<typeof ReferencedAppSchema>;
+
 /**
  * Schema for a Chat object.
  */
@@ -50,6 +71,13 @@ export const ChatSchema = z.object({
   initialCommitHash: z.string().nullable().optional(),
   dbTimestamp: z.string().nullable().optional(),
   chatMode: NullableChatModeSchema,
+  modelSelection: ModelSelectionSchema.nullable().optional(),
+  executionBackend: z.enum(["dyad", "claude-code"]).optional(),
+  /**
+   * Apps referenced via `@app:Name` that stay readable for the rest of the
+   * chat in agent-backed modes.
+   */
+  referencedApps: z.array(ReferencedAppSchema).default([]),
 });
 
 export type Chat = z.infer<typeof ChatSchema>;
@@ -58,10 +86,10 @@ export type Chat = z.infer<typeof ChatSchema>;
  * Schema for component selection (used in chat context).
  */
 export const ComponentSelectionSchema = z.object({
-  id: z.string(),
-  name: z.string(),
-  runtimeId: z.string().optional(),
-  relativePath: z.string(),
+  id: z.string().max(MAX_CHAT_COMPONENT_FIELD_CHARS),
+  name: z.string().max(MAX_CHAT_COMPONENT_FIELD_CHARS),
+  runtimeId: z.string().max(MAX_CHAT_COMPONENT_FIELD_CHARS).optional(),
+  relativePath: z.string().max(MAX_CHAT_COMPONENT_FIELD_CHARS),
   lineNumber: z.number(),
   columnNumber: z.number(),
 });
@@ -69,14 +97,34 @@ export const ComponentSelectionSchema = z.object({
 export type ComponentSelection = z.infer<typeof ComponentSelectionSchema>;
 
 /**
- * Schema for file attachment in chat (base64 encoded for IPC transfer).
+ * Shape of a serialized chat attachment, without the size-limit refinement.
+ * Use this for data that was already size-validated at the submission boundary
+ * (e.g. persisted queued prompts): re-running the size check on every
+ * round-trip wastes CPU, and tightening the limits later would retroactively
+ * reject stored data that was valid when written.
  */
-export const ChatAttachmentSchema = z.object({
-  name: z.string(),
-  type: z.string(),
+export const ChatAttachmentShapeSchema = z.object({
+  name: z.string().max(1024),
+  type: z.string().max(256),
   data: z.string(), // Base64 encoded
   attachmentType: z.enum(["upload-to-codebase", "chat-context"]),
 });
+
+/**
+ * Schema for file attachment in chat (base64 encoded for IPC transfer).
+ */
+export const ChatAttachmentSchema = ChatAttachmentShapeSchema.superRefine(
+  (attachment, context) => {
+    const validation = validateSerializedChatAttachments([attachment]);
+    if (!validation.ok) {
+      context.addIssue({
+        code: "custom",
+        path: ["data"],
+        message: validation.message,
+      });
+    }
+  },
+);
 
 export type ChatAttachment = z.infer<typeof ChatAttachmentSchema>;
 
@@ -90,16 +138,65 @@ export interface FileAttachment {
 }
 
 /**
+ * Reject excessive counts before Zod parses any attachment payloads. Keeping
+ * this as an outer pipeline avoids walking arbitrarily many large base64
+ * strings before reporting the count violation.
+ */
+const ChatAttachmentsSchema = z
+  .unknown()
+  .superRefine((value, context) => {
+    if (Array.isArray(value) && value.length > MAX_CHAT_ATTACHMENTS) {
+      context.addIssue({
+        code: "custom",
+        message: CHAT_ATTACHMENT_COUNT_LIMIT_MESSAGE,
+      });
+    }
+  })
+  .pipe(z.array(ChatAttachmentSchema));
+
+/**
  * Schema for chat stream parameters.
  */
-export const ChatStreamParamsSchema = z.object({
-  chatId: z.number(),
-  prompt: z.string(),
-  redo: z.boolean().optional(),
-  attachments: z.array(ChatAttachmentSchema).optional(),
-  selectedComponents: z.array(ComponentSelectionSchema).optional(),
-  requestedChatMode: ChatModeSchema.optional(),
-});
+export const ChatStreamInvocationRefSchema: z.ZodType<ChatStreamInvocationRef> =
+  z.object({
+    kind: z.literal("chat-stream"),
+    entityKey: z.number(),
+    operationId: z.string().min(1).max(MAX_CHAT_WIRE_ID_CHARS),
+  });
+
+export const ChatStreamParamsSchema = z
+  .object({
+    chatId: z.number(),
+    appId: z.number().int().positive().optional(),
+    /** Correlation identity for new renderers. */
+    invocationRef: ChatStreamInvocationRefSchema.optional(),
+    /** @deprecated Compatibility with renderer generations predating InvocationRef. */
+    streamId: z.number().optional(),
+    prompt: z.string().max(MAX_CHAT_PROMPT_CHARS),
+    /** Durable idempotency identity owned by the main chat actor. */
+    intentId: z.string().min(1).max(256).optional(),
+    redo: z.boolean().optional(),
+    attachments: ChatAttachmentsSchema.optional(),
+    selectedComponents: z
+      .array(ComponentSelectionSchema)
+      .max(MAX_CHAT_COMPONENT_SELECTIONS)
+      .optional(),
+    requestedChatMode: ChatModeSchema.nullable().optional(),
+    userInputRequestId: z.string().max(MAX_CHAT_WIRE_ID_CHARS).optional(),
+    planAcceptInNewChat: z.boolean().optional(),
+  })
+  .superRefine((params, context) => {
+    const validation = validateSerializedChatAttachments(
+      params.attachments ?? [],
+    );
+    if (!validation.ok) {
+      context.addIssue({
+        code: "custom",
+        path: ["attachments"],
+        message: validation.message,
+      });
+    }
+  });
 
 export type ChatStreamParams = z.infer<typeof ChatStreamParamsSchema>;
 
@@ -159,6 +256,9 @@ export type StreamingPreview = z.infer<typeof StreamingPreviewSchema>;
  */
 export const ChatResponseChunkSchema = z.object({
   chatId: z.number(),
+  invocationRef: ChatStreamInvocationRefSchema.optional(),
+  /** @deprecated Compatibility with main processes predating InvocationRef. */
+  streamId: z.number().optional(),
   messages: z.array(MessageSchema).optional(),
   streamingMessageId: z.number().optional(),
   streamingPatch: StreamingPatchSchema.optional(),
@@ -168,7 +268,7 @@ export const ChatResponseChunkSchema = z.object({
   // only acks when chunkSeq is present.
   chunkSeq: z.number().int().nonnegative().finite().optional(),
   effectiveChatMode: ChatModeSchema.optional(),
-  chatModeFallbackReason: z.literal("quota-exhausted").optional(),
+  acceptedUserInputRequestId: z.string().optional(),
 });
 
 export type ChatResponseChunk = z.infer<typeof ChatResponseChunkSchema>;
@@ -178,6 +278,9 @@ export type ChatResponseChunk = z.infer<typeof ChatResponseChunkSchema>;
  */
 export const ChatResponseEndSchema = z.object({
   chatId: z.number(),
+  invocationRef: ChatStreamInvocationRefSchema.optional(),
+  /** @deprecated Compatibility with main processes predating InvocationRef. */
+  streamId: z.number().optional(),
   updatedFiles: z.boolean(),
   extraFiles: z.array(z.string()).optional(),
   extraFilesError: z.string().optional(),
@@ -189,6 +292,10 @@ export const ChatResponseEndSchema = z.object({
   wasCancelled: z.boolean().optional(),
   /** Indicates queued prompts should be paused after this stream completes */
   pausePromptQueue: z.boolean().optional(),
+  /** Indicates the queue pause was requested for the automatic review barrier. */
+  reviewBarrierRequested: z.boolean().optional(),
+  /** Prevents renderer-owned background review for modes that forbid sub-agents. */
+  suppressAutoReview: z.boolean().optional(),
 });
 
 export type ChatResponseEnd = z.infer<typeof ChatResponseEndSchema>;
@@ -198,6 +305,9 @@ export type ChatResponseEnd = z.infer<typeof ChatResponseEndSchema>;
  */
 export const ChatResponseErrorSchema = z.object({
   chatId: z.number(),
+  invocationRef: ChatStreamInvocationRefSchema.optional(),
+  /** @deprecated Compatibility with main processes predating InvocationRef. */
+  streamId: z.number().optional(),
   error: z.string(),
   warningMessages: z.array(z.string()).optional(),
 });
@@ -214,9 +324,30 @@ export const UpdateChatParamsSchema = z.object({
   chatId: z.number(),
   title: z.string().optional(),
   chatMode: ChatModeSchema.nullable().optional(),
+  modelSelection: ModelSelectionSchema.optional(),
 });
 
 export type UpdateChatParams = z.infer<typeof UpdateChatParamsSchema>;
+
+export const RemoveChatReferencedAppParamsSchema = z.object({
+  chatId: z.number(),
+  appId: z.number(),
+});
+
+export type RemoveChatReferencedAppParams = z.infer<
+  typeof RemoveChatReferencedAppParamsSchema
+>;
+
+export const SetChatFavoriteParamsSchema = z.object({
+  chatId: z.number(),
+  isFavorite: z.boolean(),
+});
+
+export type SetChatFavoriteParams = z.infer<typeof SetChatFavoriteParamsSchema>;
+
+export const SetChatFavoriteResultSchema = z.object({
+  isFavorite: z.boolean(),
+});
 
 /**
  * Schema for token count params.
@@ -265,6 +396,7 @@ export const chatContracts = {
         title: z.string().nullable(),
         createdAt: z.date(),
         chatMode: NullableChatModeSchema,
+        isFavorite: z.boolean(),
       }),
     ),
   }),
@@ -278,9 +410,31 @@ export const chatContracts = {
       title: z.string().nullable(),
       createdAt: z.date(),
       chatMode: NullableChatModeSchema,
+      isFavorite: z.boolean(),
     }),
   }),
 
+  claudeCodeModels: defineContract({
+    channel: "claude-code:models",
+    input: z.void(),
+    output: ClaudeCodeModelsSchema,
+  }),
+  claudeCodeUsage: defineContract({
+    channel: "claude-code:usage",
+    input: z.void(),
+    output: ClaudeCodeUsageSchema,
+  }),
+  claudeCodeStatus: defineContract({
+    channel: "claude-code:status",
+    input: z.object({ force: z.boolean().optional() }).optional(),
+    output: z.object({
+      installed: z.boolean(),
+      connected: z.boolean(),
+      compatible: z.boolean(),
+      version: z.string().nullable(),
+      detail: z.string(),
+    }),
+  }),
   createChat: defineContract({
     channel: "create-chat",
     input: z.union([
@@ -288,27 +442,52 @@ export const chatContracts = {
       z.object({
         appId: z.number(),
         initialChatMode: ChatModeSchema.optional(),
+        modelSelection: ModelSelectionSchema.optional(),
+        firstPromptCreationOperationId: z.string().min(1).optional(),
       }),
     ]),
     output: CreateChatResultSchema,
+    invalidates: () => [{ family: "chats" }],
+    originHandles: () => [{ family: "chats" }],
   }),
 
   updateChat: defineContract({
     channel: "update-chat",
     input: UpdateChatParamsSchema,
     output: z.void(),
+    invalidates: (input) => [
+      { family: "chats" },
+      { family: "chat", chatId: input.chatId },
+    ],
+    originHandles: () => [{ family: "chats" }],
+  }),
+
+  setChatFavorite: defineContract({
+    channel: "set-chat-favorite",
+    input: SetChatFavoriteParamsSchema,
+    output: SetChatFavoriteResultSchema,
+    invalidates: (input) => [
+      { family: "chats" },
+      { family: "chat", chatId: input.chatId },
+    ],
+    originHandles: () => [{ family: "chats" }],
+  }),
+
+  removeChatReferencedApp: defineContract({
+    channel: "remove-chat-referenced-app",
+    input: RemoveChatReferencedAppParamsSchema,
+    output: z.void(),
+    invalidates: (input) => [{ family: "chat", chatId: input.chatId }],
+    // The chip row invalidates the chat itself in `onSettled`, so the calling
+    // window would otherwise refetch twice per detach.
+    originHandles: (input) => [{ family: "chat", chatId: input.chatId }],
   }),
 
   deleteChat: defineContract({
     channel: "delete-chat",
     input: z.number(), // chatId
     output: z.void(),
-  }),
-
-  deleteMessages: defineContract({
-    channel: "delete-messages",
-    input: z.number(), // chatId
-    output: z.void(),
+    invalidates: () => [{ family: "chats" }],
   }),
 
   searchChats: defineContract({
@@ -338,6 +517,12 @@ export const chatContracts = {
     channel: "chat:cancel",
     input: z.number(), // chatId
     output: z.boolean(),
+  }),
+
+  observeSubmissionStopPolicy: defineContract({
+    channel: "chat:observe-submission-stop-policy",
+    input: z.number().int().positive(),
+    output: z.number().int().nonnegative(),
   }),
 
   // Renderer→main ack for stress-test backpressure on the canned test

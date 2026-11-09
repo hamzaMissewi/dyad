@@ -1,4 +1,5 @@
-import type { Message } from "@/ipc/types";
+import { assistantAttribution } from "@/shared/execution_backend";
+import { type Message } from "@/ipc/types";
 import {
   DyadMarkdownParser,
   VanillaMarkdownParser,
@@ -7,7 +8,6 @@ import { DyadAttachment, type AttachmentSize } from "./DyadAttachment";
 import { useStreamChat } from "@/hooks/useStreamChat";
 import { StreamingLoadingAnimation } from "./StreamingLoadingAnimation";
 import {
-  CheckCircle,
   XCircle,
   Clock,
   GitCommit,
@@ -16,16 +16,15 @@ import {
   Info,
   Bot,
   Ban,
+  Undo2,
+  Loader2,
 } from "lucide-react";
 import { formatDistanceToNow, format } from "date-fns";
 import { useVersions } from "@/hooks/useVersions";
 import { useAtomValue } from "jotai";
-import { selectAtom } from "jotai/utils";
 import { selectedAppIdAtom } from "@/atoms/appAtoms";
-import {
-  selectedChatIdAtom,
-  streamingPreviewByChatIdAtom,
-} from "@/atoms/chatAtoms";
+import { selectedChatIdAtom } from "@/atoms/chatAtoms";
+import { useChatStreamHasPreview } from "@/hooks/useChatStream";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useCopyToClipboard } from "@/hooks/useCopyToClipboard";
 import {
@@ -33,11 +32,30 @@ import {
   TooltipTrigger,
   TooltipContent,
 } from "@/components/ui/tooltip";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { buttonVariants } from "@/components/ui/button";
 import { unescapeXmlAttr } from "../../../shared/xmlEscape";
 import {
   isCancelledResponseContent,
   stripCancelledResponseNotice,
 } from "@/shared/chatCancellation";
+import { useVersionPreview } from "@/hooks/useVersionPreview";
+import { SubagentTeamCard } from "./SubagentTeamCard";
+import {
+  getVisibleMessageApprovalState,
+  shouldShowMessageFooter,
+} from "./messageApprovalStatus";
+import { ChatMessageAnnotationLayer } from "./ChatMessageAnnotationLayer";
+import { isChatMessageAnnotatable } from "./chatAnnotationEligibility";
 
 /** Extract <dyad-attachment> tags from message content and return parsed attachment data. */
 function extractAttachments(content: string): {
@@ -86,6 +104,7 @@ function stripAttachmentInfo(content: string): string {
 interface ChatMessageProps {
   message: Message;
   isLastMessage: boolean;
+  executionBackend?: "dyad" | "claude-code";
   isCancelledPrompt?: boolean;
 }
 
@@ -93,27 +112,29 @@ const ChatMessage = ({
   message,
   isLastMessage,
   isCancelledPrompt,
+  executionBackend,
 }: ChatMessageProps) => {
   const { isStreaming } = useStreamChat();
   const appId = useAtomValue(selectedAppIdAtom);
   const { versions: liveVersions } = useVersions(appId);
+  const {
+    state: previewState,
+    projection: previewProjection,
+    send: sendPreviewEvent,
+  } = useVersionPreview(appId);
+  const canRestoreToMessage = previewProjection.capabilities.canRestore;
+  const isRestoringToMessage = previewState.type === "restoring";
   const assistantTextContent =
     message.role === "assistant"
       ? stripCancelledResponseNotice(message.content)
       : "";
   // Sidecar tool-input XML preview lives outside message.content. Subscribe
-  // to a per-chat boolean derived atom so non-last messages don't re-render
-  // every preview chunk — only on the boolean transition.
+  // to its equality-gated boolean so non-last messages only re-render on the
+  // empty/non-empty transition, not on every preview chunk.
   const selectedChatId = useAtomValue(selectedChatIdAtom);
-  const hasPreviewForChatAtom = useMemo(
-    () =>
-      selectAtom(streamingPreviewByChatIdAtom, (m) => {
-        if (selectedChatId == null) return false;
-        return (m.get(selectedChatId)?.length ?? 0) > 0;
-      }),
-    [selectedChatId],
-  );
-  const hasPreviewForChat = useAtomValue(hasPreviewForChatAtom);
+  const hasPreviewForChat = useChatStreamHasPreview(selectedChatId);
+  const [showRestoreConfirm, setShowRestoreConfirm] = useState(false);
+  const assistantContentRef = useRef<HTMLDivElement>(null);
   const hasStreamingPreview =
     message.role === "assistant" &&
     isLastMessage &&
@@ -122,6 +143,16 @@ const ChatMessage = ({
   const hasAssistantText =
     message.role === "assistant" &&
     (assistantTextContent.length > 0 || hasStreamingPreview);
+  const visibleApprovalState = getVisibleMessageApprovalState(
+    message.approvalState,
+  );
+  const showMessageFooter = shouldShowMessageFooter({
+    hasAssistantText,
+    isStreaming,
+    hasHistoricalAssistantModel:
+      message.role === "assistant" && !isLastMessage && Boolean(message.model),
+    visibleApprovalState,
+  });
   //handle copy chat
   const { copyMessageContent, copied } = useCopyToClipboard();
   const handleCopyFormatted = async () => {
@@ -189,6 +220,105 @@ const ChatMessage = ({
   const attachmentSize: AttachmentSize =
     attachments.length === 1 ? "lg" : attachments.length <= 3 ? "md" : "sm";
 
+  // Exclude cancelled prompts: they render greyed out with a "Cancelled" label,
+  // and showing an undo arrow on a turn that never completed (and may have left
+  // partial file changes) is confusing.
+  // Attachment-only prompts (no text) are still accepted and can lead to code
+  // changes, so they get a restore arrow too — anchored to the attachment block
+  // below rather than the (absent) message box.
+  const showRestoreButton =
+    message.role === "user" &&
+    message.id > 0 &&
+    (hasUserText || attachments.length > 0) &&
+    !isCancelled;
+
+  const handleRestoreToMessage = (restoreCodebase: boolean) => {
+    if (appId == null || selectedChatId == null) {
+      return;
+    }
+    setShowRestoreConfirm(false);
+    sendPreviewEvent({
+      type: "RESTORE_TO_MESSAGE",
+      appId,
+      chatId: selectedChatId,
+      messageId: message.id,
+      restoreCodebase,
+    });
+  };
+
+  // The restore button + confirmation dialog, anchored absolutely to the
+  // top-right of its (relatively-positioned) container. Rendered inside the
+  // message box for text prompts, and next to the attachment block for
+  // attachment-only prompts (which have no message box).
+  const restoreButtonNode = showRestoreButton ? (
+    <>
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <button
+              data-testid="restore-to-message-button"
+              onClick={() => setShowRestoreConfirm(true)}
+              disabled={!canRestoreToMessage}
+              aria-label="Restore to this point"
+              className="absolute -top-2 -right-2 z-10 flex h-6 w-6 items-center justify-center rounded-full border bg-(--background) text-gray-500 shadow-sm transition-colors duration-200 hover:text-gray-700 disabled:cursor-not-allowed dark:text-gray-400 dark:hover:text-gray-200"
+            />
+          }
+        >
+          {isRestoringToMessage ? (
+            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          ) : (
+            <Undo2 className="h-3.5 w-3.5" />
+          )}
+        </TooltipTrigger>
+        <TooltipContent>
+          Fork or restore to before this message in a new chat
+        </TooltipContent>
+      </Tooltip>
+      <AlertDialog
+        open={showRestoreConfirm}
+        onOpenChange={setShowRestoreConfirm}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Restore to this point?</AlertDialogTitle>
+            <AlertDialogDescription>
+              A new chat will be created with the messages up to this point.
+              Your current chat is preserved and won't be changed. Choose
+              "Restore code & fork chat" to also roll the codebase back to how
+              it was before this message, or "Fork chat only" to leave your
+              files untouched.
+            </AlertDialogDescription>
+            {isStreaming && (
+              <p className="mt-2 text-sm font-medium text-amber-600 dark:text-amber-500">
+                A generation is in progress. "Restore code & fork chat" will
+                stop it first; "Fork chat only" leaves it running.
+              </p>
+            )}
+          </AlertDialogHeader>
+          <AlertDialogFooter className="flex-col sm:flex-col sm:justify-normal">
+            <AlertDialogAction
+              data-testid="confirm-restore-to-message-button"
+              className="w-full"
+              disabled={!canRestoreToMessage}
+              onClick={() => handleRestoreToMessage(true)}
+            >
+              Restore code & fork chat
+            </AlertDialogAction>
+            <AlertDialogAction
+              data-testid="fork-chat-button"
+              className={`${buttonVariants({ variant: "outline" })} w-full text-foreground`}
+              disabled={!canRestoreToMessage}
+              onClick={() => handleRestoreToMessage(false)}
+            >
+              Fork chat only
+            </AlertDialogAction>
+            <AlertDialogCancel className="w-full">Cancel</AlertDialogCancel>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
+  ) : null;
+
   return (
     <div
       className={`flex ${message.role === "assistant" ? "justify-start" : "justify-end"}`}
@@ -200,9 +330,14 @@ const ChatMessage = ({
         {(message.role === "assistant" || hasUserText) && (
           <div
             className={`rounded-lg p-2 ${
-              message.role === "assistant" ? "" : "ml-24 bg-(--sidebar-accent)"
+              message.role === "assistant"
+                ? ""
+                : "relative ml-24 bg-(--sidebar-accent)"
             }`}
           >
+            {/* Text prompts anchor the button to the message box; attachment-only
+                prompts render it next to the attachment block below instead. */}
+            {hasUserText && restoreButtonNode}
             {message.role === "assistant" &&
             !hasAssistantText &&
             isStreaming &&
@@ -216,6 +351,9 @@ const ChatMessage = ({
               </div>
             ) : (
               <div
+                ref={
+                  message.role === "assistant" ? assistantContentRef : undefined
+                }
                 className="prose dark:prose-invert prose-headings:mb-2 prose-p:my-1 prose-pre:my-0 max-w-none break-words text-[15px]"
                 suppressHydrationWarning
               >
@@ -235,7 +373,20 @@ const ChatMessage = ({
                 )}
               </div>
             )}
-            {(hasAssistantText && !isStreaming) || message.approvalState ? (
+            {selectedChatId != null &&
+              isChatMessageAnnotatable({
+                role: message.role,
+                isLastMessage,
+                isCancelled,
+                isStreaming,
+              }) && (
+                <ChatMessageAnnotationLayer
+                  containerRef={assistantContentRef}
+                  chatId={selectedChatId}
+                  messageId={message.id}
+                />
+              )}
+            {showMessageFooter ? (
               <div
                 className={`mt-2 flex items-center ${
                   hasAssistantText && !isStreaming ? "justify-between" : ""
@@ -266,35 +417,46 @@ const ChatMessage = ({
                   </Tooltip>
                 )}
                 <div className="flex flex-wrap gap-2">
-                  {message.approvalState && (
+                  {visibleApprovalState && (
                     <div className="flex items-center space-x-1">
-                      {message.approvalState === "approved" ? (
-                        <>
-                          <CheckCircle className="h-4 w-4 text-green-500" />
-                          <span>Approved</span>
-                        </>
-                      ) : message.approvalState === "rejected" ? (
-                        <>
-                          <XCircle className="h-4 w-4 text-red-500" />
-                          <span>Rejected</span>
-                        </>
-                      ) : null}
+                      <XCircle className="h-4 w-4 text-red-500" />
+                      <span>Rejected</span>
                     </div>
                   )}
-                  {message.role === "assistant" && message.model && (
-                    <div className="flex items-center gap-1 text-gray-500 dark:text-gray-400 w-full sm:w-auto">
-                      <Bot className="h-4 w-4 flex-shrink-0" />
-                      <span>{message.model}</span>
-                    </div>
-                  )}
+                  {message.role === "assistant" &&
+                    (message.model || executionBackend === "claude-code") && (
+                      <div className="flex items-center gap-1 text-gray-500 dark:text-gray-400 w-full sm:w-auto">
+                        <Bot className="h-4 w-4 flex-shrink-0" />
+                        <span>
+                          {assistantAttribution(
+                            executionBackend,
+                            message.model,
+                          )}
+                        </span>
+                      </div>
+                    )}
                 </div>
               </div>
             ) : null}
+            {message.role === "assistant" && selectedChatId != null && (
+              <SubagentTeamCard
+                chatId={selectedChatId}
+                messageId={message.id}
+                rootIsStreaming={isLastMessage && isStreaming}
+                showReviewAction={isLastMessage}
+                hideInlineThreads={assistantTextContent.includes(
+                  "<dyad-subagent",
+                )}
+              />
+            )}
           </div>
         )}
         {/* Render attachments outside the message box */}
         {attachments.length > 0 && (
-          <div className="mt-2 ml-24 flex flex-wrap gap-2 justify-end">
+          <div className="relative mt-2 ml-24 flex flex-wrap gap-2 justify-end">
+            {/* Attachment-only prompts have no message box, so anchor the restore
+                button here instead. Text prompts render it above. */}
+            {!hasUserText && restoreButtonNode}
             {attachments.map((att, i) => (
               <DyadAttachment
                 key={i}

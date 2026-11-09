@@ -9,7 +9,6 @@ import { ElectronApplication, _electron as electron } from "playwright";
 import os from "os";
 import path from "path";
 import { execSync } from "child_process";
-import treeKill from "tree-kill";
 
 import { showDebugLogs } from "./constants";
 import { PageObject } from "./page-objects";
@@ -26,13 +25,62 @@ export interface ElectronConfig {
   postLaunchHook?: () => Promise<void>;
   showSetupScreen?: boolean;
   showPnpmMinimumReleaseAgeWarning?: boolean;
+  launchArgs?: string[];
+  testTimeout?: number;
 }
 
-// Some Electron states emit the Playwright close event but leave
-// electronApp.close() pending until the worker timeout. Terminating the process
-// tree keeps teardown bounded and also cleans up preview dev-server children.
-async function terminateElectronApp(electronApp: ElectronApplication) {
-  const childProcess = electronApp.process();
+export async function launchElectronApp({
+  userDataDir,
+  fakeLlmPort,
+  parallelIndex,
+  showSetupScreen = false,
+  launchArgs = [],
+}: {
+  userDataDir: string;
+  fakeLlmPort: number;
+  parallelIndex: number;
+  showSetupScreen?: boolean;
+  launchArgs?: string[];
+}): Promise<ElectronApplication> {
+  const appInfo = eph.parseElectronApp(eph.findLatestBuild());
+  process.env.FAKE_LLM_PORT = String(fakeLlmPort);
+  process.env.DYAD_E2E_PORT_BLOCK_INDEX = String(parallelIndex);
+  process.env.OLLAMA_HOST = `http://localhost:${fakeLlmPort}/ollama`;
+  process.env.LM_STUDIO_BASE_URL_FOR_TESTING = `http://localhost:${fakeLlmPort}/lmstudio`;
+  process.env.DYAD_ENGINE_URL = `http://localhost:${fakeLlmPort}/engine/v1`;
+  process.env.DYAD_GATEWAY_URL = `http://localhost:${fakeLlmPort}/gateway/v1`;
+  process.env.DYAD_DEFAULT_APPROVE_BUILDS_URL = `http://localhost:${fakeLlmPort}/api/default-approve-builds.txt`;
+  process.env.DYAD_TEST_PNPM_VERSION ??= "11.1.2";
+  process.env.E2E_TEST_BUILD = "true";
+  if (showSetupScreen) delete process.env.OPENAI_API_KEY;
+  else process.env.OPENAI_API_KEY = "sk-test";
+
+  const electronApp = await electron.launch({
+    args: [
+      appInfo.main,
+      "--enable-logging",
+      `--user-data-dir=${userDataDir}`,
+      ...launchArgs,
+    ],
+    executablePath: appInfo.executable,
+  });
+  (electronApp as any).$dyadUserDataDir = userDataDir;
+  (electronApp as any).$fakeLlmPort = fakeLlmPort;
+  return electronApp;
+}
+
+// Close through Playwright first so it tears down its Electron protocol
+// connections as well as the OS process. Some Electron states can still leave
+// close() pending, so retain a bounded process-group kill as a fallback.
+export async function terminateElectronApp(electronApp: ElectronApplication) {
+  let childProcess;
+  try {
+    childProcess = electronApp.process();
+  } catch {
+    // A restart test may already have closed this Playwright channel. Teardown
+    // is idempotent even after Playwright disposes its process handle.
+    return;
+  }
   const pid = childProcess.pid;
   console.log(
     `[cleanup:start] Terminating Electron app${pid ? ` ${pid}` : ""}`,
@@ -43,55 +91,57 @@ async function terminateElectronApp(electronApp: ElectronApplication) {
     return;
   }
 
-  let closed = false;
-  const waitForClose = new Promise<void>((resolve) => {
+  let processExited = false;
+  const waitForProcessExit = new Promise<void>((resolve) => {
     const done = () => {
-      closed = true;
+      processExited = true;
       resolve();
     };
-    electronApp.once("close", done);
     childProcess.once("exit", done);
+    childProcess.once("close", done);
   });
 
-  await new Promise<void>((resolve) => {
-    treeKill(pid, "SIGTERM", (error) => {
-      if (error) {
-        console.warn(`tree-kill SIGTERM error for Electron PID ${pid}:`, error);
-      }
-      resolve();
+  let playwrightCloseSucceeded = false;
+  const playwrightClose = electronApp
+    .close()
+    .then(() => {
+      playwrightCloseSucceeded = true;
+    })
+    .catch((error) => {
+      console.warn("Playwright Electron close error:", error);
     });
-  });
 
   await Promise.race([
-    waitForClose,
+    Promise.all([playwrightClose, waitForProcessExit]),
     new Promise<void>((resolve) => {
       setTimeout(resolve, 5_000);
     }),
   ]);
 
-  if (!closed) {
-    console.warn(
-      `[cleanup:timeout] Electron app did not exit after SIGTERM; killing process tree ${pid}`,
-    );
-    await new Promise<void>((resolve) => {
-      treeKill(pid, "SIGKILL", (error) => {
-        if (error) {
-          console.warn(
-            `tree-kill SIGKILL error for Electron PID ${pid}:`,
-            error,
-          );
-        }
-        resolve();
-      });
-    });
-
-    await Promise.race([
-      waitForClose,
-      new Promise<void>((resolve) => {
-        setTimeout(resolve, 2_000);
-      }),
-    ]);
+  if (playwrightCloseSucceeded && processExited) {
+    console.log("[cleanup:end] Electron app closed through Playwright");
+    return;
   }
+
+  console.warn(
+    `[cleanup:timeout] Playwright close did not finish; killing process group ${pid}`,
+  );
+  try {
+    // Playwright launches Electron as a process-group leader and uses the same
+    // negative-PID kill internally. Killing the whole group also terminates
+    // preview servers that can otherwise keep the launch process alive.
+    process.kill(-pid, "SIGKILL");
+  } catch (error) {
+    console.warn(`Process-group kill error for Electron PID ${pid}:`, error);
+    childProcess.kill("SIGKILL");
+  }
+
+  await Promise.race([
+    Promise.all([playwrightClose, waitForProcessExit]),
+    new Promise<void>((resolve) => {
+      setTimeout(resolve, 5_000);
+    }),
+  ]);
 
   console.log("[cleanup:end] Electron app terminated");
 }
@@ -153,7 +203,11 @@ export const test = base.extend<{
 
       // After the test we can check whether the test passed or failed.
       if (testInfo.status !== testInfo.expectedStatus) {
-        const page = await electronApp.firstWindow();
+        const page = electronApp.windows()[0];
+        if (!page) {
+          console.error("Unable to take failure screenshot: no window is open");
+          return;
+        }
         try {
           const screenshot = await page.screenshot({ timeout: 5_000 });
           await testInfo.attach("screenshot", {
@@ -169,53 +223,44 @@ export const test = base.extend<{
   ],
   electronApp: [
     async ({ electronConfig }, use, testInfo) => {
-      // find the latest build in the out directory
-      const latestBuild = eph.findLatestBuild();
-      // parse the directory and find paths and other info
-      const appInfo = eph.parseElectronApp(latestBuild);
-
+      if (electronConfig.testTimeout !== undefined) {
+        testInfo.setTimeout(electronConfig.testTimeout);
+      }
       // Calculate worker-specific port for fake LLM server
       // Each parallel worker gets its own server to avoid test interference
       const fakeLlmPort = FAKE_LLM_BASE_PORT + testInfo.parallelIndex;
 
-      process.env.FAKE_LLM_PORT = String(fakeLlmPort);
-      process.env.DYAD_E2E_PORT_BLOCK_INDEX = String(testInfo.parallelIndex);
-      process.env.OLLAMA_HOST = `http://localhost:${fakeLlmPort}/ollama`;
-      process.env.LM_STUDIO_BASE_URL_FOR_TESTING = `http://localhost:${fakeLlmPort}/lmstudio`;
-      process.env.DYAD_ENGINE_URL = `http://localhost:${fakeLlmPort}/engine/v1`;
-      process.env.DYAD_GATEWAY_URL = `http://localhost:${fakeLlmPort}/gateway/v1`;
-      process.env.DYAD_DEFAULT_APPROVE_BUILDS_URL = `http://localhost:${fakeLlmPort}/api/default-approve-builds.txt`;
-      process.env.DYAD_TEST_PNPM_VERSION = "11.1.2";
-      process.env.E2E_TEST_BUILD = "true";
-      if (!electronConfig.showSetupScreen) {
-        // This is just a hack to avoid the AI setup screen.
-        process.env.OPENAI_API_KEY = "sk-test";
-      } else {
-        delete process.env.OPENAI_API_KEY;
-      }
       const baseTmpDir = os.tmpdir();
       const userDataDir = path.join(
         baseTmpDir,
         `dyad-e2e-tests-worker-${testInfo.parallelIndex}-${Date.now()}`,
       );
-      if (electronConfig.preLaunchHook) {
-        await electronConfig.preLaunchHook({ userDataDir, fakeLlmPort });
+      // Each launch starts from the supported default unless its own hook
+      // selects another version. Do not inherit a previous scenario's value.
+      delete process.env.DYAD_TEST_PNPM_VERSION;
+      const sfwGitHubToken = process.env.SFW_GITHUB_TOKEN;
+      let electronApp: ElectronApplication;
+      try {
+        if (electronConfig.preLaunchHook) {
+          await electronConfig.preLaunchHook({ userDataDir, fakeLlmPort });
+        }
+        // The token exists only for trusted Node-side fixture setup. Never let
+        // Electron or generated-app child processes inherit it.
+        delete process.env.SFW_GITHUB_TOKEN;
+        electronApp = await launchElectronApp({
+          userDataDir,
+          fakeLlmPort,
+          parallelIndex: testInfo.parallelIndex,
+          showSetupScreen: electronConfig.showSetupScreen,
+          launchArgs: electronConfig.launchArgs,
+        });
+      } finally {
+        if (sfwGitHubToken === undefined) {
+          delete process.env.SFW_GITHUB_TOKEN;
+        } else {
+          process.env.SFW_GITHUB_TOKEN = sfwGitHubToken;
+        }
       }
-      const electronApp = await electron.launch({
-        args: [
-          appInfo.main,
-          "--enable-logging",
-          `--user-data-dir=${userDataDir}`,
-        ],
-        executablePath: appInfo.executable,
-        // Strong suspicion this is causing issues on Windows with tests hanging due to error:
-        // ffmpeg failed to write: Error [ERR_STREAM_WRITE_AFTER_END]: write after end
-        // recordVideo: {
-        //   dir: "test-results",
-        // },
-      });
-      (electronApp as any).$dyadUserDataDir = userDataDir;
-      (electronApp as any).$fakeLlmPort = fakeLlmPort;
 
       console.log("electronApp launched!");
       if (showDebugLogs) {
@@ -256,6 +301,7 @@ export const test = base.extend<{
       // Windows' strict resource locking (e.g. file locking).
       if (os.platform() === "win32") {
         try {
+          const appInfo = eph.parseElectronApp(eph.findLatestBuild());
           const executableName = path.basename(appInfo.executable);
           console.log(`[cleanup:start] Killing ${executableName}`);
           console.time("taskkill");

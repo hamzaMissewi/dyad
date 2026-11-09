@@ -1,14 +1,16 @@
+import { PreviewAuthBanner } from "./PreviewAuthBanner";
 import { selectedAppIdAtom } from "@/atoms/appAtoms";
-import {
-  appendConsoleEntriesForAppAtom,
-  currentAppUrlAtom,
-  currentPreviewErrorAtom,
-  previewCurrentUrlAtom,
-  setPreviewErrorForAppAtom,
-  type PreviewErrorUpdate,
-} from "@/atoms/previewRuntimeAtoms";
+import { currentTestRunStateAtom } from "@/atoms/testRuntimeAtoms";
+import { isPreviewOpenAtom } from "@/atoms/viewAtoms";
+import { useCurrentAppUrl } from "@/hooks/useAppRun";
 import { useAtomValue, useSetAtom, useAtom } from "jotai";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ArrowLeft,
@@ -17,11 +19,7 @@ import {
   ExternalLink,
   Cloud,
   Cog,
-  X,
-  Sparkles,
-  Lightbulb,
   ChevronDown,
-  ChevronRight,
   MousePointerClick,
   Power,
   MonitorSmartphone,
@@ -31,11 +29,10 @@ import {
   Pen,
   MoreVertical,
   Trash2,
-  Maximize2,
-  Minimize2,
+  CircleDot,
+  Loader2,
 } from "lucide-react";
 import { selectedChatIdAtom } from "@/atoms/chatAtoms";
-import { CopyErrorMessage } from "@/components/CopyErrorMessage";
 import { ipc } from "@/ipc/types";
 
 import { useParseRouter } from "@/hooks/useParseRouter";
@@ -43,6 +40,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { useStreamChat } from "@/hooks/useStreamChat";
@@ -54,10 +52,7 @@ import {
   annotatorModeAtom,
   screenshotDataUrlAtom,
   pendingVisualChangesAtom,
-  isRestoringQueuedSelectionAtom,
-  pendingScreenshotAppIdAtom,
 } from "@/atoms/previewAtoms";
-import { isChatPanelHiddenAtom } from "@/atoms/viewAtoms";
 import { ComponentSelection } from "@/ipc/types";
 import { mergePendingChange } from "@/ipc/types/visual-editing";
 import {
@@ -71,153 +66,70 @@ import {
   TooltipTrigger,
   TooltipContent,
 } from "@/components/ui/tooltip";
-import { useRunApp } from "@/hooks/useRunApp";
+import { runAppLifecycleInBackground, useRunApp } from "@/hooks/useRunApp";
 import { useSettings } from "@/hooks/useSettings";
 import { useShortcut } from "@/hooks/useShortcut";
 import { cn } from "@/lib/utils";
 import { normalizePath } from "../../../shared/normalizePath";
 import { showError, showSuccess } from "@/lib/toast";
+import type { TestRecorderController } from "@/hooks/useTestRecorder";
+import { useLoadApp } from "@/hooks/useLoadApp";
 import type { DeviceMode } from "@/lib/schemas";
+import {
+  boundPreviewConsoleEntry,
+  formatPreviewConsoleMessage,
+  formatPreviewNetworkStatus,
+} from "@/lib/preview_console_buffer";
+import { appLogForwarder } from "@/lib/app_log_forwarder";
 import { queryKeys } from "@/lib/queryKeys";
 import { AnnotatorOnlyForPro } from "./AnnotatorOnlyForPro";
 import { useAttachments } from "@/hooks/useAttachments";
 import { useUserBudgetInfo } from "@/hooks/useUserBudgetInfo";
 import { Annotator } from "@/pro/ui/components/Annotator/Annotator";
 import { VisualEditingToolbar } from "./VisualEditingToolbar";
+import { recordingStatusMessage } from "./RecordingBanner";
+import { RecordingBannerHost } from "./RecordingBannerHost";
+import { RecordingStorageWarningDialog } from "./RecordingStorageWarningDialog";
+import { isAppPreviewHostname } from "../../../shared/preview_hostname";
 import { resolvePreviewBrowserUrl } from "./previewBrowserUrl";
-import { PreviewToolbar } from "./PreviewToolbar";
 import { PreviewLoadingScreen } from "./PreviewLoadingScreen";
+import { PreviewErrorBanner } from "./PreviewErrorBanner";
 import { useTranslation } from "react-i18next";
 import {
   formatPreviewAddressPath,
   normalizePreviewAddressPath,
+  sameOriginStartPath,
 } from "./previewAddressPath";
-
-interface ErrorBannerProps {
-  error:
-    | {
-        message: string;
-        source: "preview-app" | "dyad-app" | "dyad-sync";
-      }
-    | undefined;
-  onDismiss: () => void;
-  onAIFix: () => void;
-}
-
-const ErrorBanner = ({ error, onDismiss, onAIFix }: ErrorBannerProps) => {
-  const [isCollapsed, setIsCollapsed] = useState(true);
-  const { isStreaming } = useStreamChat();
-  if (!error) return null;
-  const isDockerError = error.message.includes("Cannot connect to the Docker");
-  const isInternalDyadError = error.source === "dyad-app";
-  const isSyncError = error.source === "dyad-sync";
-
-  const getTruncatedError = () => {
-    const firstLine = error.message.split("\n")[0];
-    const snippetLength = 250;
-    const snippet = error.message.substring(0, snippetLength);
-    return firstLine.length < snippet.length
-      ? firstLine
-      : snippet + (snippet.length === snippetLength ? "..." : "");
-  };
-
-  return (
-    <div
-      className="absolute top-2 left-2 right-2 z-10 bg-red-50 dark:bg-red-950 border border-red-200 dark:border-red-800 rounded-md shadow-sm p-2"
-      data-testid="preview-error-banner"
-    >
-      {/* Close button in top left */}
-      <button
-        onClick={onDismiss}
-        className="absolute top-1 left-1 p-1 hover:bg-red-100 dark:hover:bg-red-900 rounded"
-      >
-        <X size={14} className="text-red-500 dark:text-red-400" />
-      </button>
-
-      {(isInternalDyadError || isSyncError) && (
-        <div className="absolute top-1 right-1 p-1 bg-red-100 dark:bg-red-900 rounded-md text-xs font-medium text-red-700 dark:text-red-300">
-          {isSyncError ? "Cloud sync issue" : "Internal Dyad error"}
-        </div>
-      )}
-
-      {/* Error message in the middle */}
-      <div
-        className={cn(
-          "px-6 py-1 text-sm",
-          (isInternalDyadError || isSyncError) && "pt-6",
-        )}
-      >
-        <div
-          className="text-red-700 dark:text-red-300 text-wrap font-mono whitespace-pre-wrap break-words text-xs cursor-pointer flex gap-1 items-start"
-          onClick={() => setIsCollapsed(!isCollapsed)}
-        >
-          <ChevronRight
-            size={14}
-            className={`mt-0.5 transform transition-transform ${isCollapsed ? "" : "rotate-90"}`}
-          />
-
-          {isCollapsed ? getTruncatedError() : error.message}
-        </div>
-      </div>
-
-      {/* Tip message */}
-      <div className="mt-2 px-6">
-        <div className="relative p-2 bg-red-100 dark:bg-red-900 rounded-sm flex gap-1 items-center">
-          <div>
-            <Lightbulb size={16} className=" text-red-800 dark:text-red-300" />
-          </div>
-          <span className="text-sm text-red-700 dark:text-red-200">
-            <span className="font-medium">Tip: </span>
-            {isDockerError
-              ? "Make sure Docker Desktop is running and try restarting the app."
-              : isSyncError
-                ? "Dyad could not upload your latest local changes to the cloud sandbox. Check your network connection or wait for sync to recover."
-                : isInternalDyadError
-                  ? "Try restarting the Dyad app or restarting your computer to see if that fixes the error."
-                  : "Check if restarting the app fixes the error."}
-          </span>
-        </div>
-      </div>
-
-      {/* Action buttons at the bottom */}
-      {!isDockerError && error.source === "preview-app" && (
-        <div className="mt-3 px-6 flex justify-end gap-2">
-          <CopyErrorMessage errorMessage={error.message} />
-          <button
-            disabled={isStreaming}
-            onClick={onAIFix}
-            className="cursor-pointer flex items-center space-x-1 px-2 py-1 bg-red-500 dark:bg-red-600 text-white rounded text-sm hover:bg-red-600 dark:hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            <Sparkles size={14} />
-            <span>Fix error with AI</span>
-          </button>
-        </div>
-      )}
-    </div>
-  );
-};
-
-const SCREENSHOT_CAPTURE_DELAY_MS = 3_000;
+import { getPreviewToolbarActionVisibility } from "./previewToolbarLayout";
+import { PREVIEW_TOOLBAR_BUTTON_CLASSES } from "./previewToolbarStyles";
+import { DeployButton } from "./DeployButton";
+import { usePreviewIframe } from "@/preview_iframe/usePreviewIframe";
+import {
+  selectCanGoBack,
+  selectCanGoForward,
+  selectPreviewError,
+} from "@/preview_iframe/state";
+import {
+  useScreenshot,
+  type ScreenshotAdapterEvent,
+} from "@/screenshot/useScreenshot";
+import { useAppRunRemoteManager } from "@/app_run/AppRunRemoteProvider";
 
 // Preview iframe component
-export const PreviewIframe = ({ loading }: { loading: boolean }) => {
+export const PreviewIframe = ({
+  loading,
+  recorder,
+}: {
+  loading: boolean;
+  recorder: TestRecorderController;
+}) => {
   const { t } = useTranslation("home");
   const selectedAppId = useAtomValue(selectedAppIdAtom);
-  const { appUrl, originalUrl, mode } = useAtomValue(currentAppUrlAtom);
-  const appendConsoleEntries = useSetAtom(appendConsoleEntriesForAppAtom);
-  // State to trigger iframe reload
-  const [reloadKey, setReloadKey] = useState(0);
-  const errorMessage = useAtomValue(currentPreviewErrorAtom);
-  const setPreviewErrorForApp = useSetAtom(setPreviewErrorForAppAtom);
-  const setErrorMessage = useCallback(
-    (update: PreviewErrorUpdate) => {
-      if (selectedAppId === null) {
-        return;
-      }
-      setPreviewErrorForApp({ appId: selectedAppId, error: update });
-    },
-    [selectedAppId, setPreviewErrorForApp],
-  );
+  const isPreviewOpen = useAtomValue(isPreviewOpenAtom);
+  const { appUrl, originalUrl, mode, previewAuth } =
+    useCurrentAppUrl(selectedAppId);
+  const testRunPhase = useAtomValue(currentTestRunStateAtom).phase;
+  const appRunManager = useAppRunRemoteManager();
   const selectedChatId = useAtomValue(selectedChatIdAtom);
   const { streamMessage } = useStreamChat();
   const {
@@ -230,37 +142,8 @@ export const PreviewIframe = ({ loading }: { loading: boolean }) => {
   const { userBudget } = useUserBudgetInfo();
   const isProMode = !!userBudget;
   const queryClient = useQueryClient();
-
-  // Preserved URL state (persists across HMR-induced remounts)
-  const [preservedUrls, setPreservedUrls] = useAtom(previewCurrentUrlAtom);
-
-  // Get the initial URL to use - check if we have a preserved URL from before HMR remount
-  const initialUrl = selectedAppId
-    ? (preservedUrls.get(selectedAppId) ?? null)
-    : null;
-
-  // Navigation state - initialize with preserved URL if available
-  const [isComponentSelectorInitialized, setIsComponentSelectorInitialized] =
-    useState(false);
-  const [canGoBack, setCanGoBack] = useState(!!initialUrl);
-  const [canGoForward, setCanGoForward] = useState(false);
-  const [navigationHistory, setNavigationHistory] = useState<string[]>(() => {
-    if (appUrl && initialUrl && initialUrl !== appUrl) {
-      return [appUrl, initialUrl];
-    }
-    return appUrl ? [appUrl] : [];
-  });
-  const [currentHistoryPosition, setCurrentHistoryPosition] = useState(() => {
-    if (appUrl && initialUrl && initialUrl !== appUrl) {
-      return 1;
-    }
-    return 0;
-  });
-  const [selectedComponentsPreview, setSelectedComponentsPreview] = useAtom(
+  const setSelectedComponentsPreview = useSetAtom(
     selectedComponentsPreviewAtom,
-  );
-  const [isRestoringQueuedSelection, setIsRestoringQueuedSelection] = useAtom(
-    isRestoringQueuedSelectionAtom,
   );
   const [visualEditingSelectedComponent, setVisualEditingSelectedComponent] =
     useAtom(visualEditingSelectedComponentAtom);
@@ -269,16 +152,86 @@ export const PreviewIframe = ({ loading }: { loading: boolean }) => {
   );
   const setPreviewIframeRef = useSetAtom(previewIframeRefAtom);
   const iframeRef = useRef<HTMLIFrameElement>(null);
-  // Ref to store the URL that the iframe should be showing - initialize with preserved URL if available
-  // This is different from appUrl - it tracks the CURRENT route, not just the base URL
-  const currentIframeUrlRef = useRef<string | null>(initialUrl || appUrl);
-  const [isPicking, setIsPicking] = useState(false);
+  const handleIframeRef = useCallback(
+    (iframe: HTMLIFrameElement | null) => {
+      iframeRef.current = iframe;
+      setPreviewIframeRef(iframe);
+    },
+    [setPreviewIframeRef],
+  );
+  const componentMessageHandlerRef = useRef<(event: MessageEvent) => void>(
+    () => undefined,
+  );
+  const screenshotAdapterHandlerRef = useRef<
+    (event: ScreenshotAdapterEvent) => void
+  >(() => undefined);
+  const {
+    state: iframeState,
+    send: sendIframeEvent,
+    iframeSrc,
+    postMessage: postPreviewMessage,
+    onIframeLoaded,
+  } = usePreviewIframe({
+    appId: selectedAppId,
+    appUrl,
+    iframeRef,
+    onSharedMachineEvent: (event) => screenshotAdapterHandlerRef.current(event),
+    onComponentMessage: (event) => componentMessageHandlerRef.current(event),
+  });
+  const errorMessage = selectPreviewError(iframeState);
+  screenshotAdapterHandlerRef.current = useScreenshot({
+    appId: selectedAppId,
+    postMessage: postPreviewMessage,
+  });
+  const navigationHistory = iframeState.history;
+  const currentHistoryPosition = iframeState.position;
+  const isComponentSelectorInitialized = iframeState.selectorReady;
+  const isPicking = iframeState.picking;
+  const canGoBack = selectCanGoBack(iframeState);
+  const canGoForward = selectCanGoForward(iframeState);
   const [annotatorMode, setAnnotatorMode] = useAtom(annotatorModeAtom);
+  const { app: loadedApp } = useLoadApp(selectedAppId);
+  // Recording is part of the testing feature, so the entry point only exists
+  // for apps that opted into testing (the Tests panel owns that opt-in).
+  const canRecordTests = !!loadedApp?.testingEnabled;
+
+  const handleRecordClick = () => {
+    if (recorder.phase !== "idle") return;
+    // The route the preview is on right now. An unauthenticated recording keeps
+    // it across the remount, while every generated spec opens with
+    // `page.goto("/")` — so the recorder needs to know when those differ.
+    //
+    // Only when the preview is still on the app. `formatPreviewAddressPath`
+    // strips the origin unconditionally, so a preview that followed an external
+    // link would hand back a path that reads as app-relative and replay as
+    // `page.goto("/that/path")` against the app — a destination the user never
+    // visited. Unknown or off-origin means no hint at all.
+    //
+    // And only for a route the user picked through Dyad's chrome: one the app
+    // reached itself is not a starting point anyone chose, and opening a
+    // session there makes replay `goto` the destination and skip the
+    // navigation — often a redirect that is the thing under test — that got to
+    // it. Same gate as the Tests panel's Record button, which feeds the same
+    // recorder start.
+    //
+    // Passing nothing does NOT leave the session on an app-driven route: the
+    // recorder navigates the preview back to the app root before it starts, so
+    // the recording begins where every spec's opening `page.goto("/")` replays
+    // from.
+    // Asks first — setup clears the preview's cookies and local storage.
+    recorder.requestStartRecording(
+      iframeState.currentUrlSource === "dyad"
+        ? sameOriginStartPath(currentHistoryUrl, appUrl)
+        : undefined,
+    );
+  };
+
+  const previewToolbarRef = useRef<HTMLDivElement>(null);
+  const [previewToolbarWidth, setPreviewToolbarWidth] = useState<number | null>(
+    null,
+  );
   const [screenshotDataUrl, setScreenshotDataUrl] = useAtom(
     screenshotDataUrlAtom,
-  );
-  const [isChatPanelHidden, setIsChatPanelHidden] = useAtom(
-    isChatPanelHiddenAtom,
   );
   const currentHistoryUrl = navigationHistory[currentHistoryPosition] ?? null;
   const currentAddressPath = formatPreviewAddressPath(currentHistoryUrl);
@@ -286,42 +239,41 @@ export const PreviewIframe = ({ loading }: { loading: boolean }) => {
   const [isEditingAddressBar, setIsEditingAddressBar] = useState(false);
   const isEditingAddressBarRef = useRef(false);
 
-  const { addAttachments } = useAttachments();
+  const { addAttachments } = useAttachments(selectedChatId);
   const setPendingChanges = useSetAtom(pendingVisualChangesAtom);
-  const [pendingScreenshotAppId, setPendingScreenshotAppId] = useAtom(
-    pendingScreenshotAppIdAtom,
-  );
-  const pendingScreenshotAppIdRef = useRef<number | null>(null);
-  // Track the latest screenshot requests so stale responses from earlier reloads
-  // don't get mistaken for annotator screenshots.
-  const pendingCommitScreenshotRequestRef = useRef<{
-    appId: number;
-    requestId: string;
-    commitHash: string;
-  } | null>(null);
+
+  const handleReload = useCallback(() => {
+    sendIframeEvent({ type: "RELOAD_REQUESTED" });
+    setVisualEditingSelectedComponent(null);
+    setPendingChanges(new Map());
+    setCurrentComponentCoordinates(null);
+    console.debug("Reloading iframe preview for app", selectedAppId);
+  }, [
+    selectedAppId,
+    sendIframeEvent,
+    setCurrentComponentCoordinates,
+    setPendingChanges,
+    setVisualEditingSelectedComponent,
+  ]);
   const pendingAnnotatorScreenshotRequestIdRef = useRef<string | null>(null);
-  const captureTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Read the latest selected app inside the capture timeout so the bail-out
-  // check compares against the current selection, not a stale render closure.
-  const selectedAppIdRef = useRef<number | null>(selectedAppId);
-  // Track which apps have already had the on-load fallback attempted this
-  // session so the check doesn't re-run on every HMR/reload.
-  const fallbackAttemptedAppIdsRef = useRef<Set<number>>(new Set());
   const skipNextAddressBarBlurRef = useRef(false);
-
-  // Keep refs in sync so the message handler and timeout callbacks always read
-  // the latest values.
-  useEffect(() => {
-    pendingScreenshotAppIdRef.current = pendingScreenshotAppId;
-  }, [pendingScreenshotAppId]);
-
-  useEffect(() => {
-    selectedAppIdRef.current = selectedAppId;
-  }, [selectedAppId]);
 
   useEffect(() => {
     isEditingAddressBarRef.current = isEditingAddressBar;
   }, [isEditingAddressBar]);
+
+  useLayoutEffect(() => {
+    const node = previewToolbarRef.current;
+    if (!node) return;
+
+    const updateWidth = () => {
+      setPreviewToolbarWidth(Math.floor(node.getBoundingClientRect().width));
+    };
+    const observer = new ResizeObserver(updateWidth);
+    observer.observe(node);
+    updateWidth();
+    return () => observer.disconnect();
+  }, [annotatorMode, selectedAppId]);
 
   useEffect(() => {
     if (!isEditingAddressBarRef.current) {
@@ -329,101 +281,35 @@ export const PreviewIframe = ({ loading }: { loading: boolean }) => {
     }
   }, [currentAddressPath]);
 
-  // Drop any in-flight request state when the user switches apps so a stale
-  // guard from a replaced iframe doesn't block future captures.
   useEffect(() => {
-    pendingCommitScreenshotRequestRef.current = null;
-    if (captureTimeoutRef.current !== null) {
-      clearTimeout(captureTimeoutRef.current);
-      captureTimeoutRef.current = null;
-    }
+    pendingAnnotatorScreenshotRequestIdRef.current = null;
+    setAnnotatorMode(false);
+    setScreenshotDataUrl(null);
   }, [selectedAppId]);
 
-  // Clean up pending screenshot timeout on unmount
   useEffect(() => {
     return () => {
-      if (captureTimeoutRef.current !== null) {
-        clearTimeout(captureTimeoutRef.current);
-        captureTimeoutRef.current = null;
-      }
+      pendingAnnotatorScreenshotRequestIdRef.current = null;
+      setAnnotatorMode(false);
+      setScreenshotDataUrl(null);
     };
   }, []);
 
-  const captureScreenshot = (appId: number) => {
-    // If a capture is already scheduled, let it run — repeated triggers
-    // (HMR, onLoad, selector-initialized) shouldn't endlessly extend the wait.
-    if (captureTimeoutRef.current !== null) {
-      return;
-    }
-
-    // Wait for page animations to finish before capturing.
-    captureTimeoutRef.current = setTimeout(async () => {
-      captureTimeoutRef.current = null;
-      // Bail out if the user switched to a different app during the delay.
-      // Read from a ref so the comparison uses the current selection, not the
-      // render closure that scheduled this timeout.
-      if (selectedAppIdRef.current !== appId) {
-        if (pendingScreenshotAppIdRef.current === appId) {
-          setPendingScreenshotAppId(null);
-        }
-        return;
-      }
-      // Re-read contentWindow inside the timeout to avoid stale references
-      // (e.g. if the iframe reloads or gets replaced during the delay).
-      const contentWindow = iframeRef.current?.contentWindow;
-      if (!contentWindow) {
-        if (pendingScreenshotAppIdRef.current === appId) {
-          setPendingScreenshotAppId(null);
-        }
-        return;
-      }
-      // Resolve the commit hash at capture time so the saved screenshot
-      // corresponds to the current HEAD and not to a later commit that may
-      // land before the iframe responds with the image.
-      let commitHash: string | null = null;
-      try {
-        const result = await ipc.app.getCurrentCommitHash({ appId });
-        commitHash = result.commitHash;
-      } catch (err) {
-        console.warn("Failed to resolve commit hash for screenshot", err);
-      }
-      if (!commitHash) {
-        if (pendingScreenshotAppIdRef.current === appId) {
-          setPendingScreenshotAppId(null);
-        }
-        return;
-      }
-      // The user may have switched apps while resolving the commit hash.
-      if (selectedAppIdRef.current !== appId) {
-        if (pendingScreenshotAppIdRef.current === appId) {
-          setPendingScreenshotAppId(null);
-        }
-        return;
-      }
-      const requestId = crypto.randomUUID();
-      pendingCommitScreenshotRequestRef.current = {
-        appId,
-        requestId,
-        commitHash,
-      };
-      contentWindow.postMessage(
-        { type: "dyad-take-screenshot", requestId },
-        "*",
-      );
-    }, SCREENSHOT_CAPTURE_DELAY_MS);
-  };
-
-  const requestCommitScreenshot = () => {
-    if (
-      pendingScreenshotAppIdRef.current === null ||
-      pendingScreenshotAppIdRef.current !== selectedAppId ||
-      !iframeRef.current?.contentWindow
-    ) {
-      return;
-    }
-
-    captureScreenshot(selectedAppId);
-  };
+  // Annotator mode and a live recording are mutually exclusive: the annotator
+  // replaces the preview with a screenshot, so nothing is being captured, and
+  // it hides the recording bar — which on this tab is the only place Stop,
+  // Cancel and Discard exist, while the main-process session goes on holding
+  // the app's lock and its isolated database to the 30-minute cap.
+  //
+  // The toolbar button is disabled for the ordinary path. This closes the race
+  // the disabled attribute can't: arming happens when the screenshot response
+  // arrives, and a recording can start while that request is in flight.
+  useEffect(() => {
+    if (recorder.phase === "idle") return;
+    pendingAnnotatorScreenshotRequestIdRef.current = null;
+    setAnnotatorMode(false);
+    setScreenshotDataUrl(null);
+  }, [recorder.phase, setAnnotatorMode]);
 
   const requestAnnotatorScreenshot = () => {
     if (!iframeRef.current?.contentWindow) {
@@ -432,10 +318,7 @@ export const PreviewIframe = ({ loading }: { loading: boolean }) => {
 
     const requestId = crypto.randomUUID();
     pendingAnnotatorScreenshotRequestIdRef.current = requestId;
-    iframeRef.current.contentWindow.postMessage(
-      { type: "dyad-take-screenshot", requestId },
-      "*",
-    );
+    postPreviewMessage({ type: "dyad-take-screenshot", requestId });
   };
 
   // AST Analysis State
@@ -504,7 +387,8 @@ export const PreviewIframe = ({ loading }: { loading: boolean }) => {
         cloudSandboxStatus.lastErrorCode === "sandbox_credits_exhausted" ||
         cloudSandboxStatus.lastErrorCode === "sandbox_billing_unavailable")
     ) {
-      setErrorMessage({
+      sendIframeEvent({
+        type: "IFRAME_ERROR",
         message: cloudSandboxStatus.lastErrorMessage
           ? cloudSandboxStatus.lastErrorMessage.includes("Dyad stopped")
             ? cloudSandboxStatus.lastErrorMessage
@@ -517,7 +401,7 @@ export const PreviewIframe = ({ loading }: { loading: boolean }) => {
         source: "dyad-app",
       });
     }
-  }, [cloudSandboxStatus, isCloudMode, setErrorMessage]);
+  }, [cloudSandboxStatus, isCloudMode, sendIframeEvent]);
 
   useEffect(() => {
     if (!isCloudMode || !cloudSandboxStatus) {
@@ -527,21 +411,15 @@ export const PreviewIframe = ({ loading }: { loading: boolean }) => {
     const localSyncErrorMessage = cloudSandboxStatus.localSyncErrorMessage;
 
     if (localSyncErrorMessage) {
-      setErrorMessage((current) =>
-        current && current.source !== "dyad-sync"
-          ? current
-          : {
-              message: localSyncErrorMessage,
-              source: "dyad-sync",
-            },
-      );
+      sendIframeEvent({
+        type: "SYNC_ERROR",
+        message: localSyncErrorMessage,
+      });
       return;
     }
 
-    setErrorMessage((current) =>
-      current?.source === "dyad-sync" ? undefined : current,
-    );
-  }, [cloudSandboxStatus, isCloudMode, setErrorMessage]);
+    sendIframeEvent({ type: "SYNC_RECOVERED" });
+  }, [cloudSandboxStatus, isCloudMode, sendIframeEvent]);
 
   useEffect(() => {
     if (!isCloudMode || !cloudSandboxStatus) {
@@ -652,9 +530,6 @@ export const PreviewIframe = ({ loading }: { loading: boolean }) => {
       console.error("Failed to get element styles:", error);
     }
   };
-  useEffect(() => {
-    setAnnotatorMode(false);
-  }, []);
   // Reset visual editing state when app changes or component unmounts
   useEffect(() => {
     return () => {
@@ -664,11 +539,6 @@ export const PreviewIframe = ({ loading }: { loading: boolean }) => {
       setCurrentComponentCoordinates(null);
     };
   }, [selectedAppId]);
-
-  // Update iframe ref atom
-  useEffect(() => {
-    setPreviewIframeRef(iframeRef.current);
-  }, [iframeRef.current, setPreviewIframeRef]);
 
   // Send pro mode status to iframe
   useEffect(() => {
@@ -680,177 +550,145 @@ export const PreviewIframe = ({ loading }: { loading: boolean }) => {
     }
   }, [isProMode, isComponentSelectorInitialized]);
 
-  // Restore component overlays in iframe only during queued-message edit restoration.
-  // Normal interactive selections are already handled by the iframe's own click handler,
-  // so we guard this effect to avoid redundant clear-and-restore round-trips.
-  useEffect(() => {
-    if (!isRestoringQueuedSelection) return;
-    if (!iframeRef.current?.contentWindow || !isComponentSelectorInitialized) {
-      return;
-    }
-    // Clear the flag before sending so it doesn't re-trigger
-    setIsRestoringQueuedSelection(false);
-    if (selectedComponentsPreview.length === 0) {
-      iframeRef.current.contentWindow.postMessage(
-        { type: "clear-dyad-component-overlays" },
-        "*",
-      );
-      return;
-    }
-    iframeRef.current.contentWindow.postMessage(
-      {
-        type: "restore-dyad-component-overlays",
-        componentIds: selectedComponentsPreview.map((c) => c.id),
-      },
-      "*",
-    );
-  }, [
-    isRestoringQueuedSelection,
-    selectedComponentsPreview,
-    isComponentSelectorInitialized,
-    setIsRestoringQueuedSelection,
-  ]);
-
-  // Add message listener for iframe errors and navigation events
-  useEffect(() => {
-    const handleMessage = (event: MessageEvent) => {
-      // Only handle messages from our iframe
-      if (event.source !== iframeRef.current?.contentWindow) {
-        return;
-      }
-
+  // Component-side postMessage routes. The preview-iframe hook owns the one
+  // window listener and claims navigation/selector lifecycle messages before
+  // forwarding all other routes here.
+  const handleComponentMessage = useCallback(
+    (event: MessageEvent) => {
       // Handle console logs from the iframe
       if (event.data?.type === "console-log") {
-        const { level, args } = event.data;
-        const formattedMessage = `[${level.toUpperCase()}] ${args.join(" ")}`;
+        const { level } = event.data;
+        const rawArgs: unknown = event.data.args;
+        const args: unknown[] = Array.isArray(rawArgs) ? rawArgs : [rawArgs];
+        const levelLabel =
+          level === "log" ||
+          level === "warn" ||
+          level === "error" ||
+          level === "info" ||
+          level === "debug"
+            ? level.toUpperCase()
+            : "LOG";
+        const formattedMessage = formatPreviewConsoleMessage(
+          `[${levelLabel}]`,
+          args,
+        );
         const logLevel: "info" | "warn" | "error" =
           level === "error" ? "error" : level === "warn" ? "warn" : "info";
-        const logEntry = {
+        const logEntry = boundPreviewConsoleEntry({
           level: logLevel,
           type: "client" as const,
           message: formattedMessage,
           appId: selectedAppId!,
           timestamp: Date.now(),
-        };
+        });
 
         // Send to central log store
-        ipc.misc.addLog(logEntry);
+        appLogForwarder.enqueue([logEntry]);
 
         // Also update UI state
-        appendConsoleEntries({ appId: logEntry.appId, entries: [logEntry] });
+        appRunManager.previewConsole.append(logEntry.appId, [logEntry]);
         return;
       }
 
       // Handle network requests from the iframe
       if (event.data?.type === "network-request") {
         const { method, url } = event.data;
-        const formattedMessage = `→ ${method} ${url}`;
-        const logEntry = {
+        const formattedMessage = formatPreviewConsoleMessage("→", [
+          method,
+          url,
+        ]);
+        const logEntry = boundPreviewConsoleEntry({
           level: "info" as const,
           type: "network-requests" as const,
           message: formattedMessage,
           appId: selectedAppId!,
           timestamp: Date.now(),
-        };
+        });
 
         // Send to central log store
-        ipc.misc.addLog(logEntry);
+        appLogForwarder.enqueue([logEntry]);
 
         // Also update UI state
-        appendConsoleEntries({ appId: logEntry.appId, entries: [logEntry] });
+        appRunManager.previewConsole.append(logEntry.appId, [logEntry]);
         return;
       }
 
       // Handle network responses from the iframe
       if (event.data?.type === "network-response") {
         const { method, url, status, duration } = event.data;
-        const formattedMessage = `[${status}] ${method} ${url} (${duration}ms)`;
+        const numericStatus = typeof status === "number" ? status : 0;
+        const durationLabel =
+          typeof duration === "number"
+            ? `(${duration}ms)`
+            : "(unknown duration)";
+        const formattedMessage = formatPreviewConsoleMessage(
+          formatPreviewNetworkStatus(status),
+          [method, url, durationLabel],
+        );
         const level: "info" | "warn" | "error" =
-          status >= 400 ? "error" : status >= 300 ? "warn" : "info";
-        const logEntry = {
+          numericStatus >= 400
+            ? "error"
+            : numericStatus >= 300
+              ? "warn"
+              : "info";
+        const logEntry = boundPreviewConsoleEntry({
           level,
           type: "network-requests" as const,
           message: formattedMessage,
           appId: selectedAppId!,
           timestamp: Date.now(),
-        };
+        });
 
         // Send to central log store
-        ipc.misc.addLog(logEntry);
+        appLogForwarder.enqueue([logEntry]);
 
         // Also update UI state
-        appendConsoleEntries({ appId: logEntry.appId, entries: [logEntry] });
+        appRunManager.previewConsole.append(logEntry.appId, [logEntry]);
         return;
       }
 
       // Handle network errors from the iframe
       if (event.data?.type === "network-error") {
         const { method, url, status, error, duration } = event.data;
-        const statusCode = status && status !== 0 ? `[${status}] ` : "";
-        const formattedMessage = `${statusCode}${method} ${url} - ${error} (${duration}ms)`;
-        const logEntry = {
+        const statusCode =
+          typeof status === "number" && status !== 0 ? `[${status}]` : "";
+        const durationLabel =
+          typeof duration === "number"
+            ? `(${duration}ms)`
+            : "(unknown duration)";
+        const formattedMessage = formatPreviewConsoleMessage(statusCode, [
+          method,
+          url,
+          "-",
+          error,
+          durationLabel,
+        ]);
+        const logEntry = boundPreviewConsoleEntry({
           level: "error" as const,
           type: "network-requests" as const,
           message: formattedMessage,
           appId: selectedAppId!,
           timestamp: Date.now(),
-        };
+        });
 
         // Send to central log store
-        ipc.misc.addLog(logEntry);
+        appLogForwarder.enqueue([logEntry]);
 
         // Also update UI state
-        appendConsoleEntries({ appId: logEntry.appId, entries: [logEntry] });
+        appRunManager.previewConsole.append(logEntry.appId, [logEntry]);
         return;
       }
 
       if (event.data?.type === "dyad-component-selector-initialized") {
-        setIsComponentSelectorInitialized(true);
         iframeRef.current?.contentWindow?.postMessage(
           { type: "dyad-pro-mode", enabled: isProMode },
           "*",
         );
+        return;
+      }
 
-        // Take a screenshot if a commit just happened for this app.
-        // Read from ref to avoid stale closure issues.
-        if (
-          pendingScreenshotAppIdRef.current !== null &&
-          pendingScreenshotAppIdRef.current === selectedAppId &&
-          iframeRef.current?.contentWindow
-        ) {
-          requestCommitScreenshot();
-        } else if (
-          selectedAppId !== null &&
-          iframeRef.current?.contentWindow &&
-          captureTimeoutRef.current === null &&
-          pendingCommitScreenshotRequestRef.current === null &&
-          !fallbackAttemptedAppIdsRef.current.has(selectedAppId)
-        ) {
-          // No pending commit screenshot and no capture already in flight —
-          // check if the app already has a screenshot on disk. If not (e.g.
-          // iframe was still loading when earlier commits happened), capture
-          // one now. Only attempt once per app per session so repeated HMR
-          // reloads don't spam capture attempts for apps whose saves fail.
-          const appId = selectedAppId;
-          fallbackAttemptedAppIdsRef.current.add(appId);
-          ipc.app
-            .listAppScreenshots({ appId })
-            .then((result) => {
-              // Guard against app switches while this promise was in flight —
-              // otherwise the stale callback would occupy `captureTimeoutRef`
-              // for the old app and block the current app's commit-triggered
-              // captures.
-              if (selectedAppIdRef.current !== appId) {
-                return;
-              }
-              if (result.screenshots.length === 0) {
-                captureScreenshot(appId);
-              }
-            })
-            .catch(() => {
-              // Ignore — screenshot check is best-effort
-            });
-        }
+      if (event.data?.type === "dyad-preview-reload-shortcut") {
+        handleReload();
         return;
       }
 
@@ -971,54 +809,6 @@ export const PreviewIframe = ({ loading }: { loading: boolean }) => {
           typeof event.data.requestId === "string"
             ? event.data.requestId
             : null;
-        const pendingCommitScreenshotRequest =
-          pendingCommitScreenshotRequestRef.current;
-
-        if (
-          requestId !== null &&
-          pendingCommitScreenshotRequest !== null &&
-          requestId === pendingCommitScreenshotRequest.requestId
-        ) {
-          const appId = pendingCommitScreenshotRequest.appId;
-          const commitHash = pendingCommitScreenshotRequest.commitHash;
-          pendingCommitScreenshotRequestRef.current = null;
-          // Only clear the pending-screenshot atom if it still points to the
-          // same app — otherwise another flow may have queued a newer capture
-          // for a different app and we'd erase its pending state.
-          const clearPendingIfMatches = () => {
-            if (pendingScreenshotAppIdRef.current === appId) {
-              setPendingScreenshotAppId(null);
-            }
-          };
-          if (event.data.success && event.data.dataUrl) {
-            console.debug("App screenshot taken for app", appId);
-            clearPendingIfMatches();
-            ipc.app
-              .saveAppScreenshot({
-                appId,
-                dataUrl: event.data.dataUrl,
-                commitHash,
-              })
-              .then(() =>
-                queryClient.invalidateQueries({
-                  queryKey: queryKeys.apps.screenshots({ appId }),
-                }),
-              )
-              .then(() =>
-                queryClient.invalidateQueries({
-                  queryKey: queryKeys.apps.thumbnails,
-                }),
-              )
-              .catch((err: unknown) => {
-                console.error("Failed to save app screenshot:", err);
-              });
-          } else {
-            console.warn("App screenshot capture failed for app", appId);
-            clearPendingIfMatches();
-          }
-          return;
-        }
-
         if (
           requestId !== null &&
           requestId === pendingAnnotatorScreenshotRequestIdRef.current
@@ -1039,9 +829,7 @@ export const PreviewIframe = ({ loading }: { loading: boolean }) => {
           | "window-error"
           | "unhandled-rejection"
           | "iframe-sourcemapped-error"
-          | "build-error-report"
-          | "pushState"
-          | "replaceState";
+          | "build-error-report";
         payload?: {
           message?: string;
           stack?: string;
@@ -1063,164 +851,64 @@ export const PreviewIframe = ({ loading }: { loading: boolean }) => {
             : payload?.stack;
         const errorMessage = `Error ${payload?.message || payload?.reason}\nStack trace: ${stack}`;
         console.error("Iframe error:", errorMessage);
-        setErrorMessage({ message: errorMessage, source: "preview-app" });
-        const logEntry = {
+        sendIframeEvent({
+          type: "IFRAME_ERROR",
+          message: errorMessage,
+          source: "preview-app",
+        });
+        const logEntry = boundPreviewConsoleEntry({
           level: "error" as const,
           type: "client" as const,
           message: `Iframe error: ${errorMessage}`,
           appId: selectedAppId!,
           timestamp: Date.now(),
-        };
+        });
 
         // Send to central log store
-        ipc.misc.addLog(logEntry);
+        appLogForwarder.enqueue([logEntry]);
 
         // Also update UI state
-        appendConsoleEntries({ appId: logEntry.appId, entries: [logEntry] });
+        appRunManager.previewConsole.append(logEntry.appId, [logEntry]);
       } else if (type === "build-error-report") {
         console.debug(`Build error report: ${payload}`);
         const errorMessage = `${payload?.message} from file ${payload?.file}.\n\nSource code:\n${payload?.frame}`;
-        setErrorMessage({ message: errorMessage, source: "preview-app" });
-        const logEntry = {
+        sendIframeEvent({
+          type: "IFRAME_ERROR",
+          message: errorMessage,
+          source: "preview-app",
+        });
+        const logEntry = boundPreviewConsoleEntry({
           level: "error" as const,
           type: "client" as const,
-          message: `Build error report: ${JSON.stringify(payload)}`,
+          message: formatPreviewConsoleMessage("Build error report:", [
+            payload?.message,
+            "from file",
+            payload?.file,
+            "Source code:",
+            payload?.frame,
+          ]),
           appId: selectedAppId!,
           timestamp: Date.now(),
-        };
+        });
 
         // Send to central log store
-        ipc.misc.addLog(logEntry);
+        appLogForwarder.enqueue([logEntry]);
 
         // Also update UI state
-        appendConsoleEntries({ appId: logEntry.appId, entries: [logEntry] });
-      } else if (type === "pushState" || type === "replaceState") {
-        // Resolve relative URLs against the app's base URL so that all
-        // entries in navigationHistory are always absolute URLs.
-        let resolvedUrl = payload?.newUrl;
-        if (resolvedUrl) {
-          try {
-            resolvedUrl = new URL(resolvedUrl, appUrl ?? undefined).href;
-          } catch {
-            // If it can't be resolved at all, keep the raw value
-          }
-        }
-
-        // Update navigation history based on the type of state change
-        if (type === "pushState" && resolvedUrl) {
-          // For pushState, we trim any forward history and add the new URL
-          const newHistory = [
-            ...navigationHistory.slice(0, currentHistoryPosition + 1),
-            resolvedUrl,
-          ];
-          setNavigationHistory(newHistory);
-          setCurrentHistoryPosition(newHistory.length - 1);
-          // Update the current iframe URL ref to match the navigation
-          currentIframeUrlRef.current = resolvedUrl;
-          // Preserve URL for HMR remounts - only if it's a different route from root
-          // Compare origins and check if there's a meaningful path
-          if (selectedAppId && appUrl) {
-            try {
-              const newUrlObj = new URL(resolvedUrl);
-              const appUrlObj = new URL(appUrl);
-              // Only preserve if there's a non-root path
-              if (
-                newUrlObj.origin === appUrlObj.origin &&
-                newUrlObj.pathname !== "/" &&
-                newUrlObj.pathname !== ""
-              ) {
-                setPreservedUrls((prev) => {
-                  const next = new Map(prev);
-                  next.set(selectedAppId, resolvedUrl);
-                  return next;
-                });
-              } else if (newUrlObj.origin === appUrlObj.origin) {
-                // Clear preserved URL when navigating back to root
-                setPreservedUrls((prev) => {
-                  const next = new Map(prev);
-                  next.delete(selectedAppId);
-                  return next;
-                });
-              }
-            } catch {
-              // Invalid URL, don't preserve
-            }
-          }
-        } else if (type === "replaceState" && resolvedUrl) {
-          // For replaceState, we replace the current URL
-          const newHistory = [...navigationHistory];
-          newHistory[currentHistoryPosition] = resolvedUrl;
-          setNavigationHistory(newHistory);
-          // Update the current iframe URL ref to match the navigation
-          currentIframeUrlRef.current = resolvedUrl;
-          // Preserve URL for HMR remounts - only if it's a different route from root
-          if (selectedAppId && appUrl) {
-            try {
-              const newUrlObj = new URL(resolvedUrl);
-              const appUrlObj = new URL(appUrl);
-              // Only preserve if there's a non-root path
-              if (
-                newUrlObj.origin === appUrlObj.origin &&
-                newUrlObj.pathname !== "/" &&
-                newUrlObj.pathname !== ""
-              ) {
-                setPreservedUrls((prev) => {
-                  const next = new Map(prev);
-                  next.set(selectedAppId, resolvedUrl);
-                  return next;
-                });
-              } else if (newUrlObj.origin === appUrlObj.origin) {
-                // Clear preserved URL when navigating back to root
-                setPreservedUrls((prev) => {
-                  const next = new Map(prev);
-                  next.delete(selectedAppId);
-                  return next;
-                });
-              }
-            } catch {
-              // Invalid URL, don't preserve
-            }
-          }
-        }
+        appRunManager.previewConsole.append(logEntry.appId, [logEntry]);
       }
-    };
-
-    window.addEventListener("message", handleMessage);
-    return () => window.removeEventListener("message", handleMessage);
-  }, [
-    navigationHistory,
-    currentHistoryPosition,
-    selectedAppId,
-    appUrl,
-    appendConsoleEntries,
-    setErrorMessage,
-    setIsComponentSelectorInitialized,
-    setSelectedComponentsPreview,
-    setVisualEditingSelectedComponent,
-    setPreservedUrls,
-    queryClient,
-    setPendingScreenshotAppId,
-  ]);
-
-  useEffect(() => {
-    // Update navigation buttons state
-    setCanGoBack(currentHistoryPosition > 0);
-    setCanGoForward(currentHistoryPosition < navigationHistory.length - 1);
-  }, [navigationHistory, currentHistoryPosition]);
-
-  // Reset navigation when appUrl changes (different app selected)
-  const prevAppUrlRef = useRef(appUrl);
-  useEffect(() => {
-    if (appUrl && appUrl !== prevAppUrlRef.current) {
-      prevAppUrlRef.current = appUrl;
-      setNavigationHistory([appUrl]);
-      setCurrentHistoryPosition(0);
-      setCanGoBack(false);
-      setCanGoForward(false);
-      // Reset iframe URL to the new app's base URL
-      currentIframeUrlRef.current = appUrl;
-    }
-  }, [appUrl]);
+    },
+    [
+      selectedAppId,
+      appRunManager,
+      sendIframeEvent,
+      setSelectedComponentsPreview,
+      setVisualEditingSelectedComponent,
+      queryClient,
+      handleReload,
+    ],
+  );
+  componentMessageHandlerRef.current = handleComponentMessage;
 
   // Get current styles when component is selected for visual editing
   useEffect(() => {
@@ -1232,37 +920,49 @@ export const PreviewIframe = ({ loading }: { loading: boolean }) => {
   // Function to activate component selector in the iframe
   const handleActivateComponentSelector = () => {
     if (iframeRef.current?.contentWindow) {
-      const newIsPicking = !isPicking;
-      if (!newIsPicking) {
-        // Clean up any text editing states when deactivating
-        iframeRef.current.contentWindow.postMessage(
-          { type: "cleanup-all-text-editing" },
-          "*",
-        );
-      }
-      setIsPicking(newIsPicking);
       setVisualEditingSelectedComponent(null);
-      iframeRef.current.contentWindow.postMessage(
-        {
-          type: newIsPicking
-            ? "activate-dyad-component-selector"
-            : "deactivate-dyad-component-selector",
-        },
-        "*",
-      );
+      sendIframeEvent({ type: "PICKER_TOGGLED" });
     }
   };
 
   // Function to handle annotator button click
   const handleAnnotatorClick = () => {
     if (annotatorMode) {
+      pendingAnnotatorScreenshotRequestIdRef.current = null;
       setAnnotatorMode(false);
+      setScreenshotDataUrl(null);
       return;
     }
+    // The button is disabled for this, but arming is asynchronous — the
+    // screenshot response is what sets annotator mode — so refuse here too.
+    if (recorder.phase !== "idle") return;
     if (iframeRef.current?.contentWindow) {
       requestAnnotatorScreenshot();
     }
   };
+
+  // Keep reload scoped to the preview while its panel is active, including
+  // when focus is in the parent renderer rather than inside the iframe. Match
+  // the native shortcut exactly so AltGr and mixed primary modifiers remain
+  // available to the focused control.
+  useEffect(() => {
+    if (!isPreviewOpen) return;
+    const handleReloadShortcut = (event: KeyboardEvent) => {
+      const hasPrimaryModifier = isMac ? event.metaKey : event.ctrlKey;
+      const hasUnexpectedModifier =
+        event.altKey || (isMac ? event.ctrlKey : event.metaKey);
+      if (event.key.toLowerCase() === "r" && hasPrimaryModifier) {
+        if (hasUnexpectedModifier) {
+          if (!event.getModifierState("AltGraph")) event.preventDefault();
+          return;
+        }
+        event.preventDefault();
+        handleReload();
+      }
+    };
+    window.addEventListener("keydown", handleReloadShortcut);
+    return () => window.removeEventListener("keydown", handleReloadShortcut);
+  }, [handleReload, isMac, isPreviewOpen]);
 
   // Activate component selector using a shortcut
   useShortcut(
@@ -1276,142 +976,19 @@ export const PreviewIframe = ({ loading }: { loading: boolean }) => {
   // Function to navigate back
   const handleNavigateBack = () => {
     if (canGoBack && iframeRef.current?.contentWindow) {
-      const newPosition = currentHistoryPosition - 1;
-      if (newPosition < 0 || newPosition >= navigationHistory.length) return;
-      const targetUrl = navigationHistory[newPosition];
-      if (!targetUrl) return;
-
-      // Send the target URL to navigate to (browser history.back() doesn't work in Electron iframes)
-      iframeRef.current.contentWindow.postMessage(
-        {
-          type: "navigate",
-          payload: { direction: "backward", url: targetUrl },
-        },
-        "*",
-      );
-
-      // Update our local state
-      setCurrentHistoryPosition(newPosition);
-      setCanGoBack(newPosition > 0);
-      setCanGoForward(true);
-      // Update iframe URL ref to match
-      currentIframeUrlRef.current = targetUrl;
-
-      // Update preservedUrls to match navigation (for HMR remounts)
-      if (selectedAppId && appUrl) {
-        try {
-          const targetUrlObj = new URL(targetUrl);
-          const appUrlObj = new URL(appUrl);
-          if (targetUrlObj.origin === appUrlObj.origin) {
-            // Clear preserved URL if navigating back to root, otherwise update it
-            if (targetUrlObj.pathname === "/" || targetUrlObj.pathname === "") {
-              setPreservedUrls((prev) => {
-                const next = new Map(prev);
-                next.delete(selectedAppId);
-                return next;
-              });
-            } else {
-              setPreservedUrls((prev) => {
-                const next = new Map(prev);
-                next.set(selectedAppId, targetUrl);
-                return next;
-              });
-            }
-          }
-        } catch {
-          // Invalid URL, don't update preservedUrls
-        }
-      }
+      sendIframeEvent({ type: "GO_BACK" });
+      // Replayed as `page.goBack()`, not as a jump to where it landed: the
+      // history move is what the user performed, and what the test should check.
+      recorder.recordHistoryMove("back");
     }
   };
 
   // Function to navigate forward
   const handleNavigateForward = () => {
     if (canGoForward && iframeRef.current?.contentWindow) {
-      const newPosition = currentHistoryPosition + 1;
-      if (newPosition < 0 || newPosition >= navigationHistory.length) return;
-      const targetUrl = navigationHistory[newPosition];
-      if (!targetUrl) return;
-
-      // Send the target URL to navigate to (browser history.forward() doesn't work in Electron iframes)
-      iframeRef.current.contentWindow.postMessage(
-        {
-          type: "navigate",
-          payload: { direction: "forward", url: targetUrl },
-        },
-        "*",
-      );
-
-      // Update our local state
-      setCurrentHistoryPosition(newPosition);
-      setCanGoBack(true);
-      setCanGoForward(newPosition < navigationHistory.length - 1);
-      // Update iframe URL ref to match
-      currentIframeUrlRef.current = targetUrl;
-
-      // Update preservedUrls to match navigation (for HMR remounts)
-      if (selectedAppId && appUrl) {
-        try {
-          const targetUrlObj = new URL(targetUrl);
-          const appUrlObj = new URL(appUrl);
-          if (targetUrlObj.origin === appUrlObj.origin) {
-            // Clear preserved URL if navigating forward to root, otherwise update it
-            if (targetUrlObj.pathname === "/" || targetUrlObj.pathname === "") {
-              setPreservedUrls((prev) => {
-                const next = new Map(prev);
-                next.delete(selectedAppId);
-                return next;
-              });
-            } else {
-              setPreservedUrls((prev) => {
-                const next = new Map(prev);
-                next.set(selectedAppId, targetUrl);
-                return next;
-              });
-            }
-          }
-        } catch {
-          // Invalid URL, don't update preservedUrls
-        }
-      }
+      sendIframeEvent({ type: "GO_FORWARD" });
+      recorder.recordHistoryMove("forward");
     }
-  };
-
-  // Function to handle reload
-  const handleReload = () => {
-    // Store the current URL to preserve the route during reload
-    const currentUrl = navigationHistory[currentHistoryPosition] || appUrl;
-
-    // Validate that the URL is same-origin as appUrl to prevent XSS/URL injection
-    if (currentUrl && appUrl) {
-      try {
-        const currentOrigin = new URL(currentUrl).origin;
-        const appOrigin = new URL(appUrl).origin;
-
-        // Only use the current URL if it has the same origin as the app URL
-        if (currentOrigin === appOrigin) {
-          currentIframeUrlRef.current = currentUrl;
-        } else {
-          console.warn(
-            `Rejecting reload URL ${currentUrl} - origin mismatch with app URL ${appUrl}`,
-          );
-          currentIframeUrlRef.current = appUrl;
-        }
-      } catch (e) {
-        console.error("Invalid URL during reload validation", e);
-        currentIframeUrlRef.current = appUrl;
-      }
-    } else {
-      currentIframeUrlRef.current = currentUrl || null;
-    }
-
-    setReloadKey((prevKey) => prevKey + 1);
-    setErrorMessage(undefined);
-    // Reset visual editing state
-    setVisualEditingSelectedComponent(null);
-    setPendingChanges(new Map());
-    setCurrentComponentCoordinates(null);
-    console.debug("Reloading iframe preview for app", selectedAppId);
   };
 
   // Function to navigate to a specific route
@@ -1433,47 +1010,11 @@ export const PreviewIframe = ({ loading }: { loading: boolean }) => {
     const baseUrl = new URL(appUrl).origin;
     const newUrl = new URL(normalized.path, baseUrl).href;
 
-    // Use postMessage to navigate (same as back/forward) - this uses location.replace()
-    // which provides smooth navigation without the black screen flicker that location.href causes
-    iframeRef.current.contentWindow.postMessage(
-      {
-        type: "navigate",
-        payload: { url: newUrl },
-      },
-      "*",
-    );
-
-    // Update navigation history
-    const newHistory = [
-      ...navigationHistory.slice(0, currentHistoryPosition + 1),
-      newUrl,
-    ];
-    setNavigationHistory(newHistory);
-    setCurrentHistoryPosition(newHistory.length - 1);
-    setCanGoBack(true);
-    setCanGoForward(false);
-
-    // Update iframe URL ref to match
-    currentIframeUrlRef.current = newUrl;
-
-    // Update preservedUrls to match navigation (for HMR remounts)
-    if (selectedAppId) {
-      // Clear preserved URL if navigating to root, otherwise update it
-      const navigatedPath = formatPreviewAddressPath(newUrl);
-      if (navigatedPath === "/") {
-        setPreservedUrls((prev) => {
-          const next = new Map(prev);
-          next.delete(selectedAppId);
-          return next;
-        });
-      } else {
-        setPreservedUrls((prev) => {
-          const next = new Map(prev);
-          next.set(selectedAppId, newUrl);
-          return next;
-        });
-      }
-    }
+    sendIframeEvent({ type: "NAVIGATE", path: newUrl });
+    // A jump the user made around the app, rather than through it: this is the
+    // one navigation a recording replays as `page.goto`. Routing the app does
+    // on its own belongs to the step that triggered it.
+    recorder.recordNavigation(normalized.path);
 
     return true;
   };
@@ -1503,27 +1044,6 @@ export const PreviewIframe = ({ loading }: { loading: boolean }) => {
     setIsEditingAddressBar(false);
   };
 
-  // Freeze iframe src between remounts so in-iframe SPA navigation (pushState/replaceState)
-  // doesn't cause React to set a new src and trigger a second full navigation flicker.
-  const iframeSrc = useMemo(() => {
-    if (!appUrl) {
-      return undefined;
-    }
-
-    const currentUrl = currentIframeUrlRef.current;
-    if (!currentUrl) {
-      return appUrl;
-    }
-
-    try {
-      const currentOrigin = new URL(currentUrl).origin;
-      const appOrigin = new URL(appUrl).origin;
-      return currentOrigin === appOrigin ? currentUrl : appUrl;
-    } catch {
-      return appUrl;
-    }
-  }, [appUrl, reloadKey, selectedAppId]);
-
   // Display message if no app is selected
   if (selectedAppId === null) {
     return (
@@ -1534,24 +1054,215 @@ export const PreviewIframe = ({ loading }: { loading: boolean }) => {
   }
 
   const onRestart = () => {
-    restartApp();
+    runAppLifecycleInBackground("restart", restartApp());
+  };
+
+  const openPreviewInBrowser = async () => {
+    try {
+      const url = await resolvePreviewBrowserUrl({
+        isCloudMode,
+        selectedAppId,
+        appUrl,
+        originalUrl,
+        createCloudSandboxShareLink,
+      });
+      await ipc.system.openExternalUrl(url);
+    } catch (error) {
+      showError(
+        error instanceof Error
+          ? error.message
+          : "Failed to open cloud sandbox share link.",
+      );
+    }
   };
 
   const onCleanRestart = () => {
-    restartApp({ removeNodeModules: true });
+    runAppLifecycleInBackground(
+      "rebuild",
+      restartApp({ removeNodeModules: true }),
+    );
   };
 
   const onRecreateSandbox = () => {
-    restartApp({ recreateSandbox: true });
+    runAppLifecycleInBackground(
+      "restart",
+      restartApp({ recreateSandbox: true }),
+    );
   };
+
+  // Isolation setup restarts the dev server and signs the test user in, so the
+  // preview is showing a page nothing the user does will survive. It reads as
+  // inert rather than covered — see RecordingSetupOverlay.
+  const isRecorderSettingUp = recorder.isBusy && !annotatorMode;
+
+  const { showOpenBrowser } =
+    getPreviewToolbarActionVisibility(previewToolbarWidth);
+  const openBrowserDisabled = isCloudMode
+    ? isCreatingCloudSandboxShareLink
+    : !appUrl;
 
   return (
     <div className="flex flex-col h-full">
+      <PreviewAuthBanner
+        status={previewAuth}
+        onRetry={onRestart}
+        disabled={
+          loading || recorder.phase !== "idle" || testRunPhase !== "idle"
+        }
+      />
       {/* Browser-style header - hide when annotator is active */}
       {!annotatorMode && (
-        <PreviewToolbar>
+        <div
+          ref={previewToolbarRef}
+          className="flex min-w-0 items-center gap-1.5 border-b px-2 py-1.5"
+        >
+          <div
+            className="flex shrink-0 items-center overflow-hidden rounded-md border border-border"
+            aria-label="Preview editing tools"
+            role="group"
+          >
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <button
+                    onClick={handleActivateComponentSelector}
+                    aria-label={
+                      isPicking
+                        ? "Deactivate component selector"
+                        : "Select component"
+                    }
+                    aria-pressed={isPicking}
+                    className={cn(
+                      PREVIEW_TOOLBAR_BUTTON_CLASSES,
+                      "rounded-none",
+                      isPicking
+                        ? "bg-purple-500 text-white hover:bg-purple-600 hover:text-white dark:bg-purple-600 dark:hover:bg-purple-700"
+                        : "text-purple-700 hover:bg-purple-100 hover:text-purple-800 dark:text-purple-300 dark:hover:bg-purple-900/50 dark:hover:text-purple-200",
+                    )}
+                    disabled={
+                      loading ||
+                      !selectedAppId ||
+                      !isComponentSelectorInitialized
+                    }
+                    data-testid="preview-pick-element-button"
+                  />
+                }
+              >
+                <MousePointerClick size={16} />
+              </TooltipTrigger>
+              <TooltipContent side="bottom">
+                {isPicking
+                  ? "Deactivate component selector"
+                  : `Select component (${isMac ? "⌘ + ⇧ + C" : "Ctrl + ⇧ + C"})`}
+              </TooltipContent>
+            </Tooltip>
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <button
+                    onClick={handleAnnotatorClick}
+                    aria-label={
+                      annotatorMode
+                        ? "Annotator mode active"
+                        : "Activate annotator"
+                    }
+                    aria-pressed={annotatorMode}
+                    className={cn(
+                      PREVIEW_TOOLBAR_BUTTON_CLASSES,
+                      "rounded-none border-l border-border",
+                      annotatorMode
+                        ? "bg-purple-500 text-white hover:bg-purple-600 hover:text-white dark:bg-purple-600 dark:hover:bg-purple-700"
+                        : "text-purple-700 hover:bg-purple-100 hover:text-purple-800 dark:text-purple-300 dark:hover:bg-purple-900/50 dark:hover:text-purple-200",
+                    )}
+                    disabled={
+                      loading ||
+                      !selectedAppId ||
+                      isPicking ||
+                      !isComponentSelectorInitialized ||
+                      // The mirror of the record button's `annotatorMode` gate.
+                      // Without it the annotator takes away the recording bar —
+                      // the session's only Stop — on the one tab the bar was
+                      // moved to PreviewPanel level to stay visible from.
+                      recorder.phase !== "idle"
+                    }
+                    data-testid="preview-annotator-button"
+                  />
+                }
+              >
+                <Pen size={16} />
+              </TooltipTrigger>
+              <TooltipContent side="bottom">
+                {recorder.phase !== "idle"
+                  ? "Finish the recording before using the annotator"
+                  : annotatorMode
+                    ? "Annotator mode active"
+                    : "Activate annotator"}
+              </TooltipContent>
+            </Tooltip>
+            {canRecordTests && (
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <button
+                      onClick={handleRecordClick}
+                      aria-label={
+                        recorder.isRecording
+                          ? "Recording — stop it from the recording bar below"
+                          : "Record test"
+                      }
+                      aria-pressed={recorder.phase !== "idle"}
+                      className={cn(
+                        PREVIEW_TOOLBAR_BUTTON_CLASSES,
+                        "rounded-none border-l border-border",
+                        recorder.phase !== "idle"
+                          ? "bg-purple-500 text-white hover:bg-purple-600 hover:text-white dark:bg-purple-600 dark:hover:bg-purple-700"
+                          : "text-purple-700 hover:bg-purple-100 hover:text-purple-800 dark:text-purple-300 dark:hover:bg-purple-900/50 dark:hover:text-purple-200",
+                      )}
+                      disabled={
+                        loading ||
+                        !selectedAppId ||
+                        !appUrl ||
+                        isPicking ||
+                        annotatorMode ||
+                        recorder.phase !== "idle"
+                      }
+                      data-testid="preview-record-button"
+                    />
+                  }
+                >
+                  {/* Never a Stop square: this button is disabled for every
+                      non-idle phase, and a stop glyph is the one affordance
+                      users are certain means "click to stop" — offering it on
+                      an inert control strands them, with only a tooltip a
+                      disabled button may never fire to explain it. A pulsing
+                      record dot says "recording, in progress" without
+                      promising an action that lives in the bar below. */}
+                  {recorder.isBusy ? (
+                    <Loader2 size={16} className="animate-spin" />
+                  ) : recorder.isRecording ? (
+                    <CircleDot size={16} className="animate-pulse" />
+                  ) : (
+                    <CircleDot size={16} />
+                  )}
+                </TooltipTrigger>
+                <TooltipContent side="bottom">
+                  {recorder.phase === "idle"
+                    ? "Record a test"
+                    : recorder.isRecording
+                      ? "Recording — use the bar below to stop"
+                      : // `recordingStatusMessage` only speaks for the spinner
+                        // phases; reviewing/saved are waiting on the user, and
+                        // saying "Setting up…" there is just wrong.
+                        recorder.isBusy
+                        ? recordingStatusMessage(recorder)
+                        : "Finish the recorded test in the bar below first"}
+                </TooltipContent>
+              </Tooltip>
+            )}
+          </div>
+
           {/* Browser navigation group */}
-          <div className="flex items-center space-x-2 ml-auto">
+          <div className="flex shrink-0 items-center gap-1.5">
             {isCloudMode && (
               <Tooltip>
                 <TooltipTrigger
@@ -1566,15 +1277,17 @@ export const PreviewIframe = ({ loading }: { loading: boolean }) => {
                 >
                   <Cloud size={14} />
                 </TooltipTrigger>
-                <TooltipContent>Running in a Cloud sandbox</TooltipContent>
+                <TooltipContent side="bottom">
+                  Running in a Cloud sandbox
+                </TooltipContent>
               </Tooltip>
             )}
-            <div className="flex items-center bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-full p-0.5">
+            <div className="flex items-center gap-0.5">
               <Tooltip>
                 <TooltipTrigger
                   render={
                     <button
-                      className="p-1 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed text-gray-700 dark:text-gray-300"
+                      className={PREVIEW_TOOLBAR_BUTTON_CLASSES}
                       disabled={!canGoBack || loading || !selectedAppId}
                       onClick={handleNavigateBack}
                       data-testid="preview-navigate-back-button"
@@ -1584,13 +1297,13 @@ export const PreviewIframe = ({ loading }: { loading: boolean }) => {
                 >
                   <ArrowLeft size={16} />
                 </TooltipTrigger>
-                <TooltipContent>Navigate back</TooltipContent>
+                <TooltipContent side="bottom">Navigate back</TooltipContent>
               </Tooltip>
               <Tooltip>
                 <TooltipTrigger
                   render={
                     <button
-                      className="p-1 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed text-gray-700 dark:text-gray-300"
+                      className={PREVIEW_TOOLBAR_BUTTON_CLASSES}
                       disabled={!canGoForward || loading || !selectedAppId}
                       onClick={handleNavigateForward}
                       data-testid="preview-navigate-forward-button"
@@ -1600,98 +1313,99 @@ export const PreviewIframe = ({ loading }: { loading: boolean }) => {
                 >
                   <ArrowRight size={16} />
                 </TooltipTrigger>
-                <TooltipContent>Navigate forward</TooltipContent>
+                <TooltipContent side="bottom">Navigate forward</TooltipContent>
               </Tooltip>
             </div>
           </div>
 
-          {/* Address Bar - white pill with device mode, refresh + external inside */}
-          <div className="relative w-1/2 min-w-20 flex items-center bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-full pl-1 pr-1">
-            <Popover open={isDevicePopoverOpen} modal={false}>
-              <Tooltip>
-                <TooltipTrigger
-                  render={
-                    <PopoverTrigger
-                      data-testid="device-mode-button"
-                      onClick={() => {
-                        // Toggle popover open/close
-                        if (isDevicePopoverOpen)
-                          updateSettings({ previewDeviceMode: "desktop" });
-                        setIsDevicePopoverOpen(!isDevicePopoverOpen);
-                      }}
-                      className={cn(
-                        "flex-shrink-0 p-1 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-300",
-                        deviceMode !== "desktop" &&
-                          "bg-gray-200 dark:bg-gray-700",
-                      )}
-                    />
+          {/* Device mode sits beside the route field because it controls the
+              preview viewport rather than the current route. */}
+          <Popover open={isDevicePopoverOpen} modal={false}>
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <PopoverTrigger
+                    data-testid="device-mode-button"
+                    onClick={() => {
+                      // Toggle popover open/close
+                      if (isDevicePopoverOpen)
+                        updateSettings({ previewDeviceMode: "desktop" });
+                      setIsDevicePopoverOpen(!isDevicePopoverOpen);
+                    }}
+                    className={cn(
+                      PREVIEW_TOOLBAR_BUTTON_CLASSES,
+                      deviceMode !== "desktop" &&
+                        "bg-primary/10 text-primary dark:bg-purple-900/40 dark:text-purple-300",
+                    )}
+                  />
+                }
+              >
+                <MonitorSmartphone size={14} />
+              </TooltipTrigger>
+              <TooltipContent side="bottom">Device Mode</TooltipContent>
+            </Tooltip>
+            <PopoverContent className="w-auto p-2">
+              <ToggleGroup
+                value={[deviceMode]}
+                onValueChange={(value) => {
+                  if (value && value.length > 0) {
+                    updateSettings({
+                      previewDeviceMode: value[value.length - 1] as DeviceMode,
+                    });
+                    setIsDevicePopoverOpen(false);
                   }
-                >
-                  <MonitorSmartphone size={14} />
-                </TooltipTrigger>
-                <TooltipContent>Device Mode</TooltipContent>
-              </Tooltip>
-              <PopoverContent className="w-auto p-2">
-                <ToggleGroup
-                  value={[deviceMode]}
-                  onValueChange={(value) => {
-                    if (value && value.length > 0) {
-                      updateSettings({
-                        previewDeviceMode: value[
-                          value.length - 1
-                        ] as DeviceMode,
-                      });
-                      setIsDevicePopoverOpen(false);
+                }}
+                variant="outline"
+              >
+                <Tooltip>
+                  <TooltipTrigger
+                    render={
+                      <ToggleGroupItem
+                        value="desktop"
+                        aria-label="Desktop view"
+                      />
                     }
-                  }}
-                  variant="outline"
-                >
-                  <Tooltip>
-                    <TooltipTrigger
-                      render={
-                        <ToggleGroupItem
-                          value="desktop"
-                          aria-label="Desktop view"
-                        />
-                      }
-                    >
-                      <Monitor size={16} />
-                    </TooltipTrigger>
-                    <TooltipContent>Desktop</TooltipContent>
-                  </Tooltip>
-                  <Tooltip>
-                    <TooltipTrigger
-                      render={
-                        <ToggleGroupItem
-                          value="tablet"
-                          aria-label="Tablet view"
-                        />
-                      }
-                    >
-                      <Tablet size={16} className="scale-x-130" />
-                    </TooltipTrigger>
-                    <TooltipContent>Tablet</TooltipContent>
-                  </Tooltip>
-                  <Tooltip>
-                    <TooltipTrigger
-                      render={
-                        <ToggleGroupItem
-                          value="mobile"
-                          aria-label="Mobile view"
-                        />
-                      }
-                    >
-                      <Smartphone size={16} />
-                    </TooltipTrigger>
-                    <TooltipContent>Mobile</TooltipContent>
-                  </Tooltip>
-                </ToggleGroup>
-              </PopoverContent>
-            </Popover>
+                  >
+                    <Monitor size={16} />
+                  </TooltipTrigger>
+                  <TooltipContent>Desktop</TooltipContent>
+                </Tooltip>
+                <Tooltip>
+                  <TooltipTrigger
+                    render={
+                      <ToggleGroupItem
+                        value="tablet"
+                        aria-label="Tablet view"
+                      />
+                    }
+                  >
+                    <Tablet size={16} className="scale-x-130" />
+                  </TooltipTrigger>
+                  <TooltipContent>Tablet</TooltipContent>
+                </Tooltip>
+                <Tooltip>
+                  <TooltipTrigger
+                    render={
+                      <ToggleGroupItem
+                        value="mobile"
+                        aria-label="Mobile view"
+                      />
+                    }
+                  >
+                    <Smartphone size={16} />
+                  </TooltipTrigger>
+                  <TooltipContent>Mobile</TooltipContent>
+                </Tooltip>
+              </ToggleGroup>
+            </PopoverContent>
+          </Popover>
+
+          {/* Flexible route field keeps priority as the panel narrows. */}
+          <div className="relative flex h-8 min-w-24 flex-1 items-center rounded-md border border-border bg-(--background-lighter) px-1">
             <div className="flex min-w-[2rem] flex-1 items-center">
               <input
                 aria-label="Preview path"
-                className="min-w-0 flex-1 rounded-sm bg-transparent py-1 pl-2 pr-1 text-sm text-gray-700 outline-none placeholder:text-gray-400 dark:text-gray-200"
+                className="min-w-0 flex-1 rounded-sm bg-transparent px-2 py-1 text-xs text-foreground outline-none placeholder:text-muted-foreground"
                 data-testid="preview-address-bar-input"
                 disabled={loading || !selectedAppId}
                 onBlur={() => {
@@ -1724,7 +1438,7 @@ export const PreviewIframe = ({ loading }: { loading: boolean }) => {
               <DropdownMenu>
                 <DropdownMenuTrigger
                   aria-label="Show detected routes"
-                  className="flex-shrink-0 rounded-full p-1 text-gray-700 opacity-70 hover:bg-gray-200 hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-40 dark:text-gray-300 dark:hover:bg-gray-700"
+                  className="flex size-7 shrink-0 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground disabled:cursor-not-allowed disabled:opacity-40"
                   data-testid="preview-address-bar-routes-button"
                   disabled={loading || !selectedAppId}
                 >
@@ -1765,7 +1479,7 @@ export const PreviewIframe = ({ loading }: { loading: boolean }) => {
                 render={
                   <button
                     onClick={handleReload}
-                    className="flex-shrink-0 p-1 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed text-gray-700 dark:text-gray-300"
+                    className="flex size-7 shrink-0 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 disabled:cursor-not-allowed disabled:opacity-40"
                     disabled={loading || !selectedAppId}
                     data-testid="preview-refresh-button"
                     aria-label="Refresh preview"
@@ -1774,49 +1488,32 @@ export const PreviewIframe = ({ loading }: { loading: boolean }) => {
               >
                 <RefreshCw size={14} />
               </TooltipTrigger>
-              <TooltipContent>Refresh preview</TooltipContent>
+              <TooltipContent side="bottom">Refresh preview</TooltipContent>
             </Tooltip>
+          </div>
+
+          <DeployButton appId={selectedAppId} />
+          {showOpenBrowser && (
             <Tooltip>
               <TooltipTrigger
                 render={
                   <button
                     data-testid="preview-open-browser-button"
                     aria-label="Open in browser"
-                    onClick={async () => {
-                      try {
-                        const url = await resolvePreviewBrowserUrl({
-                          isCloudMode,
-                          selectedAppId,
-                          originalUrl,
-                          createCloudSandboxShareLink,
-                        });
-                        await ipc.system.openExternalUrl(url);
-                      } catch (error) {
-                        showError(
-                          error instanceof Error
-                            ? error.message
-                            : "Failed to open cloud sandbox share link.",
-                        );
-                      }
-                    }}
-                    disabled={
-                      isCloudMode
-                        ? selectedAppId === null ||
-                          isCreatingCloudSandboxShareLink
-                        : !originalUrl
-                    }
-                    className="flex-shrink-0 p-1 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed text-gray-700 dark:text-gray-300"
+                    onClick={openPreviewInBrowser}
+                    disabled={openBrowserDisabled}
+                    className={PREVIEW_TOOLBAR_BUTTON_CLASSES}
                   />
                 }
               >
                 <ExternalLink size={14} />
               </TooltipTrigger>
-              <TooltipContent>Open in browser</TooltipContent>
+              <TooltipContent side="bottom">Open in browser</TooltipContent>
             </Tooltip>
-          </div>
+          )}
 
-          {/* Right action group - restart, editing tools, panel toggle */}
-          <div className="flex items-center space-x-1 ml-auto pl-2">
+          {/* Right action group - runtime and overflow actions */}
+          <div className="flex shrink-0 items-center gap-1.5">
             <Tooltip>
               <TooltipTrigger
                 render={
@@ -1826,112 +1523,36 @@ export const PreviewIframe = ({ loading }: { loading: boolean }) => {
                     aria-label={
                       isCloudMode ? "Restart Cloud Sandbox" : "Restart"
                     }
-                    className="p-1 rounded hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-300 transition-colors"
+                    className={PREVIEW_TOOLBAR_BUTTON_CLASSES}
                   />
                 }
               >
                 <Power size={16} />
               </TooltipTrigger>
-              <TooltipContent>
+              <TooltipContent side="bottom">
                 {isCloudMode ? "Restart Cloud Sandbox" : "Restart App"}
-              </TooltipContent>
-            </Tooltip>
-            <Tooltip>
-              <TooltipTrigger
-                render={
-                  <button
-                    onClick={handleActivateComponentSelector}
-                    aria-label={
-                      isPicking
-                        ? "Deactivate component selector"
-                        : "Select component"
-                    }
-                    aria-pressed={isPicking}
-                    className={`p-1 rounded transition-colors duration-200 disabled:opacity-50 disabled:cursor-not-allowed ${
-                      isPicking
-                        ? "bg-purple-500 text-white hover:bg-purple-600 dark:bg-purple-600 dark:hover:bg-purple-700"
-                        : " text-purple-700 hover:bg-purple-200  dark:text-purple-300 dark:hover:bg-purple-900"
-                    }`}
-                    disabled={
-                      loading ||
-                      !selectedAppId ||
-                      !isComponentSelectorInitialized
-                    }
-                    data-testid="preview-pick-element-button"
-                  />
-                }
-              >
-                <MousePointerClick size={16} />
-              </TooltipTrigger>
-              <TooltipContent>
-                {isPicking
-                  ? "Deactivate component selector"
-                  : `Select component (${isMac ? "⌘ + ⇧ + C" : "Ctrl + ⇧ + C"})`}
-              </TooltipContent>
-            </Tooltip>
-            <Tooltip>
-              <TooltipTrigger
-                render={
-                  <button
-                    onClick={handleAnnotatorClick}
-                    aria-label={
-                      annotatorMode
-                        ? "Annotator mode active"
-                        : "Activate annotator"
-                    }
-                    aria-pressed={annotatorMode}
-                    className={`p-1 rounded transition-colors duration-200 disabled:opacity-50 disabled:cursor-not-allowed ${
-                      annotatorMode
-                        ? "bg-purple-500 text-white hover:bg-purple-600 dark:bg-purple-600 dark:hover:bg-purple-700"
-                        : " text-purple-700 hover:bg-purple-200  dark:text-purple-300 dark:hover:bg-purple-900"
-                    }`}
-                    disabled={
-                      loading ||
-                      !selectedAppId ||
-                      isPicking ||
-                      !isComponentSelectorInitialized
-                    }
-                    data-testid="preview-annotator-button"
-                  />
-                }
-              >
-                <Pen size={16} />
-              </TooltipTrigger>
-              <TooltipContent>
-                {annotatorMode ? "Annotator mode active" : "Activate annotator"}
-              </TooltipContent>
-            </Tooltip>
-            <Tooltip>
-              <TooltipTrigger
-                render={
-                  <button
-                    onClick={() => setIsChatPanelHidden(!isChatPanelHidden)}
-                    aria-label={isChatPanelHidden ? "Show chat" : "Hide chat"}
-                    aria-pressed={isChatPanelHidden}
-                    className="p-1 rounded transition-colors duration-200 hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-300"
-                    data-testid="preview-toggle-chat-panel-button"
-                  />
-                }
-              >
-                {isChatPanelHidden ? (
-                  <Maximize2 size={16} />
-                ) : (
-                  <Minimize2 size={16} />
-                )}
-              </TooltipTrigger>
-              <TooltipContent>
-                {isChatPanelHidden ? "Show chat" : "Hide chat"}
               </TooltipContent>
             </Tooltip>
             <DropdownMenu>
               <DropdownMenuTrigger
                 data-testid="preview-more-options-button"
                 aria-label={t("preview.moreOptions")}
-                className="p-1 rounded transition-colors duration-200 hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-300"
+                className={PREVIEW_TOOLBAR_BUTTON_CLASSES}
               >
                 <MoreVertical size={16} />
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end" className="w-60">
+                {!showOpenBrowser && (
+                  <DropdownMenuItem
+                    onClick={openPreviewInBrowser}
+                    disabled={openBrowserDisabled}
+                    data-testid="preview-open-browser-menu-item"
+                  >
+                    <ExternalLink size={16} />
+                    <span>Open in browser</span>
+                  </DropdownMenuItem>
+                )}
+                {!showOpenBrowser && <DropdownMenuSeparator />}
                 <DropdownMenuItem onClick={onCleanRestart}>
                   <Cog size={16} />
                   <div className="flex flex-col">
@@ -1964,18 +1585,38 @@ export const PreviewIframe = ({ loading }: { loading: boolean }) => {
               </DropdownMenuContent>
             </DropdownMenu>
           </div>
-        </PreviewToolbar>
+        </div>
       )}
 
+      {/* Under the browser header rather than above it: on this tab the bar
+          reads as part of the preview's chrome instead of shoving it down.
+          PreviewPanel mounts this same host on every other tab, so leaving here
+          can't take the session's only Stop control off screen. */}
+      <RecordingBannerHost recorder={recorder} />
+
+      <RecordingStorageWarningDialog
+        open={recorder.pendingStart !== null}
+        // The running proxy's hostname, not the setting: toggling it only
+        // applies once the app restarts.
+        isAppSpecificDomain={isAppPreviewHostname(
+          URL.parse(appUrl ?? "")?.hostname ?? "",
+        )}
+        onOpenChange={(open) => {
+          if (!open) recorder.dismissStartRecording();
+        }}
+        onContinue={recorder.confirmStartRecording}
+      />
+
       <div className="relative flex-grow overflow-hidden">
-        {!loading && (
-          <ErrorBanner
+        {!loading && errorMessage && (
+          <PreviewErrorBanner
+            key={`${errorMessage.source}:${errorMessage.message}`}
             error={errorMessage}
-            onDismiss={() => setErrorMessage(undefined)}
+            onDismiss={() => sendIframeEvent({ type: "DISMISS" })}
             onAIFix={() => {
               if (selectedChatId) {
                 streamMessage({
-                  prompt: `Fix error: ${errorMessage?.message}`,
+                  prompt: `Fix error: ${errorMessage.message}`,
                   chatId: selectedChatId,
                 });
               }
@@ -1989,9 +1630,20 @@ export const PreviewIframe = ({ loading }: { loading: boolean }) => {
         />
         {!loading && appUrl && (
           <div
+            // Actually inert, not just dimmed and pointer-blocked. The overlay
+            // above covers the preview for the mouse, but a preview that
+            // already had focus goes on receiving KEYSTROKES through it — so
+            // typing during setup or teardown mutates the app outside the
+            // recorded session, against whichever database the swap has reached
+            // by then. `inert` also blurs whatever is focused inside, which is
+            // what stops the keystrokes already in flight.
+            inert={isRecorderSettingUp}
             className={cn(
               "w-full h-full",
               deviceMode !== "desktop" && "flex justify-center",
+              // Greyed out while the recorder sets up, the same way a cancelled
+              // chat message reads as inert.
+              isRecorderSettingUp && "opacity-50 transition-opacity",
             )}
           >
             {annotatorMode && screenshotDataUrl ? (
@@ -2010,9 +1662,7 @@ export const PreviewIframe = ({ loading }: { loading: boolean }) => {
                     handleAnnotatorClick={handleAnnotatorClick}
                   />
                 ) : (
-                  <AnnotatorOnlyForPro
-                    onGoBack={() => setAnnotatorMode(false)}
-                  />
+                  <AnnotatorOnlyForPro onGoBack={handleAnnotatorClick} />
                 )}
               </div>
             ) : (
@@ -2021,13 +1671,10 @@ export const PreviewIframe = ({ loading }: { loading: boolean }) => {
                   sandbox="allow-same-origin allow-scripts allow-forms allow-popups allow-modals allow-orientation-lock allow-pointer-lock allow-presentation allow-downloads"
                   data-testid="preview-iframe-element"
                   onLoad={() => {
-                    setErrorMessage(undefined);
-                    // Note: We don't clear currentIframeUrlRef - it tracks the URL the iframe is showing
-                    // This prevents re-renders from accidentally changing the iframe src
-                    requestCommitScreenshot();
+                    onIframeLoaded();
                   }}
-                  ref={iframeRef}
-                  key={reloadKey}
+                  ref={handleIframeRef}
+                  key={iframeState.iframeEpoch}
                   title={`Preview for App ${selectedAppId}`}
                   className="w-full h-full border-none bg-white dark:bg-gray-950"
                   style={
@@ -2056,10 +1703,54 @@ export const PreviewIframe = ({ loading }: { loading: boolean }) => {
             )}
           </div>
         )}
+        {isRecorderSettingUp && <RecordingSetupOverlay recorder={recorder} />}
       </div>
     </div>
   );
 };
+
+/**
+ * Explains the preview — and swallows clicks — while a recording session is
+ * being set up or torn down. Anything the user does in that window is lost to
+ * the dev-server restart, and confusing besides.
+ *
+ * Nothing is laid over the app: the preview itself greys out, the way a
+ * cancelled chat message does. Dimming says "inert" without covering anything,
+ * so the page stays completely sharp — watching it reload into the isolated
+ * environment is most of the reassurance this wait has to offer. This layer is
+ * transparent and exists only to hold the message and eat pointer events.
+ *
+ * The message keeps a card of its own, which is the one place this departs
+ * from the cancelled-message pattern: a chat message controls what sits behind
+ * its label, and a preview does not — bare text lands on top of whatever the
+ * app happens to be rendering.
+ */
+function RecordingSetupOverlay({
+  recorder,
+}: {
+  recorder: TestRecorderController;
+}) {
+  return (
+    <div
+      className="absolute inset-0 z-20 flex items-center justify-center px-6 text-center"
+      data-testid="preview-recording-overlay"
+      role="status"
+      aria-live="polite"
+    >
+      <div className="flex max-w-sm flex-col items-center gap-2.5 rounded-xl border border-border bg-(--background-lightest) px-6 py-5 shadow-lg">
+        <Loader2 className="size-7 animate-spin text-purple-600 dark:text-purple-300" />
+        <p className="text-base font-medium text-foreground">
+          {recordingStatusMessage(recorder)}
+        </p>
+        <p className="text-sm text-muted-foreground">
+          {recorder.phase === "starting" || recorder.phase === "authenticating"
+            ? "Dyad is preparing an isolated environment for your recording — hold off on interacting with the preview until it's ready."
+            : "Hold off on interacting with the preview until this finishes."}
+        </p>
+      </div>
+    </div>
+  );
+}
 
 function parseComponentSelection(data: any): ComponentSelection | null {
   if (!data || data.type !== "dyad-component-selected") {

@@ -1,23 +1,24 @@
 import fs from "node:fs";
-import path from "node:path";
 import { z } from "zod";
 import log from "electron-log";
 import { ToolDefinition, AgentContext, escapeXmlAttr } from "./types";
-import { safeJoin } from "@/ipc/utils/path_utils";
+import { lstatIfExists, prepareDeletePath } from "@/ipc/utils/path_utils";
 import { gitRemove } from "@/ipc/utils/git_utils";
-import { deleteSupabaseFunction } from "../../../../../../supabase_admin/supabase_management_client";
 import {
+  deleteSupabaseFunction,
+  deploySupabaseFunction,
+} from "../../../../../../supabase_admin/supabase_management_client";
+import {
+  extractFunctionNameFromPath,
   isServerFunction,
   isSharedServerModule,
+  supabaseFunctionEntryExists,
 } from "../../../../../../supabase_admin/supabase_utils";
-import { DyadError, DyadErrorKind } from "@/errors/dyad_error";
 import { queueCloudSandboxSnapshotSync } from "@/ipc/utils/cloud_sandbox_provider";
+import { getFileWriteKey, withLock } from "@/ipc/utils/lock_utils";
+import { isSupabaseFunctionSyncDeferred } from "@/supabase_admin/supabase_recording_deferred_sync";
 
 const logger = log.scope("delete_file");
-
-function getFunctionNameFromPath(input: string): string {
-  return path.basename(path.extname(input) ? path.dirname(input) : input);
-}
 
 const deleteFileSchema = z.object({
   path: z
@@ -43,64 +44,101 @@ export const deleteFileTool: ToolDefinition<z.infer<typeof deleteFileSchema>> =
       return `<dyad-delete path="${escapeXmlAttr(args.path)}"></dyad-delete>`;
     },
 
+    shouldTrackMutation: (_args, result) =>
+      result.startsWith("Successfully deleted") ||
+      result.startsWith("File deleted,"),
+
     execute: async (args, ctx: AgentContext) => {
-      const normalizedPath = path.posix.normalize(
-        args.path.replace(/\\/g, "/"),
-      );
-      if (
-        normalizedPath === "." ||
-        normalizedPath === "./" ||
-        normalizedPath === ""
-      ) {
-        throw new DyadError(
-          `Refusing to delete project root for path: "${args.path}"`,
-          DyadErrorKind.Validation,
-        );
-      }
+      const { relativePath: operationPath, fullPath: fullFilePath } =
+        await prepareDeletePath(ctx.appPath, args.path);
 
-      const fullFilePath = safeJoin(ctx.appPath, args.path);
+      let functionToReconcile: string | undefined;
+      const didDelete = await withLock(
+        await getFileWriteKey(fullFilePath),
+        async () => {
+          const currentStat = lstatIfExists(fullFilePath);
+          if (currentStat) {
+            // Track if this is a shared module
+            if (isSharedServerModule(operationPath)) {
+              ctx.isSharedModulesChanged = true;
+              ctx.sharedServerModulePaths.push(operationPath);
+              ctx.onSharedServerModuleChange?.(operationPath);
+            }
 
-      // Track if this is a shared module
-      if (isSharedServerModule(args.path)) {
-        ctx.isSharedModulesChanged = true;
-        ctx.sharedServerModulePaths.push(args.path);
-      }
+            if (currentStat.isDirectory()) {
+              fs.rmdirSync(fullFilePath, { recursive: true });
+            } else {
+              fs.unlinkSync(fullFilePath);
+            }
+            logger.log(`Successfully deleted file: ${fullFilePath}`);
 
-      if (fs.existsSync(fullFilePath)) {
-        if (fs.lstatSync(fullFilePath).isDirectory()) {
-          fs.rmdirSync(fullFilePath, { recursive: true });
-        } else {
-          fs.unlinkSync(fullFilePath);
-        }
-        logger.log(`Successfully deleted file: ${fullFilePath}`);
+            // Remove from git
+            try {
+              await gitRemove({ path: ctx.appPath, filepath: operationPath });
+            } catch (error) {
+              logger.warn(
+                `Failed to git remove deleted file ${args.path}:`,
+                error,
+              );
+            }
 
-        // Remove from git
-        try {
-          await gitRemove({ path: ctx.appPath, filepath: args.path });
-        } catch (error) {
-          logger.warn(`Failed to git remove deleted file ${args.path}:`, error);
-        }
-
-        // Delete Supabase function if applicable
-        if (ctx.supabaseProjectId && isServerFunction(args.path)) {
-          try {
-            await deleteSupabaseFunction({
-              supabaseProjectId: ctx.supabaseProjectId,
-              functionName: getFunctionNameFromPath(args.path),
-              organizationSlug: ctx.supabaseOrganizationSlug ?? null,
-            });
-          } catch (error) {
-            return `File deleted, but failed to delete Supabase function: ${error}`;
+            if (ctx.supabaseProjectId && isServerFunction(operationPath)) {
+              const functionName = extractFunctionNameFromPath(operationPath);
+              if (ctx.allowDeploySideEffects === false) {
+                ctx.onDeferredFunctionDelete?.(functionName);
+              } else {
+                functionToReconcile = functionName;
+              }
+            }
+          } else {
+            logger.warn(`File to delete does not exist: ${fullFilePath}`);
           }
-        }
-      } else {
-        logger.warn(`File to delete does not exist: ${fullFilePath}`);
+
+          if (currentStat) {
+            queueCloudSandboxSnapshotSync({
+              appId: ctx.appId,
+              deletedPaths: [operationPath],
+            });
+          }
+          return currentStat !== null;
+        },
+      );
+
+      if (!didDelete) {
+        return `File ${args.path} did not exist, so nothing was deleted.`;
       }
 
-      queueCloudSandboxSnapshotSync({
-        appId: ctx.appId,
-        deletedPaths: [args.path],
-      });
+      // Reconcile outside the file lock: deployment admission can queue behind
+      // another chat's batch upload, and other writers of this path must not
+      // wait for it.
+      if (functionToReconcile && ctx.supabaseProjectId) {
+        const functionName = functionToReconcile;
+        try {
+          if (await supabaseFunctionEntryExists(ctx.appPath, functionName)) {
+            await deploySupabaseFunction({
+              appId: ctx.appId,
+              supabaseProjectId: ctx.supabaseProjectId,
+              functionName,
+              appPath: ctx.appPath,
+              organizationSlug: ctx.supabaseOrganizationSlug ?? null,
+              signal: ctx.abortSignal,
+            });
+          } else {
+            await deleteSupabaseFunction({
+              appId: ctx.appId,
+              supabaseProjectId: ctx.supabaseProjectId,
+              functionName,
+              organizationSlug: ctx.supabaseOrganizationSlug ?? null,
+              signal: ctx.abortSignal,
+            });
+          }
+        } catch (error) {
+          if (isSupabaseFunctionSyncDeferred(error)) {
+            return `Successfully deleted ${args.path}. ${error.message}`;
+          }
+          return `File deleted, but failed to reconcile Supabase function: ${error}`;
+        }
+      }
 
       return `Successfully deleted ${args.path}`;
     },

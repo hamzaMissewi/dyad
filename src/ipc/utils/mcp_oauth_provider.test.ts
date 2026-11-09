@@ -5,6 +5,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 // `select()` chain reads from here. Lets us exercise the real
 // provider against a real DB-like surface without touching SQLite.
 const dbStore = new Map<number, string | null>();
+const recovery = vi.hoisted(() => vi.fn<() => string | null>(() => null));
+vi.mock("@/main/safe_storage_legacy", () => ({
+  recoverLegacySafeStorageSecret: recovery,
+}));
 
 vi.mock("electron", () => ({
   shell: {
@@ -84,14 +88,140 @@ vi.mock("drizzle-orm", () => ({
 // work; resolve the provider module after mocks are in place.
 const electronImport = await import("electron");
 const providerImport = await import("@/ipc/utils/mcp_oauth_provider");
-const { DyadOAuthClientProvider, oauthStateHasTokens } = providerImport;
+const {
+  DyadOAuthClientProvider,
+  issueMcpOAuthWriteAuthority,
+  oauthStateHasTokens,
+  revokeMcpOAuthWriteAuthority,
+} = providerImport;
 const { shell, safeStorage } = electronImport;
 
 describe("DyadOAuthClientProvider", () => {
   beforeEach(() => {
     dbStore.clear();
     vi.clearAllMocks();
+    recovery.mockReturnValue(null);
     vi.mocked(safeStorage.isEncryptionAvailable).mockReturnValue(true);
+    vi.mocked(safeStorage.decryptString).mockImplementation((buf: Buffer) => {
+      const s = buf.toString("utf8");
+      return s.startsWith("enc:") ? s.slice(4) : s;
+    });
+  });
+
+  it("preserves unreadable OAuth state through automatic reads and writes until explicit disconnect", async () => {
+    const raw = Buffer.from("v10locked-oauth").toString("base64");
+    dbStore.set(71, raw);
+    const provider = new DyadOAuthClientProvider({
+      serverId: 71,
+      allowInteractive: true,
+      preregisteredClientId: "client",
+    });
+    vi.mocked(safeStorage.decryptString).mockImplementation(() => {
+      throw new Error("denied");
+    });
+    for (const operation of [
+      () => provider.tokens(),
+      () => provider.clientInformation(),
+      () =>
+        provider.saveTokens({
+          access_token: "replacement",
+          token_type: "Bearer",
+        }),
+      () => provider.saveClientInformation({ client_id: "other" }),
+      () => provider.invalidateCredentials("tokens"),
+      () => provider.invalidateCredentials("all"),
+    ]) {
+      await expect(operation()).rejects.toThrow("Saved MCP OAuth credentials");
+      expect(dbStore.get(71)).toBe(raw);
+    }
+    expect(oauthStateHasTokens(raw)).toBe(false);
+    await new DyadOAuthClientProvider({ serverId: 71 }).disconnect();
+    expect(dbStore.get(71)).toBe(raw);
+    await provider.disconnect();
+    expect(dbStore.get(71)).toBeNull();
+    vi.mocked(safeStorage.decryptString).mockImplementation((buf: Buffer) =>
+      buf.toString().slice(4),
+    );
+  });
+
+  it("recovers OAuth state after access returns and retains refresh tokens on subsequent writes", async () => {
+    const raw = Buffer.from("v10legacy-oauth").toString("base64");
+    dbStore.set(72, raw);
+    const provider = new DyadOAuthClientProvider({
+      serverId: 72,
+      allowInteractive: true,
+    });
+    vi.mocked(safeStorage.decryptString).mockImplementationOnce(() => {
+      throw new Error("denied");
+    });
+    await expect(provider.tokens()).rejects.toThrow();
+    recovery.mockReturnValue(
+      JSON.stringify({
+        tokens: {
+          access_token: "old",
+          token_type: "Bearer",
+          refresh_token: "keep",
+        },
+        clientInformation: { client_id: "cid" },
+      }),
+    );
+    vi.mocked(safeStorage.decryptString).mockImplementationOnce(() => {
+      throw new Error("wrong identity");
+    });
+    await provider.saveTokens({ access_token: "new", token_type: "Bearer" });
+    expect(await provider.tokens()).toMatchObject({
+      access_token: "new",
+      refresh_token: "keep",
+    });
+    expect(await provider.clientInformation()).toMatchObject({
+      client_id: "cid",
+    });
+  });
+
+  it.each([false, true])(
+    "does not downgrade encrypted OAuth state when the keyring disappears (during write: %s)",
+    async (duringWrite) => {
+      const raw = Buffer.from("v10legacy-oauth").toString("base64");
+      dbStore.set(74, raw);
+      const provider = new DyadOAuthClientProvider({
+        serverId: 74,
+        allowInteractive: true,
+      });
+      vi.mocked(safeStorage.isEncryptionAvailable).mockReturnValue(false);
+      if (duringWrite) {
+        vi.mocked(safeStorage.isEncryptionAvailable).mockReturnValueOnce(true);
+        vi.mocked(safeStorage.decryptString).mockImplementationOnce(() => {
+          throw new Error("wrong identity");
+        });
+      }
+      recovery.mockReturnValue(
+        JSON.stringify({
+          tokens: { access_token: "old", token_type: "Bearer" },
+        }),
+      );
+      await expect(
+        provider.saveTokens({ access_token: "new", token_type: "Bearer" }),
+      ).rejects.toThrow("Secure storage is unavailable");
+      expect(dbStore.get(74)).toBe(raw);
+    },
+  );
+
+  it.each([
+    "null",
+    "[]",
+    '{"tokens":"bad"}',
+    '{"clientInformation":{"client_id":2}}',
+  ])("preserves malformed decrypted OAuth state: %s", async (json) => {
+    const raw = Buffer.from(`enc:${json}`).toString("base64");
+    dbStore.set(73, raw);
+    const provider = new DyadOAuthClientProvider({
+      serverId: 73,
+      allowInteractive: true,
+    });
+    await expect(
+      provider.saveTokens({ access_token: "new", token_type: "Bearer" }),
+    ).rejects.toThrow();
+    expect(dbStore.get(73)).toBe(raw);
   });
 
   it("computes redirectUrl from the configured callback port", () => {
@@ -123,6 +253,60 @@ describe("DyadOAuthClientProvider", () => {
     const stored = dbStore.get(7);
     expect(stored).toBeDefined();
     expect(stored).not.toContain("tok");
+  });
+
+  it("rejects writes from a revoked OAuth flow authority", async () => {
+    const authority = issueMcpOAuthWriteAuthority(71);
+    const staleProvider = new DyadOAuthClientProvider({
+      serverId: 71,
+      allowInteractive: true,
+      writeAuthority: authority,
+    });
+    await staleProvider.saveTokens({
+      access_token: "before-revoke",
+      token_type: "Bearer",
+    });
+    const before = dbStore.get(71);
+
+    await revokeMcpOAuthWriteAuthority(71);
+    await staleProvider.saveTokens({
+      access_token: "stale-after-revoke",
+      token_type: "Bearer",
+    });
+    expect(dbStore.get(71)).toBe(before);
+
+    const replacementAuthority = issueMcpOAuthWriteAuthority(71);
+    const replacement = new DyadOAuthClientProvider({
+      serverId: 71,
+      allowInteractive: true,
+      writeAuthority: replacementAuthority,
+    });
+    await replacement.saveTokens({
+      access_token: "replacement",
+      token_type: "Bearer",
+    });
+    expect(await replacement.tokens()).toMatchObject({
+      access_token: "replacement",
+    });
+  });
+
+  it("also revokes background providers that captured the prior epoch", async () => {
+    const background = new DyadOAuthClientProvider({
+      serverId: 72,
+      allowInteractive: false,
+    });
+    await background.saveTokens({
+      access_token: "background-before-revoke",
+      token_type: "Bearer",
+    });
+    const before = dbStore.get(72);
+
+    await revokeMcpOAuthWriteAuthority(72);
+    await background.saveTokens({
+      access_token: "stale-background-refresh",
+      token_type: "Bearer",
+    });
+    expect(dbStore.get(72)).toBe(before);
   });
 
   it("seeds clientInformation from preregisteredClientId on first read", async () => {

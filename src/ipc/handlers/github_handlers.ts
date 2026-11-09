@@ -1,5 +1,5 @@
-import { BrowserWindow, IpcMainInvokeEvent } from "electron";
-import fetch from "node-fetch"; // Use node-fetch for making HTTP requests in main process
+import { IpcMainInvokeEvent } from "electron";
+import fetch from "../utils/github_fetch";
 import { writeSettings, readSettings } from "../../main/settings";
 import {
   gitSetRemoteUrl,
@@ -13,16 +13,29 @@ import {
   gitCreateBranch,
   gitCheckout,
   gitGetMergeConflicts,
-  gitCurrentBranch,
   gitListBranches,
   gitListRemoteBranches,
   isGitStatusClean,
-  getCurrentCommitHash,
   isGitMergeInProgress,
   isGitRebaseInProgress,
-  GitConflictError,
+  GitStateError,
+  GIT_ERROR_CODES,
+  isMissingRemoteBranchError,
+  execGit,
 } from "../utils/git_utils";
+import {
+  appOperationCoordinator,
+  readAppResource,
+} from "../services/app_operation_coordinator";
 import { gitService } from "../services/git_service";
+import {
+  collectSyncSnapshot,
+  collectPushBaseline,
+  measurePush,
+  type PushBaseline,
+} from "../utils/git_sync_diagnostics";
+import { summarizePush } from "@/github_ops/push_summary";
+import type { PushSummary } from "@/github_ops/state";
 import * as schema from "../../db/schema";
 import fs from "node:fs";
 import { getDyadAppPath, isAppLocationAccessible } from "../../paths/paths";
@@ -31,18 +44,50 @@ import { apps } from "../../db/schema";
 import { eq } from "drizzle-orm";
 import { GithubUser } from "../../lib/schemas";
 import log from "electron-log";
-import { IS_TEST_BUILD } from "../utils/test_utils";
 import path from "node:path";
-import { withLock } from "../utils/lock_utils";
+import type { FetchRefspecState, GitRemoteAuth } from "../git_types";
+import {
+  getGitHubAccessTokenUrl,
+  getGitHubApiBase,
+  getGitHubDeviceCodeUrl,
+} from "../utils/github_endpoints";
+import {
+  assertCanLinkProvider,
+  assertRemoteProvider,
+  getAppGitRemoteAuth,
+  githubRemote,
+  githubRemoteAuth,
+  requireAppGitRemote,
+  resolveAppGitRemote,
+  type GitRemoteProvider,
+} from "../utils/app_git_remote";
+import { findAppOrThrow } from "../utils/find_app";
+import { withPushHint } from "../utils/git_push_hints";
 import { createTypedHandler } from "./base";
 import { githubContracts } from "../types/github";
-import type { CloneRepoParams, CloneRepoResult } from "../types/github";
+import type {
+  CloneRepoParams,
+  CloneRepoResult,
+  ListCollaboratorsResult,
+} from "../types/github";
 import { DyadError, DyadErrorKind } from "@/errors/dyad_error";
+import {
+  sanitizeAppDisplayName,
+  slugifyAppFolderName,
+} from "@/shared/app_names";
 import { slugifyAppPath } from "@/shared/slugify";
+import { resolveUniqueFolderName } from "../utils/app_name_resolution";
+import { withLock } from "../utils/lock_utils";
 import {
   isComponentTaggerUpgradeNeeded,
   applyComponentTagger,
 } from "../utils/app_upgrade_utils";
+import {
+  connectionFlowRegistry,
+  registerConnectionFlowProvider,
+  runOAuthReturnExchange,
+} from "./connection_flow_handlers";
+import type { ConnectionFlowInvocationRef } from "@/connection_flow/state";
 
 const logger = log.scope("github_handlers");
 
@@ -62,37 +107,23 @@ export function normalizeGitHubRepoName(repoName: string): string {
 // TODO: Fetch this securely, e.g., from environment variables or a config file
 const GITHUB_CLIENT_ID = process.env.GITHUB_CLIENT_ID || "Ov23liWV2HdC0RBLecWx";
 
-// Use test server URLs when in test mode
-
-const TEST_SERVER_BASE = `http://localhost:${process.env.FAKE_LLM_PORT || "3500"}`;
-
-const GITHUB_DEVICE_CODE_URL = IS_TEST_BUILD
-  ? `${TEST_SERVER_BASE}/github/login/device/code`
-  : "https://github.com/login/device/code";
-const GITHUB_ACCESS_TOKEN_URL = IS_TEST_BUILD
-  ? `${TEST_SERVER_BASE}/github/login/oauth/access_token`
-  : "https://github.com/login/oauth/access_token";
-const GITHUB_API_BASE = IS_TEST_BUILD
-  ? `${TEST_SERVER_BASE}/github/api`
-  : "https://api.github.com";
-const GITHUB_GIT_BASE = IS_TEST_BUILD
-  ? `${TEST_SERVER_BASE}/github/git`
-  : "https://github.com";
-
 const GITHUB_SCOPES = "repo,user,workflow"; // Define the scopes needed
 
-// --- State Management (Simple in-memory, consider alternatives for robustness) ---
-interface DeviceFlowState {
+// --- Device Flow State ---
+//
+// The authoritative flow state (what the renderer sees) lives in the
+// connection flow registry, keyed per provider and correlated by typed ref.
+// This map only holds GitHub-specific polling internals for each flow.
+interface DeviceFlowRecord {
   deviceCode: string;
   interval: number;
   timeoutId: NodeJS.Timeout | null;
-  isPolling: boolean;
-  window: BrowserWindow | null; // Reference to the window that initiated the flow
+  signal: AbortSignal;
+  disposedForShutdown: boolean;
 }
 
-// Simple map to track ongoing flows (key could be appId or a unique flow ID if needed)
-// For simplicity, let's assume only one flow can happen at a time for now.
-let currentFlowState: DeviceFlowState | null = null;
+const deviceFlows = new Map<string, DeviceFlowRecord>();
+let githubFlowsShuttingDown = false;
 
 // --- Helper Functions ---
 
@@ -107,7 +138,7 @@ export async function getGithubUser(): Promise<GithubUser | null> {
   try {
     const accessToken = settings.githubAccessToken?.value;
     if (!accessToken) return null;
-    const res = await fetch(`${GITHUB_API_BASE}/user/emails`, {
+    const res = await fetch(`${getGitHubApiBase()}/user/emails`, {
       headers: { Authorization: `Bearer ${accessToken}` },
     });
     if (!res.ok) return null;
@@ -134,12 +165,15 @@ export async function prepareLocalBranch({
   appId,
   branch,
   remoteUrl,
-  accessToken,
+  auth,
+  providerLabel = "GitHub",
 }: {
   appId: number;
   branch?: string;
   remoteUrl?: string;
-  accessToken?: string;
+  auth?: GitRemoteAuth;
+  /** Named in the auto-commit message, so the history says where the app went. */
+  providerLabel?: string;
 }) {
   const app = await db.query.apps.findFirst({ where: eq(apps.id, appId) });
   if (!app) {
@@ -156,14 +190,14 @@ export async function prepareLocalBranch({
         remoteUrl,
       });
 
-      // Fetch remote branches if we have access token and remote URL
+      // Fetch remote branches if we have credentials and remote URL
       // This allows us to check if the branch exists remotely
-      if (accessToken) {
+      if (auth) {
         try {
           await gitFetch({
             path: appPath,
             remote: "origin",
-            accessToken,
+            auth,
           });
         } catch (fetchError: any) {
           // For new repos, fetch might fail because the repo is empty
@@ -175,188 +209,115 @@ export async function prepareLocalBranch({
       }
     }
 
-    // Use locking to prevent race conditions when multiple operations attempt to modify the repository
-    // This ensures atomicity and prevents conflicts between concurrent operations
-    await withLock(appId, async () => {
-      const isClean = await isGitStatusClean({ path: appPath });
-      if (!isClean) {
-        if (isGitMergeInProgress({ path: appPath })) {
-          throw new Error(
-            "Cannot auto-commit changes because a merge is in progress. " +
-              "Please complete or abort the merge and try again.",
-          );
-        }
-        if (isGitRebaseInProgress({ path: appPath })) {
-          throw new Error(
-            "Cannot auto-commit changes because a rebase is in progress. " +
-              "Please complete or abort the rebase and try again.",
-          );
-        }
-
-        try {
-          const commitHash = await gitService.stageAllAndCommit({
-            path: appPath,
-            message:
-              "chore: auto-commit local changes before connecting to GitHub",
-          });
-          logger.info(
-            `[GitHub Handler] Auto-committed local changes (${commitHash}) before preparing branch '${targetBranch}'.`,
-          );
-        } catch (commitError) {
-          logger.error(
-            "[GitHub Handler] Failed to auto-commit local changes before preparing branch:",
-            commitError,
-          );
-          throw new Error(
-            "Failed to auto-commit uncommitted changes. Please commit or stash your changes manually and try again.",
-          );
-        }
+    const isClean = await isGitStatusClean({ path: appPath });
+    if (!isClean) {
+      if (isGitMergeInProgress({ path: appPath })) {
+        throw GitStateError(
+          "Cannot auto-commit changes because a merge is in progress. " +
+            "Please complete or abort the merge and try again.",
+          GIT_ERROR_CODES.MERGE_IN_PROGRESS,
+        );
+      }
+      if (isGitRebaseInProgress({ path: appPath })) {
+        throw GitStateError(
+          "Cannot auto-commit changes because a rebase is in progress. " +
+            "Please complete or abort the rebase and try again.",
+          GIT_ERROR_CODES.REBASE_IN_PROGRESS,
+        );
       }
 
-      await ensureCleanWorkspace(appPath, `preparing branch '${targetBranch}'`);
-
-      // List branches and check if target branch exists
-      const localBranches = await gitListBranches({ path: appPath });
-
-      // Check if branch exists remotely (if remote was set up)
-      let remoteBranches: string[] = [];
-      if (remoteUrl && accessToken) {
-        remoteBranches = await gitListRemoteBranches({
+      try {
+        const commitHash = await gitService.stageAllAndCommit({
           path: appPath,
-          remote: "origin",
+          message: `chore: auto-commit local changes before connecting to ${providerLabel}`,
         });
+        logger.info(
+          `[GitHub Handler] Auto-committed local changes (${commitHash}) before preparing branch '${targetBranch}'.`,
+        );
+      } catch (commitError) {
+        logger.error(
+          "[GitHub Handler] Failed to auto-commit local changes before preparing branch:",
+          commitError,
+        );
+        throw new Error(
+          "Failed to auto-commit uncommitted changes. Please commit or stash your changes manually and try again.",
+        );
       }
+    }
 
-      if (!localBranches.includes(targetBranch)) {
-        // If branch exists remotely, create local tracking branch
-        // Otherwise, create a new local branch
-        if (remoteBranches.includes(targetBranch)) {
-          // For native git: create branch with tracking
-          // For isomorphic-git: checkout remote branch directly (creates tracking branch automatically)
-          const settings = readSettings();
-          if (settings.enableNativeGit) {
-            // Native git: create branch from remote with tracking
-            await gitCreateBranch({
-              path: appPath,
-              branch: targetBranch,
-              from: `origin/${targetBranch}`,
-            });
-            await gitCheckout({ path: appPath, ref: targetBranch });
-          } else {
-            // isomorphic-git: create local branch from the remote commit and checkout so branch name matches native git
-            // gitCreateBranch does not support 'from' when native git is disabled, so resolve the remote ref's commit
-            // and create the local branch at that commit.
-            const remoteRef = `refs/remotes/origin/${targetBranch}`;
-            let commitSha: string;
-            try {
-              commitSha = await getCurrentCommitHash({
-                path: appPath,
-                ref: remoteRef,
-              });
-            } catch {
-              // Fallback to short remote ref name if the full refs path isn't present
-              try {
-                commitSha = await getCurrentCommitHash({
-                  path: appPath,
-                  ref: `origin/${targetBranch}`,
-                });
-              } catch (innerErr: any) {
-                throw new Error(
-                  `Failed to resolve remote branch 'origin/${targetBranch}' to a commit. ` +
-                    "Ensure 'git fetch' succeeded and the remote branch exists. " +
-                    `${innerErr?.message || String(innerErr)}`,
-                );
-              }
-            }
+    await ensureCleanWorkspace(appPath, `preparing branch '${targetBranch}'`);
 
-            // Checkout the remote commit (detached HEAD), create branch at that commit, then checkout the branch
-            // Store current branch to restore on error
-            const previousBranch = await gitCurrentBranch({ path: appPath });
-            try {
-              await gitCheckout({ path: appPath, ref: commitSha });
-              await gitCreateBranch({ path: appPath, branch: targetBranch });
-              await gitCheckout({ path: appPath, ref: targetBranch });
-            } catch (error: any) {
-              // If anything fails, restore the previous branch to avoid leaving repo in detached HEAD
-              if (previousBranch) {
-                try {
-                  await gitCheckout({ path: appPath, ref: previousBranch });
-                } catch (restoreError) {
-                  logger.error(
-                    `Failed to restore branch '${previousBranch}' after error: ${restoreError}`,
-                  );
-                }
-              } else {
-                logger.warn(
-                  "[GitHub Handler] Previous branch unknown; repository may remain in detached HEAD at " +
-                    `${commitSha}.`,
-                );
-              }
-              throw error;
-            }
-          }
-        } else {
-          // Create new local branch
-          await gitCreateBranch({
-            path: appPath,
-            branch: targetBranch,
-          });
-          await gitCheckout({ path: appPath, ref: targetBranch });
-        }
+    // List branches and check if target branch exists
+    const localBranches = await gitListBranches({ path: appPath });
+
+    // Check if branch exists remotely (if remote was set up)
+    let remoteBranches: string[] = [];
+    if (remoteUrl && auth) {
+      remoteBranches = await gitListRemoteBranches({
+        path: appPath,
+        remote: "origin",
+      });
+    }
+
+    if (!localBranches.includes(targetBranch)) {
+      // If branch exists remotely, create local tracking branch
+      // Otherwise, create a new local branch
+      if (remoteBranches.includes(targetBranch)) {
+        await gitCreateBranch({
+          path: appPath,
+          branch: targetBranch,
+          from: `origin/${targetBranch}`,
+        });
+        await gitCheckout({ path: appPath, ref: targetBranch });
       } else {
-        // Branch exists locally, just checkout
+        // Create new local branch
+        await gitCreateBranch({
+          path: appPath,
+          branch: targetBranch,
+        });
         await gitCheckout({ path: appPath, ref: targetBranch });
       }
-    });
+    } else {
+      // Branch exists locally, just checkout
+      await gitCheckout({ path: appPath, ref: targetBranch });
+    }
   } catch (gitError: any) {
     logger.error("[GitHub Handler] Failed to prepare local branch:", gitError);
-    // Check if error is about uncommitted changes (fallback in case check above missed it)
+    if (gitError instanceof DyadError) throw gitError;
     const errorMessage =
       gitError?.message ||
       "Failed to prepare local branch for the connected repository.";
-    const lowerMessage = errorMessage.toLowerCase();
-    if (
-      lowerMessage.includes("local changes") ||
-      lowerMessage.includes("would be overwritten") ||
-      lowerMessage.includes("please commit or stash")
-    ) {
-      throw new Error(
-        `Failed to prepare local branch: uncommitted changes detected. ` +
-          "Unable to automatically handle uncommitted changes. Please commit or stash your changes manually and try again.",
-      );
-    }
     throw new Error(errorMessage);
   }
 }
-// function event.sender.send(channel: string, data: any) {
-//   if (currentFlowState?.window && !currentFlowState.window.isDestroyed()) {
-//     currentFlowState.window.webContents.send(channel, data);
-//   }
-// }
-
-async function pollForAccessToken(event: IpcMainInvokeEvent) {
-  if (!currentFlowState || !currentFlowState.isPolling) {
+async function pollForAccessToken(invocationRef: ConnectionFlowInvocationRef) {
+  const key = invocationRef.operationId;
+  const record = deviceFlows.get(key);
+  const flowState = connectionFlowRegistry.getState("github");
+  if (
+    !record ||
+    flowState.status !== "awaiting-return" ||
+    flowState.invocationRef.operationId !== invocationRef.operationId
+  ) {
+    // Flow was cancelled, failed, or superseded — stop polling.
     logger.debug("[GitHub Handler] Polling stopped or no active flow.");
+    cleanupDeviceFlow(invocationRef);
     return;
   }
 
-  const { deviceCode, interval } = currentFlowState;
-
   logger.debug("[GitHub Handler] Polling for token with device code");
-  event.sender.send("github:flow-update", {
-    message: "Polling GitHub for authorization...",
-  });
 
   try {
-    const response = await fetch(GITHUB_ACCESS_TOKEN_URL, {
+    const response = await fetch(getGitHubAccessTokenUrl(), {
       method: "POST",
+      signal: record.signal,
       headers: {
         "Content-Type": "application/json",
         Accept: "application/json",
       },
       body: JSON.stringify({
         client_id: GITHUB_CLIENT_ID,
-        device_code: deviceCode,
+        device_code: record.deviceCode,
         grant_type: "urn:ietf:params:oauth:grant-type:device_code",
       }),
     });
@@ -366,67 +327,93 @@ async function pollForAccessToken(event: IpcMainInvokeEvent) {
       error?: string;
       error_description?: string;
     };
+    if (githubFlowsShuttingDown || record.disposedForShutdown) return;
 
     if (response.ok && data.access_token) {
       logger.log("Successfully obtained GitHub Access Token.");
-      event.sender.send("github:flow-success", {
-        message: "Successfully connected!",
-      });
-      writeSettings({
-        githubAccessToken: {
-          value: data.access_token,
+      // The token is always written, even if the flow was cancelled while
+      // this request was in flight — GitHub already authorized us, and
+      // dropping the token would leave the account half-connected.
+      // `expectedFlowId` correlates the write with THIS poll chain's flow:
+      // if the user cancelled and started a newer flow while this request
+      // was in flight, the stale result lands as unsolicited instead of
+      // advancing the newer flow.
+      const outcome = await runOAuthReturnExchange(
+        "github",
+        () => {
+          writeSettings({
+            githubAccessToken: {
+              value: data.access_token!,
+            },
+          });
         },
-      });
-
-      stopPolling();
+        {
+          expectedInvocationRef: invocationRef,
+          // Device-flow polling is an authenticated producer. Preserve a
+          // successfully authorized token if the UI flow was cancelled while
+          // the final poll was in flight, without allowing it to claim a newer
+          // invocation.
+          allowUnclaimedExchange: true,
+        },
+      );
+      if (!outcome.ok) {
+        // A claimed failure was already recorded on the flow; rethrow only
+        // unclaimed failures so the generic network-error handling applies.
+        if (!outcome.claimed) {
+          throw outcome.error;
+        }
+      }
+      cleanupDeviceFlow(invocationRef);
       return;
     } else if (data.error) {
       switch (data.error) {
         case "authorization_pending":
           logger.debug("Authorization pending...");
-          event.sender.send("github:flow-update", {
-            message: "Waiting for user authorization...",
-          });
-          // Schedule next poll
-          currentFlowState.timeoutId = setTimeout(
-            () => pollForAccessToken(event),
-            interval * 1000,
+          if (deviceFlows.get(key) !== record) return;
+          record.timeoutId = setTimeout(
+            () => pollForAccessToken(invocationRef),
+            record.interval * 1000,
           );
           break;
-        case "slow_down":
-          const newInterval = interval + 5;
+        case "slow_down": {
+          const newInterval = record.interval + 5;
           logger.debug(`Slow down requested. New interval: ${newInterval}s`);
-          currentFlowState.interval = newInterval; // Update interval
-          event.sender.send("github:flow-update", {
-            message: `GitHub asked to slow down. Retrying in ${newInterval}s...`,
-          });
-          currentFlowState.timeoutId = setTimeout(
-            () => pollForAccessToken(event),
+          record.interval = newInterval;
+          if (deviceFlows.get(key) !== record) return;
+          record.timeoutId = setTimeout(
+            () => pollForAccessToken(invocationRef),
             newInterval * 1000,
           );
           break;
+        }
         case "expired_token":
           logger.error("Device code expired.");
-          event.sender.send("github:flow-error", {
-            error: "Verification code expired. Please try again.",
-          });
-          stopPolling();
+          connectionFlowRegistry.fail(
+            "github",
+            invocationRef,
+            "timeout",
+            "Verification code expired. Please try again.",
+          );
           break;
         case "access_denied":
           logger.error("Access denied by user.");
-          event.sender.send("github:flow-error", {
-            error: "Authorization denied by user.",
-          });
-          stopPolling();
+          connectionFlowRegistry.fail(
+            "github",
+            invocationRef,
+            "user_cancelled",
+            "Authorization denied by user.",
+          );
           break;
         default:
           logger.error(
             `Unknown GitHub error: ${data.error_description || data.error}`,
           );
-          event.sender.send("github:flow-error", {
-            error: `GitHub authorization error: ${data.error_description || data.error}`,
-          });
-          stopPolling();
+          connectionFlowRegistry.fail(
+            "github",
+            invocationRef,
+            "token_invalid",
+            `GitHub authorization error: ${data.error_description || data.error}`,
+          );
           break;
       }
     } else {
@@ -437,118 +424,116 @@ async function pollForAccessToken(event: IpcMainInvokeEvent) {
     }
   } catch (error) {
     logger.error("Error polling for GitHub access token:", error);
-    event.sender.send("github:flow-error", {
-      error: `Network or unexpected error during polling: ${
+    connectionFlowRegistry.fail(
+      "github",
+      invocationRef,
+      "network",
+      `Network or unexpected error during polling: ${
         error instanceof Error ? error.message : String(error)
       }`,
-    });
-    stopPolling();
+    );
   }
 }
 
-function stopPolling() {
-  if (currentFlowState) {
-    if (currentFlowState.timeoutId) {
-      clearTimeout(currentFlowState.timeoutId);
+/**
+ * Releases the polling timer and device code for a flow. Wired as the
+ * registry's `onFlowEnded` hook, so it runs whenever the flow reaches a
+ * terminal state — cancel IPC, timeout, failure, or success — even if the
+ * renderer that started the flow is long gone.
+ */
+function cleanupDeviceFlow(invocationRef: ConnectionFlowInvocationRef) {
+  const key = invocationRef.operationId;
+  const record = deviceFlows.get(key);
+  if (!record) {
+    return;
+  }
+  if (record.timeoutId) {
+    clearTimeout(record.timeoutId);
+  }
+  deviceFlows.delete(key);
+  logger.debug("[GitHub Handler] Device flow cleaned up:", key);
+}
+
+/**
+ * Starts the GitHub device flow for a freshly allocated invocation ref.
+ * the connection flow registry (`connection-flow:start` with provider
+ * "github"), which guarantees at most one active GitHub flow at a time —
+ * without blocking flows for other providers.
+ */
+async function startGithubDeviceFlow({
+  invocationRef,
+  signal,
+}: {
+  invocationRef: ConnectionFlowInvocationRef;
+  appId: number | null;
+  signal: AbortSignal;
+}) {
+  const key = invocationRef.operationId;
+  logger.debug(`Starting GitHub device flow ${key}`);
+  try {
+    const res = await fetch(getGitHubDeviceCodeUrl(), {
+      method: "POST",
+      signal,
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify({
+        client_id: GITHUB_CLIENT_ID,
+        scope: GITHUB_SCOPES,
+      }),
+    });
+    if (!res.ok) {
+      const errData = (await res.json()) as any;
+      throw new Error(
+        `GitHub API Error: ${errData.error_description || res.statusText}`,
+      );
     }
-    currentFlowState.isPolling = false;
-    currentFlowState.timeoutId = null;
+    const data = (await res.json()) as {
+      device_code: string;
+      interval?: number;
+      user_code: string;
+      verification_uri: string;
+    };
 
-    logger.debug("[GitHub Handler] Polling stopped.");
-  }
-}
+    logger.info("Received device code response");
+    const record: DeviceFlowRecord = {
+      deviceCode: data.device_code,
+      interval: data.interval || 5,
+      timeoutId: null,
+      signal,
+      disposedForShutdown: false,
+    };
+    deviceFlows.set(key, record);
 
-// --- IPC Handlers ---
-
-function handleStartGithubFlow(
-  event: IpcMainInvokeEvent,
-  args: { appId: number | null },
-) {
-  logger.debug(`Received github:start-flow for appId: ${args.appId}`);
-
-  // If a flow is already in progress, maybe cancel it or send an error
-  if (currentFlowState && currentFlowState.isPolling) {
-    logger.warn("Another GitHub flow is already in progress.");
-    event.sender.send("github:flow-error", {
-      error: "Another connection process is already active.",
-    });
-    return;
-  }
-
-  // Store the window that initiated the request
-  const window = BrowserWindow.fromWebContents(event.sender);
-  if (!window) {
-    logger.error("Could not get BrowserWindow instance.");
-    return;
-  }
-
-  currentFlowState = {
-    deviceCode: "",
-    interval: 5, // Default interval
-    timeoutId: null,
-    isPolling: false,
-    window: window,
-  };
-
-  event.sender.send("github:flow-update", {
-    message: "Requesting device code from GitHub...",
-  });
-
-  fetch(GITHUB_DEVICE_CODE_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Accept: "application/json",
-    },
-    body: JSON.stringify({
-      client_id: GITHUB_CLIENT_ID,
-      scope: GITHUB_SCOPES,
-    }),
-  })
-    .then((res) => {
-      if (!res.ok) {
-        return res.json().then((errData: any) => {
-          throw new Error(
-            `GitHub API Error: ${errData.error_description || res.statusText}`,
-          );
-        });
-      }
-      return res.json() as Promise<{
-        device_code: string;
-        interval?: number;
-        user_code: string;
-        verification_uri: string;
-      }>;
-    })
-    .then((data) => {
-      logger.info("Received device code response");
-      if (!currentFlowState) return; // Flow might have been cancelled
-
-      currentFlowState.deviceCode = data.device_code;
-      currentFlowState.interval = data.interval || 5;
-      currentFlowState.isPolling = true;
-
-      // Send user code and verification URI to renderer
-      event.sender.send("github:flow-update", {
+    // The flow may have been cancelled while the device code request was in
+    // flight; markPrepared is then ignored by the machine and we stand down.
+    const prepared = connectionFlowRegistry.markPrepared(
+      "github",
+      invocationRef,
+      {
         userCode: data.user_code,
         verificationUri: data.verification_uri,
-        message: "Please authorize in your browser.",
-      });
+      },
+    );
+    if (!prepared) {
+      cleanupDeviceFlow(invocationRef);
+      return;
+    }
 
-      // Start polling after the initial interval
-      currentFlowState.timeoutId = setTimeout(
-        () => pollForAccessToken(event),
-        currentFlowState.interval * 1000,
-      );
-    })
-    .catch((error) => {
-      logger.error("Error initiating GitHub device flow:", error);
-      event.sender.send("github:flow-error", {
-        error: `Failed to start GitHub connection: ${error.message}`,
-      });
-      stopPolling(); // Ensure polling stops on initial error
-      currentFlowState = null; // Clear state on initial error
-    });
+    record.timeoutId = setTimeout(
+      () => pollForAccessToken(invocationRef),
+      record.interval * 1000,
+    );
+  } catch (error: any) {
+    logger.error("Error initiating GitHub device flow:", error);
+    connectionFlowRegistry.fail(
+      "github",
+      invocationRef,
+      "network",
+      `Failed to start GitHub connection: ${error.message}`,
+    );
+  }
 }
 
 // --- GitHub List Repos Handler ---
@@ -565,7 +550,7 @@ async function handleListGithubRepos(): Promise<
 
     // Fetch user's repositories
     const response = await fetch(
-      `${GITHUB_API_BASE}/user/repos?per_page=100&sort=updated`,
+      `${getGitHubApiBase()}/user/repos?per_page=100&sort=updated`,
       {
         headers: {
           Authorization: `Bearer ${accessToken}`,
@@ -609,7 +594,7 @@ async function handleGetRepoBranches(
 
     // Fetch repository branches
     const response = await fetch(
-      `${GITHUB_API_BASE}/repos/${owner}/${repo}/branches`,
+      `${getGitHubApiBase()}/repos/${owner}/${repo}/branches`,
       {
         headers: {
           Authorization: `Bearer ${accessToken}`,
@@ -655,13 +640,13 @@ async function handleIsRepoAvailable(
     // If org is empty, use the authenticated user
     const owner =
       org ||
-      (await fetch(`${GITHUB_API_BASE}/user`, {
+      (await fetch(`${getGitHubApiBase()}/user`, {
         headers: { Authorization: `Bearer ${accessToken}` },
       })
         .then((r) => r.json() as Promise<{ login?: string }>)
         .then((u) => u.login ?? ""));
     // Check if repo exists (using normalized name)
-    const url = `${GITHUB_API_BASE}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(normalizedRepo)}`;
+    const url = `${getGitHubApiBase()}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(normalizedRepo)}`;
     const res = await fetch(url, {
       headers: { Authorization: `Bearer ${accessToken}` },
     });
@@ -679,7 +664,7 @@ async function handleIsRepoAvailable(
 }
 
 // --- GitHub Create Repo Handler ---
-async function handleCreateRepo(
+export async function handleCreateRepo(
   event: IpcMainInvokeEvent,
   {
     org,
@@ -688,6 +673,9 @@ async function handleCreateRepo(
     branch,
   }: { org: string; repo: string; appId: number; branch?: string },
 ): Promise<void> {
+  const app = await findAppOrThrow(appId);
+  assertCanLinkProvider(app, "github");
+
   // Normalize the repo name to match GitHub's automatic normalization
   // GitHub converts spaces to hyphens when creating repositories
   const normalizedRepo = normalizeGitHubRepoName(repo);
@@ -701,7 +689,7 @@ async function handleCreateRepo(
   // If org is empty, create for the authenticated user
   let owner = org;
   if (!owner) {
-    const userRes = await fetch(`${GITHUB_API_BASE}/user`, {
+    const userRes = await fetch(`${getGitHubApiBase()}/user`, {
       headers: { Authorization: `Bearer ${accessToken}` },
     });
     const user = (await userRes.json()) as { login?: string };
@@ -709,8 +697,8 @@ async function handleCreateRepo(
   }
   // Create repo
   const createUrl = org
-    ? `${GITHUB_API_BASE}/orgs/${owner}/repos`
-    : `${GITHUB_API_BASE}/user/repos`;
+    ? `${getGitHubApiBase()}/orgs/${owner}/repos`
+    : `${getGitHubApiBase()}/user/repos`;
   const res = await fetch(createUrl, {
     method: "POST",
     headers: {
@@ -767,14 +755,14 @@ async function handleCreateRepo(
   // Set up remote URL before preparing branch.
   // The URL is stored without credentials; auth is injected per-invocation
   // via environment variables in git_utils.
-  const remoteUrl = `${GITHUB_GIT_BASE}/${owner}/${normalizedRepo}.git`;
+  const remote = githubRemote({ owner, repo: normalizedRepo, branch });
 
   // Prepare local branch with remote URL set up
   await prepareLocalBranch({
     appId,
     branch,
-    remoteUrl,
-    accessToken,
+    remoteUrl: remote.httpsUrl,
+    auth: githubRemoteAuth(accessToken),
   });
 
   // Store org, repo (normalized), and branch in the app's DB row (apps table)
@@ -787,7 +775,7 @@ async function handleCreateRepo(
 }
 
 // --- GitHub Connect to Existing Repo Handler ---
-async function handleConnectToExistingRepo(
+export async function handleConnectToExistingRepo(
   event: IpcMainInvokeEvent,
   {
     owner,
@@ -797,6 +785,8 @@ async function handleConnectToExistingRepo(
   }: { owner: string; repo: string; branch: string; appId: number },
 ): Promise<void> {
   try {
+    assertCanLinkProvider(await findAppOrThrow(appId), "github");
+
     // Get access token from settings
     const settings = readSettings();
     const accessToken = settings.githubAccessToken?.value;
@@ -806,7 +796,7 @@ async function handleConnectToExistingRepo(
 
     // Verify the repository exists and user has access
     const repoResponse = await fetch(
-      `${GITHUB_API_BASE}/repos/${owner}/${repo}`,
+      `${getGitHubApiBase()}/repos/${owner}/${repo}`,
       {
         headers: {
           Authorization: `Bearer ${accessToken}`,
@@ -824,14 +814,14 @@ async function handleConnectToExistingRepo(
 
     // Set up remote URL before preparing branch (credentials are never
     // stored in the URL; auth is injected per-invocation in git_utils)
-    const remoteUrl = `${GITHUB_GIT_BASE}/${owner}/${repo}.git`;
+    const remote = githubRemote({ owner, repo, branch });
 
     // Prepare local branch with remote URL set up
     await prepareLocalBranch({
       appId,
       branch,
-      remoteUrl,
-      accessToken,
+      remoteUrl: remote.httpsUrl,
+      auth: githubRemoteAuth(accessToken),
     });
 
     // Store org, repo, and branch in the app's DB row
@@ -844,109 +834,174 @@ async function handleConnectToExistingRepo(
 }
 
 // --- GitHub Push Handler ---
-async function handlePushToGithub(
+export async function handlePushToGithub(
   event: IpcMainInvokeEvent,
   {
     appId,
     force,
     forceWithLease,
+    provider,
   }: {
     appId: number;
     force?: boolean;
     forceWithLease?: boolean;
+    /** What the caller believes this app is linked to; refused if it is not. */
+    provider?: GitRemoteProvider;
   },
-): Promise<void> {
-  // Get access token from settings
-  const settings = readSettings();
-  const accessToken = settings.githubAccessToken?.value;
-  if (!accessToken) {
-    throw new DyadError("Not authenticated with GitHub.", DyadErrorKind.Auth);
-  }
-
-  // Get app info from DB
-  const app = await db.query.apps.findFirst({ where: eq(apps.id, appId) });
-  if (!app || !app.githubOrg || !app.githubRepo) {
-    throw new DyadError(
-      "App is not linked to a GitHub repo.",
-      DyadErrorKind.Precondition,
-    );
-  }
+): Promise<PushSummary> {
+  const app = await findAppOrThrow(appId);
+  const remote = requireAppGitRemote(app);
+  assertRemoteProvider(remote, provider);
+  const auth = getAppGitRemoteAuth(remote);
   const appPath = getDyadAppPath(app.path);
-  const branch = app.githubBranch || "main";
+  const branch = remote.branch;
 
-  // Set up remote URL (credentials are never stored in the URL; auth is
-  // injected per-invocation in git_utils). Re-setting it on every push also
-  // scrubs tokens that older versions embedded in .git/config.
-  const remoteUrl = `${GITHUB_GIT_BASE}/${app.githubOrg}/${app.githubRepo}.git`;
-  // Set or update remote URL using git config
-  await gitSetRemoteUrl({
-    path: appPath,
-    remoteUrl,
-  });
+  // Measured before anything changes, so a failure still logs what the
+  // repository looked like, and the push can be compared against it after.
+  const before = await collectSyncSnapshot({ path: appPath, branch });
+  const syncContext = {
+    appId,
+    repo: remote.displayPath,
+    pushedBranch: branch,
+    currentBranch: describeBranch(before),
+    uncommittedFiles: before.uncommittedFiles,
+    branchesNotOnRemote: before.branchesNotOnRemote,
+  };
+  // The push is measured against where things stand after the pull, since
+  // the pull's fetch moves the tracking ref too. Until the pull runs, that is
+  // the snapshot.
+  let baseline: PushBaseline = {
+    head: before.head,
+    remoteTip: before.remoteTip,
+  };
+  // Logged with the outcome: "added" means this sync repaired a remote whose
+  // tracking refs had never been updating, so earlier summaries were stale.
+  let fetchRefspec: FetchRefspecState | null = null;
 
-  // Pull changes first (unless force push)
-  if (!force && !forceWithLease) {
-    try {
-      await gitPull({
+  try {
+    // Set up remote URL (credentials are never stored in the URL; auth is
+    // injected per-invocation in git_utils). Re-setting it on every push also
+    // scrubs tokens that older versions embedded in .git/config, and adds the
+    // fetch refspec older versions left out.
+    fetchRefspec = await gitSetRemoteUrl({
+      path: appPath,
+      remoteUrl: remote.httpsUrl,
+    });
+
+    // Pull changes first (unless force push)
+    if (!force && !forceWithLease) {
+      let remoteBranchMissing = false;
+      try {
+        await gitPull({
+          path: appPath,
+          remote: "origin",
+          branch,
+          auth,
+        });
+      } catch (pullError: any) {
+        const errorMessage = pullError?.message || "";
+        const isMissingRemoteBranch = isMissingRemoteBranchError(pullError);
+
+        // If it's just that remote doesn't have the branch yet, we can ignore and push
+        if (!isMissingRemoteBranch) {
+          // The fetch half of the pull may have moved the tracking ref before
+          // the merge failed, so the failure log gets the refreshed tip.
+          baseline = await collectPushBaseline({
+            path: appPath,
+            branch,
+            before,
+            remoteBranchMissing: false,
+          });
+          throw pullError;
+        } else {
+          remoteBranchMissing = true;
+          logger.debug(
+            "[GitHub Handler] Remote branch missing during pull, continuing with push",
+            errorMessage,
+          );
+        }
+      }
+      baseline = await collectPushBaseline({
         path: appPath,
-        remote: "origin",
         branch,
-        accessToken,
+        before,
+        remoteBranchMissing,
       });
-    } catch (pullError: any) {
-      // Check if it's a conflict error (including GitConflictError)
-      if ((pullError as any)?.name === "GitConflictError") {
-        throw GitConflictError(
-          "Merge conflict detected during pull. Please resolve conflicts before pushing.",
-        );
-      }
-
-      // Check for conflict in error message
-      const errorMessage = pullError?.message || "";
-      if (
-        errorMessage.includes("merge conflict") ||
-        errorMessage.includes("Merge conflict") ||
-        errorMessage.includes("CONFLICT (") ||
-        errorMessage.match(/failed to merge.*conflict/i)
-      ) {
-        throw GitConflictError(
-          "Merge conflict detected during pull. Please resolve conflicts before pushing.",
-        );
-      }
-
-      // Check if it's a missing remote branch error
-      const isMissingRemoteBranch =
-        pullError?.code === "MissingRefError" ||
-        (pullError?.code === "NotFoundError" &&
-          (errorMessage.includes("remote ref") ||
-            errorMessage.includes("remote branch"))) ||
-        errorMessage.includes("couldn't find remote ref") ||
-        // isomorphic-git throws a TypeError when the remote repo is empty
-        errorMessage.includes("Cannot read properties of null");
-
-      // If it's just that remote doesn't have the branch yet, we can ignore and push
-      if (!isMissingRemoteBranch) {
-        throw pullError;
-      } else {
-        logger.debug(
-          "[GitHub Handler] Remote branch missing during pull, continuing with push",
-          errorMessage,
-        );
-      }
     }
+
+    // Push to the linked remote
+    try {
+      await gitPush({
+        path: appPath,
+        branch,
+        auth,
+        force,
+        forceWithLease,
+      });
+    } catch (error) {
+      // A GitLab protected-branch refusal gets told where to change that. The
+      // remedy depends on whether this push was forced, so pass that along.
+      throw withPushHint(error, remote, {
+        forced: Boolean(force || forceWithLease),
+      });
+    }
+  } catch (error) {
+    logger.error("[GitHub Handler] sync failed", {
+      ...syncContext,
+      fetchRefspec,
+      head: abbreviateCommit(before.head),
+      headAfterPull: abbreviateCommit(baseline.head),
+      remoteTip: abbreviateCommit(before.remoteTip),
+      remoteTipAfterPull: abbreviateCommit(baseline.remoteTip),
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
   }
 
-  // Push to GitHub
-  await gitPush({
+  const measured = await measurePush({
     path: appPath,
     branch,
-    accessToken,
-    force,
-    forceWithLease,
+    before,
+    baseline,
   });
+  const summary = summarizePush(measured);
+  logger.debug("[GitHub Handler] sync summary", {
+    ...syncContext,
+    fetchRefspec,
+    currentBranch: describeBranch(measured),
+    head: {
+      before: abbreviateCommit(before.head),
+      afterPull: abbreviateCommit(baseline.head),
+      afterPush: summary.head,
+    },
+    remoteTip: {
+      before: abbreviateCommit(before.remoteTip),
+      afterPull: abbreviateCommit(measured.remoteTipBeforePush),
+      after: summary.remoteTip,
+    },
+    pushed:
+      summary.commitsPushed === null
+        ? null
+        : { commits: summary.commitsPushed, files: summary.files },
+    commitsNotOnRemote: summary.commitsNotOnRemote,
+    outcome: summary.outcome,
+  });
+  return summary;
 }
 
-async function handleAbortRebase(
+function describeBranch(reading: {
+  currentBranch: string | null;
+  branchKnown: boolean;
+}): string {
+  if (!reading.branchKnown) return "(unknown)";
+  return reading.currentBranch ?? "(detached)";
+}
+
+function abbreviateCommit(commit: string | null): string | null {
+  return commit ? commit.slice(0, 7) : null;
+}
+
+export async function handleAbortRebase(
   event: IpcMainInvokeEvent,
   { appId }: { appId: number },
 ): Promise<void> {
@@ -957,7 +1012,7 @@ async function handleAbortRebase(
   await gitRebaseAbort({ path: appPath });
 }
 
-async function handleContinueRebase(
+export async function handleContinueRebase(
   event: IpcMainInvokeEvent,
   { appId }: { appId: number },
 ): Promise<void> {
@@ -968,45 +1023,33 @@ async function handleContinueRebase(
   await gitRebaseContinue({ path: appPath });
 }
 // --- GitHub Rebase Handler ---
-async function handleRebaseFromGithub(
+export async function handleRebaseFromGithub(
   event: IpcMainInvokeEvent,
-  { appId }: { appId: number },
+  { appId, provider }: { appId: number; provider?: GitRemoteProvider },
 ): Promise<void> {
-  const settings = readSettings();
-  const accessToken = settings.githubAccessToken?.value;
-  if (!accessToken) {
-    throw new DyadError("Not authenticated with GitHub.", DyadErrorKind.Auth);
-  }
-  const app = await db.query.apps.findFirst({ where: eq(apps.id, appId) });
-  if (!app || !app.githubOrg || !app.githubRepo) {
-    throw new DyadError(
-      "App is not linked to a GitHub repo.",
-      DyadErrorKind.Precondition,
-    );
-  }
+  const app = await findAppOrThrow(appId);
+  const remote = requireAppGitRemote(app);
+  assertRemoteProvider(remote, provider);
+  const auth = getAppGitRemoteAuth(remote);
   const appPath = getDyadAppPath(app.path);
-  const branch = app.githubBranch || "main";
+  const branch = remote.branch;
 
   // Set up remote URL (credentials are never stored in the URL; auth is
   // injected per-invocation in git_utils)
-  const remoteUrl = `${GITHUB_GIT_BASE}/${app.githubOrg}/${app.githubRepo}.git`;
-  // Set or update remote URL using git config
   await gitSetRemoteUrl({
     path: appPath,
-    remoteUrl,
+    remoteUrl: remote.httpsUrl,
   });
 
   // Fetch latest changes from remote first
   await gitFetch({
     path: appPath,
     remote: "origin",
-    accessToken,
+    auth,
   });
 
-  // Check for uncommitted changes - Git requires a clean working directory for rebase
-  await withLock(appId, async () => {
-    await ensureCleanWorkspace(appPath, "rebase");
-  });
+  // Git requires a clean working directory for rebase.
+  await ensureCleanWorkspace(appPath, "rebase");
   // Perform the rebase
   await gitRebase({
     path: appPath,
@@ -1023,16 +1066,26 @@ export async function ensureCleanWorkspace(
 ): Promise<void> {
   const isClean = await isGitStatusClean({ path: appPath });
   if (isClean) return;
-  throw new Error(
+  throw GitStateError(
     `Workspace is not clean before ${operationDescription}. ` +
       "Please commit or stash your changes manually and try again.",
+    GIT_ERROR_CODES.UNCOMMITTED_CHANGES,
   );
 }
 
-async function handleGetGitState(
+/**
+ * Whether git is in the middle of a merge or rebase, and whose remote the app
+ * is linked to. A rebase found in progress was not started by any operation
+ * the machine knows about, so the provider has to come from the app row.
+ */
+export async function handleGetGitState(
   event: IpcMainInvokeEvent,
   { appId }: { appId: number },
-): Promise<{ mergeInProgress: boolean; rebaseInProgress: boolean }> {
+): Promise<{
+  mergeInProgress: boolean;
+  rebaseInProgress: boolean;
+  provider: GitRemoteProvider | null;
+}> {
   const app = await db.query.apps.findFirst({ where: eq(apps.id, appId) });
   if (!app) throw new Error("App not found");
   const appPath = getDyadAppPath(app.path);
@@ -1040,13 +1093,57 @@ async function handleGetGitState(
   const mergeInProgress = isGitMergeInProgress({ path: appPath });
   const rebaseInProgress = isGitRebaseInProgress({ path: appPath });
 
-  return { mergeInProgress, rebaseInProgress };
+  return {
+    mergeInProgress,
+    rebaseInProgress,
+    provider: resolveAppGitRemote(app)?.provider ?? null,
+  };
 }
 
-async function handleListCollaborators(
+async function readGitHubErrorMessage(
+  response: Awaited<ReturnType<typeof fetch>>,
+): Promise<string | undefined> {
+  try {
+    const data = (await response.json()) as { message?: unknown };
+    return typeof data.message === "string" ? data.message : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// GitHub returns 403 from the collaborators endpoint for several reasons:
+// missing push access, org OAuth app restrictions, or SAML SSO enforcement.
+// Only the first is a normal state, so confirm it from the repo's own
+// permissions instead of matching GitHub's error text.
+async function userLacksPushAccess(
+  repoUrl: string,
+  accessToken: string,
+): Promise<boolean> {
+  try {
+    const response = await fetch(repoUrl, {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: "application/vnd.github+json",
+      },
+    });
+    if (!response.ok) return false;
+    const repo = (await response.json()) as {
+      permissions?: { push?: boolean; admin?: boolean };
+    };
+    return (
+      repo.permissions !== undefined &&
+      !repo.permissions.push &&
+      !repo.permissions.admin
+    );
+  } catch {
+    return false;
+  }
+}
+
+export async function handleListCollaborators(
   event: IpcMainInvokeEvent,
   { appId }: { appId: number },
-): Promise<{ login: string; avatar_url: string; permissions: any }[]> {
+): Promise<ListCollaboratorsResult> {
   try {
     const settings = readSettings();
     const accessToken = settings.githubAccessToken?.value;
@@ -1062,28 +1159,44 @@ async function handleListCollaborators(
       );
     }
 
-    const response = await fetch(
-      `${GITHUB_API_BASE}/repos/${app.githubOrg}/${app.githubRepo}/collaborators`,
-      {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          Accept: "application/vnd.github+json",
-        },
+    const repoUrl = `${getGitHubApiBase()}/repos/${app.githubOrg}/${app.githubRepo}`;
+    const response = await fetch(`${repoUrl}/collaborators`, {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: "application/vnd.github+json",
       },
-    );
+    });
 
     if (!response.ok) {
-      throw new Error(
-        `Failed to list collaborators: ${response.status} ${response.statusText}`,
-      );
+      const githubMessage = await readGitHubErrorMessage(response);
+      if (
+        response.status === 403 &&
+        (await userLacksPushAccess(repoUrl, accessToken))
+      ) {
+        return { canManage: false, collaborators: [] };
+      }
+      const statusMessage = `Failed to list collaborators: ${response.status} ${response.statusText}`;
+      const detailedMessage = githubMessage
+        ? `${statusMessage} (${githubMessage})`
+        : statusMessage;
+      logger.warn(`[GitHub Handler] ${detailedMessage}`);
+      if (response.status === 401 || response.status === 403) {
+        throw new DyadError(detailedMessage, DyadErrorKind.Auth);
+      }
+      // Plain errors are sent to telemetry, and GitHub's message can include
+      // user or request identifiers, so keep it out of this one.
+      throw new Error(statusMessage);
     }
 
     const collaborators = (await response.json()) as any[];
-    return collaborators.map((c: any) => ({
-      login: c.login,
-      avatar_url: c.avatar_url,
-      permissions: c.permissions,
-    }));
+    return {
+      canManage: true,
+      collaborators: collaborators.map((c: any) => ({
+        login: c.login,
+        avatar_url: c.avatar_url,
+        permissions: c.permissions,
+      })),
+    };
   } catch (err: any) {
     if (err instanceof DyadError) throw err;
     logger.error("[GitHub Handler] Failed to list collaborators:", err);
@@ -1139,7 +1252,7 @@ async function handleInviteCollaborator(
 
     // GitHub API to add a collaborator (sends an invitation)
     const response = await fetch(
-      `${GITHUB_API_BASE}/repos/${app.githubOrg}/${app.githubRepo}/collaborators/${encodeURIComponent(trimmedUsername)}`,
+      `${getGitHubApiBase()}/repos/${app.githubOrg}/${app.githubRepo}/collaborators/${encodeURIComponent(trimmedUsername)}`,
       {
         method: "PUT",
         headers: {
@@ -1186,7 +1299,7 @@ async function handleRemoveCollaborator(
     }
 
     const response = await fetch(
-      `${GITHUB_API_BASE}/repos/${app.githubOrg}/${app.githubRepo}/collaborators/${encodeURIComponent(username)}`,
+      `${getGitHubApiBase()}/repos/${app.githubOrg}/${app.githubRepo}/collaborators/${encodeURIComponent(username)}`,
       {
         method: "DELETE",
         headers: {
@@ -1210,19 +1323,20 @@ async function handleRemoveCollaborator(
   }
 }
 
-async function handleGetMergeConflicts(
+/** The conflicted files, and whose remote the app is linked to; see handleGetGitState. */
+export async function handleGetMergeConflicts(
   event: IpcMainInvokeEvent,
   { appId }: { appId: number },
-): Promise<string[]> {
+): Promise<{ files: string[]; provider: GitRemoteProvider | null }> {
   const app = await db.query.apps.findFirst({ where: eq(apps.id, appId) });
   if (!app) throw new Error("App not found");
   const appPath = getDyadAppPath(app.path);
 
-  const conflicts = await gitGetMergeConflicts({ path: appPath });
-  return conflicts;
+  const files = await gitGetMergeConflicts({ path: appPath });
+  return { files, provider: resolveAppGitRemote(app)?.provider ?? null };
 }
 
-async function handleDisconnectGithubRepo(
+export async function handleDisconnectGithubRepo(
   event: IpcMainInvokeEvent,
   { appId }: { appId: number },
 ): Promise<void> {
@@ -1237,13 +1351,19 @@ async function handleDisconnectGithubRepo(
     throw new DyadError("App not found", DyadErrorKind.NotFound);
   }
 
-  // Update app in database to remove GitHub repo, org, and branch
+  // Clears whichever provider the app is linked to. An app links to one at a
+  // time, so nulling both sets is the same as nulling the linked one, and it
+  // leaves nothing stale behind if that invariant ever slipped.
   await db
     .update(apps)
     .set({
       githubRepo: null,
       githubOrg: null,
       githubBranch: null,
+      gitlabInstanceUrl: null,
+      gitlabProjectId: null,
+      gitlabProjectPath: null,
+      gitlabBranch: null,
     })
     .where(eq(apps.id, appId));
 }
@@ -1273,7 +1393,7 @@ async function handleCloneRepoFromUrl(
     const [, owner, repoName] = match;
     if (accessToken) {
       const repoResponse = await fetch(
-        `${GITHUB_API_BASE}/repos/${owner}/${repoName}`,
+        `${getGitHubApiBase()}/repos/${owner}/${repoName}`,
         {
           headers: {
             Authorization: `Bearer ${accessToken}`,
@@ -1287,105 +1407,131 @@ async function handleCloneRepoFromUrl(
         };
       }
     }
-    const finalAppName = appName && appName.trim() ? appName.trim() : repoName;
-    const existingApp = await db.query.apps.findFirst({
-      where: eq(apps.name, finalAppName),
-    });
-
-    if (existingApp) {
-      return { error: `An app named "${finalAppName}" already exists.` };
-    }
-
-    const appPath = getDyadAppPath(finalAppName);
-
-    if (!isAppLocationAccessible(appPath)) {
-      throw new Error(
-        `The path ${appPath} is inaccessible. Please check your custom apps folder setting.`,
-      );
-    }
-
-    // Ensure the app directory exists if native git is disabled
-    if (!settings.enableNativeGit) {
-      if (!fs.existsSync(appPath)) {
-        fs.mkdirSync(appPath, { recursive: true });
-      }
-    }
-    // Always clone with a credential-free URL; if a token exists it is
-    // injected per-invocation in git_utils.
-    const cloneUrl = `${GITHUB_GIT_BASE}/${owner}/${repoName}.git`;
-    try {
-      await gitClone({
-        path: appPath,
-        url: cloneUrl,
-        accessToken,
-        singleBranch: false,
+    const finalAppName = sanitizeAppDisplayName(
+      appName && appName.trim() ? appName : repoName,
+    );
+    return await withLock(`github-import-name:${finalAppName}`, async () => {
+      const existingApp = await db.query.apps.findFirst({
+        where: eq(apps.name, finalAppName),
       });
-    } catch (cloneErr) {
-      logger.error("[GitHub Handler] Clone failed:", cloneErr);
-      return {
-        error:
-          "Failed to clone repository. Please check the URL and try again.",
-      };
-    }
-    const aiRulesPath = path.join(appPath, "AI_RULES.md");
-    const hasAiRules = fs.existsSync(aiRulesPath);
-    const [newApp] = await db
-      .insert(schema.apps)
-      .values({
-        name: finalAppName,
-        path: finalAppName,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-        githubOrg: owner,
-        githubRepo: repoName,
-        githubBranch: "main",
-        installCommand: installCommand || null,
-        startCommand: startCommand || null,
-      })
-      .returning();
-    logger.log(`Successfully cloned repo ${owner}/${repoName} to ${appPath}`);
 
-    let autoUpgradeWarning = false;
-    if (optimizeForDyad && isComponentTaggerUpgradeNeeded(appPath)) {
-      try {
-        await applyComponentTagger(appPath, { installDependencies: false });
-        logger.log(
-          `Automatically applied component tagger upgrade for ${owner}/${repoName}`,
-        );
-      } catch (upgradeError) {
-        // Auto-upgrade  Failures are logged but don't block import.
-        // User will be notified via warning toast to manually upgrade if needed.
-        autoUpgradeWarning = true;
-        logger.warn(
-          `Failed to auto-apply component tagger upgrade for ${owner}/${repoName}: `,
-          upgradeError,
+      if (existingApp) {
+        return { error: `An app named "${finalAppName}" already exists.` };
+      }
+
+      const folderName = await resolveUniqueFolderName(
+        slugifyAppFolderName(finalAppName),
+      );
+      const appPath = getDyadAppPath(folderName);
+
+      if (!isAppLocationAccessible(appPath)) {
+        throw new Error(
+          `The path ${appPath} is inaccessible. Please check your custom apps folder setting.`,
         );
       }
-    }
 
-    return {
-      app: {
-        ...newApp,
-        files: [],
-        supabaseProjectName: null,
-        supabaseOrganizationSlug: null,
-        vercelTeamSlug: null,
-      },
-      hasAiRules,
-      autoUpgradeWarning,
-    };
-  } catch (err: any) {
+      // Always clone with a credential-free URL; if a token exists it is
+      // injected per-invocation in git_utils.
+      const cloneUrl = githubRemote({ owner, repo: repoName }).httpsUrl;
+      try {
+        await gitClone({
+          path: appPath,
+          url: cloneUrl,
+          auth: accessToken ? githubRemoteAuth(accessToken) : undefined,
+          singleBranch: false,
+        });
+      } catch (cloneErr) {
+        logger.error("[GitHub Handler] Clone failed:", cloneErr);
+        return {
+          error:
+            "Failed to clone repository. Please check the URL and try again.",
+        };
+      }
+      const aiRulesPath = path.join(appPath, "AI_RULES.md");
+      const hasAiRules = fs.existsSync(aiRulesPath);
+      const [newApp] = await db
+        .insert(schema.apps)
+        .values({
+          name: finalAppName,
+          path: folderName,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          githubOrg: owner,
+          githubRepo: repoName,
+          githubBranch: "main",
+          installCommand: installCommand || null,
+          startCommand: startCommand || null,
+        })
+        .returning();
+      logger.log(`Successfully cloned repo ${owner}/${repoName} to ${appPath}`);
+
+      let autoUpgradeWarning = false;
+      if (optimizeForDyad && isComponentTaggerUpgradeNeeded(appPath)) {
+        try {
+          await applyComponentTagger(appPath, { installDependencies: false });
+          logger.log(
+            `Automatically applied component tagger upgrade for ${owner}/${repoName}`,
+          );
+        } catch (upgradeError) {
+          // Auto-upgrade  Failures are logged but don't block import.
+          // User will be notified via warning toast to manually upgrade if needed.
+          autoUpgradeWarning = true;
+          logger.warn(
+            `Failed to auto-apply component tagger upgrade for ${owner}/${repoName}: `,
+            upgradeError,
+          );
+        }
+      }
+
+      return {
+        app: {
+          ...newApp,
+          files: [],
+          supabaseProjectName: null,
+          supabaseOrganizationSlug: null,
+          vercelTeamSlug: null,
+          deploymentProvidersInUse: {
+            vercel: false,
+            cloudflare: false,
+            coolify: false,
+          },
+        },
+        hasAiRules,
+        autoUpgradeWarning,
+      };
+    });
+  } catch (err: unknown) {
+    if (err instanceof DyadError) {
+      throw err;
+    }
     logger.error("[GitHub Handler] Unexpected error in clone flow:", err);
     return {
-      error: err.message || "An unexpected error occurred during cloning.",
+      error:
+        (err instanceof Error && err.message) ||
+        "An unexpected error occurred during cloning.",
     };
   }
 }
 
 // --- Registration ---
 export function registerGithubHandlers() {
-  createTypedHandler(githubContracts.startFlow, async (event, params) => {
-    return handleStartGithubFlow(event, params);
+  createTypedHandler(githubContracts.verifyConnection, (_, params) =>
+    verifyGithubConnection(params),
+  );
+  // The GitHub device flow is started/cancelled through the generic
+  // connection-flow IPC (per-provider registry, invocation-correlated), so no
+  // github-specific start handler remains.
+  registerConnectionFlowProvider("github", {
+    start: startGithubDeviceFlow,
+    onFlowEnded: cleanupDeviceFlow,
+    dispose: () => {
+      githubFlowsShuttingDown = true;
+      for (const record of deviceFlows.values()) {
+        record.disposedForShutdown = true;
+        if (record.timeoutId) clearTimeout(record.timeoutId);
+      }
+      deviceFlows.clear();
+    },
   });
 
   createTypedHandler(githubContracts.listRepos, async () => {
@@ -1398,33 +1544,6 @@ export function registerGithubHandlers() {
 
   createTypedHandler(githubContracts.isRepoAvailable, async (event, params) => {
     return handleIsRepoAvailable(event, params);
-  });
-
-  createTypedHandler(githubContracts.createRepo, async (event, params) => {
-    return handleCreateRepo(event, params);
-  });
-
-  createTypedHandler(
-    githubContracts.connectExistingRepo,
-    async (event, params) => {
-      return handleConnectToExistingRepo(event, params);
-    },
-  );
-
-  createTypedHandler(githubContracts.push, async (event, params) => {
-    return handlePushToGithub(event, params);
-  });
-
-  createTypedHandler(githubContracts.rebase, async (event, params) => {
-    return handleRebaseFromGithub(event, params);
-  });
-
-  createTypedHandler(githubContracts.rebaseAbort, async (event, params) => {
-    return handleAbortRebase(event, params);
-  });
-
-  createTypedHandler(githubContracts.rebaseContinue, async (event, params) => {
-    return handleContinueRebase(event, params);
   });
 
   createTypedHandler(
@@ -1448,22 +1567,196 @@ export function registerGithubHandlers() {
     },
   );
 
-  createTypedHandler(githubContracts.getConflicts, async (event, params) => {
-    return handleGetMergeConflicts(event, params);
-  });
-
-  createTypedHandler(githubContracts.getGitState, async (event, params) => {
-    return handleGetGitState(event, params);
-  });
-
-  createTypedHandler(githubContracts.disconnect, async (event, params) => {
-    return handleDisconnectGithubRepo(event, params);
-  });
-
   createTypedHandler(
     githubContracts.cloneRepoFromUrl,
     async (event, params) => {
       return handleCloneRepoFromUrl(event, params);
+    },
+  );
+}
+
+const GITHUB_VERIFY_TIMEOUT_MS = 15_000;
+
+/**
+ * `host/owner/repo` for a remote in any form git accepts (HTTPS, SSH or
+ * scp-style `git@host:owner/repo`), so an SSH remote for the same repository
+ * still matches. Dyad's own sync rewrites origin to HTTPS before pushing.
+ */
+function normalizeGitRemote(remote: string): string | null {
+  const trimmed = remote
+    .trim()
+    .replace(/\/+$/, "")
+    .replace(/\.git$/i, "");
+  const scp = /^[^@/:\s]+@([^:/\s]+):(?!\/)(.+)$/.exec(trimmed);
+  if (scp) return `${scp[1]}/${scp[2]}`.toLowerCase();
+  try {
+    const url = new URL(trimmed);
+    // URL normalizes HTTP(S) default ports, but not SSH's default port.
+    const port =
+      (url.protocol === "ssh:" || url.protocol === "git+ssh:") &&
+      url.port === "22"
+        ? ""
+        : url.port;
+    return `${url.hostname}${port ? `:${port}` : ""}${url.pathname}`
+      .replace(/\/+$/, "")
+      .toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+/** Verify both the local connection and the branch on GitHub, not just saved metadata. */
+export async function verifyGithubConnection({
+  appId,
+  requireSynced = false,
+  requirePushable = false,
+}: {
+  appId: number;
+  requireSynced?: boolean;
+  requirePushable?: boolean;
+}) {
+  return appOperationCoordinator.run(
+    {
+      appId,
+      operation: "github:verify-connection",
+      resources: [
+        readAppResource("app-path"),
+        readAppResource("metadata"),
+        requirePushable ? "repository" : readAppResource("repository"),
+      ],
+      refuseWhenRecording: "verify the GitHub repository",
+    },
+    async () => {
+      const token = readSettings().githubAccessToken?.value;
+      if (!token)
+        throw new DyadError(
+          "Reconnect your GitHub account to continue.",
+          DyadErrorKind.Auth,
+        );
+      const app = await db.query.apps.findFirst({ where: eq(apps.id, appId) });
+      if (!app?.githubOrg || !app.githubRepo) {
+        throw new DyadError(
+          "Create or connect a GitHub repository first.",
+          DyadErrorKind.Precondition,
+        );
+      }
+      const appPath = getDyadAppPath(app.path);
+      const branch = app.githubBranch || "main";
+      const remote = await execGit(["remote", "get-url", "origin"], appPath);
+      const expected = normalizeGitRemote(
+        githubRemote({ owner: app.githubOrg, repo: app.githubRepo }).httpsUrl,
+      );
+      if (
+        remote.exitCode !== 0 ||
+        !expected ||
+        normalizeGitRemote(remote.stdout) !== expected
+      ) {
+        throw new DyadError(
+          "The local GitHub remote does not match this app. Reconnect the repository in Publish.",
+          DyadErrorKind.Precondition,
+        );
+      }
+      const current = await execGit(["branch", "--show-current"], appPath);
+      if (current.exitCode !== 0 || current.stdout.trim() !== branch) {
+        throw new DyadError(
+          "Switch to the connected GitHub branch before deploying.",
+          DyadErrorKind.Precondition,
+        );
+      }
+      if (requirePushable) {
+        // Fetch objects without changing local code before checking ancestry.
+        await gitFetch({
+          path: appPath,
+          remote: githubRemote({
+            owner: app.githubOrg,
+            repo: app.githubRepo,
+          }).httpsUrl,
+          auth: githubRemoteAuth(token),
+        });
+      }
+      // Bound both headers and body reads while holding the repository lock.
+      const signal = AbortSignal.timeout(GITHUB_VERIFY_TIMEOUT_MS);
+      const timeoutError = () =>
+        new DyadError(
+          "GitHub verification timed out after 15 seconds. Retry in a moment.",
+          DyadErrorKind.External,
+        );
+      let response: Awaited<ReturnType<typeof fetch>>;
+      try {
+        response = await fetch(
+          `${getGitHubApiBase()}/repos/${encodeURIComponent(app.githubOrg)}/${encodeURIComponent(app.githubRepo)}/branches/${encodeURIComponent(branch)}`,
+          {
+            headers: {
+              Authorization: `Bearer ${token}`,
+              Accept: "application/vnd.github+json",
+            },
+            signal,
+          },
+        );
+      } catch {
+        if (signal.aborted) throw timeoutError();
+        throw new DyadError(
+          "Could not reach GitHub to verify the repository. Check your connection and retry.",
+          DyadErrorKind.External,
+        );
+      }
+      if (!response.ok) {
+        if (response.status === 401) {
+          throw new DyadError(
+            "GitHub authentication expired or was revoked. Reconnect your GitHub account and retry.",
+            DyadErrorKind.Auth,
+          );
+        }
+        if (response.status === 404) {
+          throw new DyadError(
+            "GitHub could not find this repository or branch. Check repository access, then sync or push your code first.",
+            DyadErrorKind.Precondition,
+          );
+        }
+        throw new DyadError(
+          `Could not verify the GitHub repository (HTTP ${response.status}). Check GitHub access or rate limits and retry in a moment.`,
+          DyadErrorKind.External,
+        );
+      }
+      const remoteBranch = (await response.json().catch(() => {
+        if (signal.aborted) throw timeoutError();
+        return null;
+      })) as {
+        commit?: { sha?: unknown };
+      } | null;
+      const remoteSha = remoteBranch?.commit?.sha;
+      if (typeof remoteSha !== "string" || remoteSha.length === 0)
+        throw new DyadError(
+          "GitHub returned an unexpected response for the branch. Retry in a moment.",
+          DyadErrorKind.External,
+        );
+      if (requireSynced) {
+        const head = await execGit(["rev-parse", "HEAD"], appPath);
+        // Sync pulls before it pushes, so it also resolves GitHub being ahead.
+        if (
+          head.exitCode !== 0 ||
+          head.stdout.trim() !== remoteSha ||
+          !(await isGitStatusClean({ path: appPath }))
+        ) {
+          throw new DyadError(
+            "This app and GitHub are not in sync yet. Sync with GitHub and retry.",
+            DyadErrorKind.Precondition,
+          );
+        }
+      }
+      if (requirePushable) {
+        const ancestor = await execGit(
+          ["merge-base", "--is-ancestor", "--", remoteSha, "HEAD"],
+          appPath,
+        );
+        if (ancestor.exitCode !== 0) {
+          throw new DyadError(
+            "GitHub has changes that are not in this app. Sync with GitHub and resolve any conflicts before deploying.",
+            DyadErrorKind.Precondition,
+          );
+        }
+      }
+      return { owner: app.githubOrg, repo: app.githubRepo, branch };
     },
   );
 }

@@ -1,5 +1,4 @@
 import { atom } from "jotai";
-import type { PlanQuestionnairePayload } from "@/ipc/types/plan";
 
 export interface PlanData {
   content: string;
@@ -7,44 +6,26 @@ export interface PlanData {
   summary?: string;
 }
 
+// The transient "transitioning" display state is not tracked here: it is the
+// plan-handoff machine's `transitioning` state (src/plan_handoff/), read via
+// usePlanHandoffState.
 export interface PlanState {
   plansByChatId: Map<number, PlanData>;
   acceptedChatIds: Set<number>;
-  transitioningChatIds: Set<number>;
 }
 
 export const planStateAtom = atom<PlanState>({
   plansByChatId: new Map(),
   acceptedChatIds: new Set<number>(),
-  transitioningChatIds: new Set<number>(),
 });
-
-export interface PendingPlanImplementation {
-  chatId: number;
-  title: string;
-  planSlug: string;
-}
-
-export const pendingPlanImplementationAtom =
-  atom<PendingPlanImplementation | null>(null);
 
 // Records, per plan chatId, whether the user chose to implement in a brand-new
 // chat (true) or to continue in the current chat (false) when accepting the
-// plan. Read by usePlanEvents once the exit_plan event fires so it can route
-// the implementation accordingly.
+// plan. Read by the plan-handoff machine once the exit_plan event fires so it
+// can route the implementation accordingly.
 export const planAcceptInNewChatByChatIdAtom = atom<Map<number, boolean>>(
   new Map(),
 );
-
-export const pendingQuestionnaireAtom = atom<
-  Map<number, PlanQuestionnairePayload>
->(new Map());
-
-// Transient flag: chatIds that just had a questionnaire submitted (for brief confirmation)
-// "visible" = showing, "fading" = fade-out in progress
-export const questionnaireSubmittedChatIdsAtom = atom<
-  Map<number, "visible" | "fading">
->(new Map());
 
 export interface PlanAnnotation {
   id: string;

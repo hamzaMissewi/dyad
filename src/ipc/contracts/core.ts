@@ -1,5 +1,13 @@
 import { z } from "zod";
+import {
+  isInvocationRef,
+  invocationRegistryKey,
+  InvocationRegistry,
+  type InvocationRef,
+  type InvocationClaim,
+} from "../../state_machines/invocation_ref";
 import { DyadError, DyadErrorKind, isDyadError } from "../../errors/dyad_error";
+import type { QueryInvalidationScope } from "../../window_infrastructure/types";
 
 // =============================================================================
 // Contract Type Definitions
@@ -17,6 +25,14 @@ export interface IpcContract<
   readonly channel: TChannel;
   readonly input: TInput;
   readonly output: TOutput;
+  readonly invalidates?: (
+    input: z.infer<TInput>,
+    output: z.infer<TOutput>,
+  ) => readonly QueryInvalidationScope[];
+  readonly originHandles?: (
+    input: z.infer<TInput>,
+    output: z.infer<TOutput>,
+  ) => readonly QueryInvalidationScope[];
 }
 
 /**
@@ -29,6 +45,24 @@ export interface EventContract<
 > {
   readonly channel: TChannel;
   readonly payload: TPayload;
+}
+
+/**
+ * One-way IPC contract (renderer -> main), fire-and-forget with NO response.
+ *
+ * Unlike an invoke contract, the main process never replies. This matters for
+ * messages fired while the renderer frame is being torn down (e.g. on
+ * `pagehide` during app quit): a two-way `invoke` would leave the main process
+ * trying to post its reply back to an already-destroyed frame, which Electron
+ * surfaces as an unhandled "Object has been destroyed" error. A one-way send
+ * has no reply, so there is nothing to deliver back.
+ */
+export interface SendContract<
+  TChannel extends string,
+  TInput extends z.ZodType,
+> {
+  readonly channel: TChannel;
+  readonly input: TInput;
 }
 
 /**
@@ -69,6 +103,14 @@ export function defineContract<
   channel: TChannel;
   input: TInput;
   output: TOutput;
+  invalidates?: (
+    input: z.infer<TInput>,
+    output: z.infer<TOutput>,
+  ) => readonly QueryInvalidationScope[];
+  originHandles?: (
+    input: z.infer<TInput>,
+    output: z.infer<TOutput>,
+  ) => readonly QueryInvalidationScope[];
 }): IpcContract<TChannel, TInput, TOutput> {
   return contract;
 }
@@ -85,6 +127,19 @@ export function defineEvent<
   payload: TPayload;
 }): EventContract<TChannel, TPayload> {
   return event;
+}
+
+/**
+ * Creates a typed one-way send contract definition (renderer -> main, no reply).
+ */
+export function defineSendContract<
+  TChannel extends string,
+  TInput extends z.ZodType,
+>(contract: {
+  channel: TChannel;
+  input: TInput;
+}): SendContract<TChannel, TInput> {
+  return contract;
 }
 
 /**
@@ -137,6 +192,7 @@ export interface SerializedIpcError {
   name?: string;
   message: string;
   kind?: DyadErrorKind;
+  code?: string;
   stack?: string;
 }
 
@@ -181,11 +237,19 @@ export function isIpcInvokeEnvelope(
 }
 
 export function serializeIpcError(error: unknown): SerializedIpcError {
+  const code =
+    typeof error === "object" &&
+    error !== null &&
+    typeof (error as { code?: unknown }).code === "string"
+      ? (error as { code: string }).code
+      : undefined;
+
   if (isDyadError(error)) {
     return {
       name: error.name,
       message: error.message,
       kind: error.kind,
+      code,
       stack: error.stack,
     };
   }
@@ -194,11 +258,12 @@ export function serializeIpcError(error: unknown): SerializedIpcError {
     return {
       name: error.name,
       message: error.message,
+      code,
       stack: error.stack,
     };
   }
 
-  return { message: String(error) };
+  return { message: String(error), code };
 }
 
 function isDyadErrorKind(value: unknown): value is DyadErrorKind {
@@ -211,12 +276,19 @@ function isDyadErrorKind(value: unknown): value is DyadErrorKind {
 export function deserializeIpcError(error: SerializedIpcError): Error {
   if (isDyadErrorKind(error.kind)) {
     const dyadError = new DyadError(error.message, error.kind);
+    dyadError.name = error.name ?? dyadError.name;
+    if (error.code !== undefined) {
+      (dyadError as DyadError & { code: string }).code = error.code;
+    }
     dyadError.stack = error.stack;
     return dyadError;
   }
 
   const genericError = new Error(error.message);
   genericError.name = error.name ?? genericError.name;
+  if (error.code !== undefined) {
+    (genericError as Error & { code: string }).code = error.code;
+  }
   genericError.stack = error.stack;
   return genericError;
 }
@@ -272,6 +344,40 @@ export function createClient<
       return isIpcInvokeEnvelope(response)
         ? unwrapIpcEnvelope(response)
         : response;
+    };
+  }
+  return client;
+}
+
+/** Type to convert send contracts object to fire-and-forget client methods */
+type SendClientFromContracts<
+  T extends Record<string, SendContract<string, z.ZodType>>,
+> = {
+  [K in keyof T]: (input: z.infer<T[K]["input"]>) => void;
+};
+
+/**
+ * Creates a typed one-way send client from a send-contracts object. Each method
+ * dispatches a fire-and-forget `ipcRenderer.send` and returns immediately —
+ * there is no response to await. Use for writes that must survive being fired
+ * during renderer teardown (see {@link SendContract}).
+ */
+export function createSendClient<
+  T extends Record<string, SendContract<string, z.ZodType>>,
+>(contracts: T): SendClientFromContracts<T> {
+  // Access ipcRenderer from the window.electron exposed by preload
+  const getIpcRenderer = () => (window as any).electron?.ipcRenderer;
+
+  const client = {} as SendClientFromContracts<T>;
+  for (const [methodName, contract] of Object.entries(contracts)) {
+    (client as any)[methodName] = (input: unknown) => {
+      const ipcRenderer = getIpcRenderer();
+      if (typeof ipcRenderer?.send !== "function") {
+        throw new Error(
+          `[${contract.channel}] IPC renderer send not available. Make sure this is called from the renderer process.`,
+        );
+      }
+      ipcRenderer.send(contract.channel, input);
     };
   }
   return client;
@@ -378,16 +484,30 @@ export function createStreamClient<
   // the exact key type from TInput[TKey] due to Zod v4 type system limitations.
   type KeyValue = string | number;
 
-  const streams = new Map<
-    KeyValue,
-    {
+  interface StreamEntry {
+    callbacks: {
       onChunk: (data: z.infer<TChunk>) => void;
       onEnd: (data: z.infer<TEnd>) => void;
       onError: (data: z.infer<TError>) => void;
-    }
-  >();
+    };
+    /** When true (default), the entry is removed on end/error events. */
+    autoRelease: boolean;
+  }
+
+  const registryKind = `ipc-stream:${contract.channel}`;
+  const streams = new InvocationRegistry<StreamEntry>();
+  const legacyStructuralSafety = {
+    structuralSafety:
+      "App-update compatibility: an older producer cannot echo InvocationRef, so an identity-less event intentionally claims the current key.",
+  } as const;
+
+  // Legacy monotonic generation counter for callers that do not supply an
+  // InvocationRef. Contracts that echo either identity reject stale events.
+  // Payloads without either identity retain legacy key-only routing.
+  let nextStreamId = 0;
 
   let listenersSetUp = false;
+  const unclaimedChunkListeners = new Set<(data: z.infer<TChunk>) => void>();
 
   const setupListeners = () => {
     if (listenersSetUp) return;
@@ -398,41 +518,94 @@ export function createStreamClient<
     ipcRenderer.on(contract.events.chunk.channel, (data: unknown) => {
       const parsed = contract.events.chunk.payload.safeParse(data);
       if (parsed.success) {
-        const key = (parsed.data as Record<string, unknown>)[
-          contract.keyField
-        ] as KeyValue;
-        streams.get(key)?.onChunk(parsed.data);
+        const payload = parsed.data as Record<string, unknown>;
+        const key = payload[contract.keyField] as KeyValue;
+        const claim = claimPayload(key, payload);
+        if (claim.kind === "claimed") {
+          claim.value.callbacks.onChunk(parsed.data);
+        } else if (claim.kind === "unsolicited") {
+          for (const listener of unclaimedChunkListeners) {
+            listener(parsed.data);
+          }
+        }
       }
     });
 
     ipcRenderer.on(contract.events.end.channel, (data: unknown) => {
       const parsed = contract.events.end.payload.safeParse(data);
       if (parsed.success) {
-        const key = (parsed.data as Record<string, unknown>)[
-          contract.keyField
-        ] as KeyValue;
-        streams.get(key)?.onEnd(parsed.data);
-        streams.delete(key);
+        const payload = parsed.data as Record<string, unknown>;
+        const key = payload[contract.keyField] as KeyValue;
+        const claim = claimPayload(key, payload);
+        if (claim.kind !== "claimed") return;
+        claim.value.callbacks.onEnd(parsed.data);
+        // The terminal callback may synchronously start another stream with
+        // the same key. Only clean up the generation that actually ended.
+        if (claim.value.autoRelease) {
+          streams.delete(claim.ref);
+        }
       }
     });
 
     ipcRenderer.on(contract.events.error.channel, (data: unknown) => {
       const parsed = contract.events.error.payload.safeParse(data);
       if (parsed.success) {
-        const key = (parsed.data as Record<string, unknown>)[
-          contract.keyField
-        ] as KeyValue;
-        streams.get(key)?.onError(parsed.data);
-        streams.delete(key);
+        const payload = parsed.data as Record<string, unknown>;
+        const key = payload[contract.keyField] as KeyValue;
+        const claim = claimPayload(key, payload);
+        if (claim.kind !== "claimed") return;
+        claim.value.callbacks.onError(parsed.data);
+        // The error callback may synchronously replace this stream.
+        if (claim.value.autoRelease) {
+          streams.delete(claim.ref);
+        }
       }
     });
 
     listenersSetUp = true;
   };
 
+  function registryRef(
+    key: KeyValue,
+    correlation: number | InvocationRef,
+  ): InvocationRef<string, KeyValue> {
+    const operationId =
+      typeof correlation === "number"
+        ? `legacy-number:${correlation}`
+        : `invocation:${invocationRegistryKey(correlation)}`;
+    return { kind: registryKind, entityKey: key, operationId };
+  }
+
+  function claimPayload(
+    key: KeyValue,
+    payload: Record<string, unknown>,
+  ): InvocationClaim<StreamEntry> {
+    if (payload.invocationRef !== undefined) {
+      return isInvocationRef(payload.invocationRef)
+        ? streams.claim(registryRef(key, payload.invocationRef))
+        : { kind: "unsolicited" };
+    }
+    if (typeof payload.streamId === "number") {
+      return streams.claim(registryRef(key, payload.streamId));
+    }
+    return streams.claimStructurally(registryKind, key, legacyStructuralSafety);
+  }
+
+  function claimCurrentStructurally(
+    key: KeyValue,
+    structuralSafety: string,
+  ): InvocationClaim<StreamEntry> {
+    return streams.claimStructurally(registryKind, key, { structuralSafety });
+  }
+
   return {
     /**
      * Start a stream with the given input and callbacks.
+     *
+     * Returns the correlation identity identifying this start() call. With
+     * `autoRelease: false` the entry keeps receiving events after end/error
+     * until `release(key, correlation)` is called (used by the chat stream
+     * controller, which owns terminal reconciliation).
      */
     start(
       input: Input,
@@ -441,8 +614,22 @@ export function createStreamClient<
         onEnd: (data: z.infer<TEnd>) => void;
         onError: (data: z.infer<TError>) => void;
       },
-    ): void {
+      opts?: {
+        invocationRef?: InvocationRef;
+        streamId?: number;
+        autoRelease?: boolean;
+      },
+    ): InvocationRef | number {
       setupListeners();
+
+      const invocationRef = opts?.invocationRef;
+      const streamId =
+        invocationRef === undefined
+          ? (opts?.streamId ?? ++nextStreamId)
+          : undefined;
+      if (streamId !== undefined && streamId > nextStreamId) {
+        nextStreamId = streamId;
+      }
 
       const ipcRenderer = getIpcRenderer();
       if (!ipcRenderer) {
@@ -452,35 +639,98 @@ export function createStreamClient<
           ],
           error: "IPC renderer not available",
         } as any);
-        return;
+        return invocationRef ?? streamId!;
       }
 
       const key = (input as Record<string, unknown>)[
         contract.keyField
       ] as KeyValue;
-      streams.set(key, callbacks);
+      const entry: StreamEntry = {
+        callbacks,
+        autoRelease: opts?.autoRelease !== false,
+      };
+      const ref = registryRef(key, invocationRef ?? streamId!);
+      streams.register(ref, entry);
 
       ipcRenderer.invoke(contract.channel, input).catch((err: Error) => {
+        // Only surface the failure if this start() call still owns the entry.
+        const claim = streams.claim(ref);
+        if (claim.kind !== "claimed" || claim.value !== entry) return;
         callbacks.onError({
           [contract.keyField]: key,
           error: err.message,
         } as any);
-        streams.delete(key);
+        // The error callback may synchronously replace this stream.
+        const current = streams.claim(ref);
+        if (current.kind === "claimed" && current.value === entry) {
+          streams.delete(ref);
+        }
       });
+      return invocationRef ?? streamId!;
     },
 
     /**
      * Cancel a stream by its key value.
      */
     cancel(key: KeyValue): void {
-      streams.delete(key);
+      const claim = claimCurrentStructurally(
+        key,
+        "Domain cancellation targets whichever operation currently owns this stream key.",
+      );
+      if (claim.kind === "claimed") {
+        streams.delete(claim.ref);
+      }
+    },
+
+    /**
+     * Release a stream entry. When correlation identity is given, only
+     * releases the matching entry (stale releases are no-ops).
+     */
+    release(
+      key: KeyValue,
+      correlation?: number | { invocationRef: InvocationRef },
+    ): void {
+      const claim =
+        correlation === undefined
+          ? claimCurrentStructurally(
+              key,
+              "Legacy release without correlation targets the current entry for this key.",
+            )
+          : streams.claim(
+              registryRef(
+                key,
+                typeof correlation === "number"
+                  ? correlation
+                  : correlation.invocationRef,
+              ),
+            );
+      if (claim.kind === "claimed") {
+        streams.delete(claim.ref);
+      }
     },
 
     /**
      * Check if a stream is active for a given key.
      */
     isActive(key: KeyValue): boolean {
-      return streams.has(key);
+      return (
+        claimCurrentStructurally(
+          key,
+          "Presence checks observe current ownership but do not consume or mutate it.",
+        ).kind === "claimed"
+      );
+    },
+
+    /**
+     * Observe valid chunks that are not owned by a stream started in this
+     * renderer. Multi-window consumers use this to project peer streams.
+     */
+    subscribeUnclaimedChunks(
+      listener: (data: z.infer<TChunk>) => void,
+    ): () => void {
+      setupListeners();
+      unclaimedChunkListeners.add(listener);
+      return () => unclaimedChunkListeners.delete(listener);
     },
   };
 }
@@ -496,6 +746,16 @@ export function createStreamClient<
 export function getInvokeChannels<
   T extends Record<string, { channel: string }>,
 >(contracts: T): T[keyof T]["channel"][] {
+  return Object.values(contracts).map((c) => c.channel);
+}
+
+/**
+ * Extract all one-way send channels from a send-contracts object.
+ * Used for building the preload whitelist.
+ */
+export function getSendChannels<T extends Record<string, { channel: string }>>(
+  contracts: T,
+): T[keyof T]["channel"][] {
   return Object.values(contracts).map((c) => c.channel);
 }
 

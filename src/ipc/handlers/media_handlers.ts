@@ -8,12 +8,20 @@ import { getMimeType, MIME_TYPE_MAP } from "../utils/mime_utils";
 import { DYAD_MEDIA_DIR_NAME } from "../utils/media_path_utils";
 import { INVALID_FILE_NAME_CHARS } from "../../shared/media_validation";
 import { ensureDyadGitignored } from "./gitignoreUtils";
-import { withLock } from "../utils/lock_utils";
+import {
+  appOperationCoordinator,
+  readAppResource,
+} from "../services/app_operation_coordinator";
 import fs from "node:fs";
 import path from "node:path";
 import { eq } from "drizzle-orm";
 import log from "electron-log";
 import { DyadError, DyadErrorKind } from "@/errors/dyad_error";
+import { app as electronApp, shell } from "electron";
+import {
+  getMediaThumbnailCacheRoot,
+  invalidateMediaThumbnailCache,
+} from "../utils/media_thumbnail";
 
 const logger = log.scope("media_handlers");
 
@@ -49,6 +57,7 @@ async function getMediaFilesForApp(
           appId,
           appName,
           sizeBytes: stat.size,
+          modifiedAtMs: stat.mtimeMs,
           mimeType: getMimeType(path.extname(entry.name).toLowerCase()),
         };
       } catch {
@@ -64,16 +73,34 @@ async function getMediaFilesForApp(
 async function withMediaLock<T>(
   appIds: number[],
   fn: () => Promise<T>,
+  repositoryAppIds: readonly number[] = [],
 ): Promise<T> {
   const uniqueSortedIds = [...new Set(appIds)].sort((a, b) => a - b);
+  const repositoryIds = new Set(repositoryAppIds);
 
   const runWithLock = async (index: number): Promise<T> => {
     if (index >= uniqueSortedIds.length) {
       return fn();
     }
 
-    return withLock(`media:${uniqueSortedIds[index]}`, async () =>
-      runWithLock(index + 1),
+    const claimsRepository = repositoryIds.has(uniqueSortedIds[index]);
+    return appOperationCoordinator.run(
+      {
+        appId: uniqueSortedIds[index],
+        operation: "mutate-media",
+        resources: [
+          readAppResource("app-path"),
+          "media",
+          ...(claimsRepository ? (["repository"] as const) : []),
+        ],
+        // Moving into an app may update that target's .gitignore. A recording
+        // owns its repository for the whole session, so refuse at the target's
+        // admission instead of queueing the cross-app move indefinitely.
+        refuseWhenRecording: claimsRepository
+          ? "move an image into this app"
+          : undefined,
+      },
+      () => runWithLock(index + 1),
     );
   };
 
@@ -141,6 +168,19 @@ function getMediaFilePath(appPath: string, fileName: string): string {
 
 function getMediaDirectoryPath(appPath: string): string {
   return path.join(appPath, DYAD_MEDIA_DIR_NAME);
+}
+
+async function invalidateThumbnail(filePath: string): Promise<void> {
+  try {
+    await invalidateMediaThumbnailCache(
+      getMediaThumbnailCacheRoot(electronApp.getPath("sessionData")),
+      filePath,
+    );
+  } catch (error) {
+    // Cache cleanup must not turn a successful user file operation into an
+    // error. The stale derivative is path-keyed and can no longer be served.
+    logger.warn(`Could not invalidate media thumbnail cache`, error);
+  }
 }
 
 async function getAppOrThrow(appId: number) {
@@ -222,6 +262,7 @@ export function registerMediaHandlers() {
         }
         throw e;
       }
+      await invalidateThumbnail(sourcePath);
       logger.log(`Renamed media file: ${sourcePath} -> ${destinationPath}`);
     });
   });
@@ -242,8 +283,25 @@ export function registerMediaHandlers() {
         }
         throw e;
       }
+      await invalidateThumbnail(filePath);
       logger.log(`Deleted media file: ${filePath}`);
     });
+  });
+
+  createTypedHandler(mediaContracts.openMediaFile, async (_, params) => {
+    const app = await getAppOrThrow(params.appId);
+    const appPath = getDyadAppPath(app.path);
+    const filePath = getMediaFilePath(appPath, params.fileName);
+    if (!fs.existsSync(filePath)) {
+      throw new DyadError("Media file not found", DyadErrorKind.NotFound);
+    }
+    const result = await shell.openPath(filePath);
+    if (result) {
+      throw new DyadError(
+        `Failed to open file: ${result}`,
+        DyadErrorKind.External,
+      );
+    }
   });
 
   createTypedHandler(mediaContracts.moveMediaFile, async (_, params) => {
@@ -254,62 +312,67 @@ export function registerMediaHandlers() {
       );
     }
 
-    await withMediaLock([params.sourceAppId, params.targetAppId], async () => {
-      const sourceApp = await getAppOrThrow(params.sourceAppId);
-      const targetApp = await getAppOrThrow(params.targetAppId);
+    await withMediaLock(
+      [params.sourceAppId, params.targetAppId],
+      async () => {
+        const sourceApp = await getAppOrThrow(params.sourceAppId);
+        const targetApp = await getAppOrThrow(params.targetAppId);
 
-      const sourceAppPath = getDyadAppPath(sourceApp.path);
-      const targetAppPath = getDyadAppPath(targetApp.path);
+        const sourceAppPath = getDyadAppPath(sourceApp.path);
+        const targetAppPath = getDyadAppPath(targetApp.path);
 
-      const sourcePath = getMediaFilePath(sourceAppPath, params.fileName);
-      if (!fs.existsSync(sourcePath)) {
-        throw new DyadError("Media file not found", DyadErrorKind.NotFound);
-      }
-
-      await ensureDyadGitignored(targetAppPath);
-      const targetMediaDirectoryPath = getMediaDirectoryPath(targetAppPath);
-      await fs.promises.mkdir(targetMediaDirectoryPath, { recursive: true });
-
-      const destinationPath = safeJoin(
-        targetAppPath,
-        DYAD_MEDIA_DIR_NAME,
-        params.fileName,
-      );
-
-      if (fs.existsSync(destinationPath)) {
-        throw new Error(
-          `Target app already has a media file named "${params.fileName}"`,
-        );
-      }
-
-      try {
-        await fs.promises.rename(sourcePath, destinationPath);
-      } catch (e: any) {
-        if (e?.code === "EXDEV") {
-          // Cross-device move (e.g. different drives on Windows): copy then delete.
-          await fs.promises.copyFile(sourcePath, destinationPath);
-          try {
-            await fs.promises.unlink(sourcePath);
-          } catch (unlinkError: any) {
-            // Source delete failed after copy succeeded — remove the copy
-            // so we don't end up with duplicates.
-            try {
-              await fs.promises.unlink(destinationPath);
-            } catch {
-              // Best-effort cleanup; destination may already be gone.
-            }
-            throw unlinkError;
-          }
-        } else if (e?.code === "ENOENT") {
-          throw new Error(
-            "File was modified or deleted before the move could complete",
-          );
-        } else {
-          throw e;
+        const sourcePath = getMediaFilePath(sourceAppPath, params.fileName);
+        if (!fs.existsSync(sourcePath)) {
+          throw new DyadError("Media file not found", DyadErrorKind.NotFound);
         }
-      }
 
-      logger.log(`Moved media file: ${sourcePath} -> ${destinationPath}`);
-    });
+        await ensureDyadGitignored(targetAppPath);
+        const targetMediaDirectoryPath = getMediaDirectoryPath(targetAppPath);
+        await fs.promises.mkdir(targetMediaDirectoryPath, { recursive: true });
+
+        const destinationPath = safeJoin(
+          targetAppPath,
+          DYAD_MEDIA_DIR_NAME,
+          params.fileName,
+        );
+
+        if (fs.existsSync(destinationPath)) {
+          throw new Error(
+            `Target app already has a media file named "${params.fileName}"`,
+          );
+        }
+
+        try {
+          await fs.promises.rename(sourcePath, destinationPath);
+        } catch (e: any) {
+          if (e?.code === "EXDEV") {
+            // Cross-device move (e.g. different drives on Windows): copy then delete.
+            await fs.promises.copyFile(sourcePath, destinationPath);
+            try {
+              await fs.promises.unlink(sourcePath);
+            } catch (unlinkError: any) {
+              // Source delete failed after copy succeeded — remove the copy
+              // so we don't end up with duplicates.
+              try {
+                await fs.promises.unlink(destinationPath);
+              } catch {
+                // Best-effort cleanup; destination may already be gone.
+              }
+              throw unlinkError;
+            }
+          } else if (e?.code === "ENOENT") {
+            throw new Error(
+              "File was modified or deleted before the move could complete",
+            );
+          } else {
+            throw e;
+          }
+        }
+
+        await invalidateThumbnail(sourcePath);
+        logger.log(`Moved media file: ${sourcePath} -> ${destinationPath}`);
+      },
+      [params.targetAppId],
+    );
   });
 }

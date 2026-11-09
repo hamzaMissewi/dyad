@@ -7,6 +7,7 @@ import {
   hasIncompleteTodos,
   buildTodoReminderMessage,
   ensureToolResultOrdering,
+  sanitizeStepMessages,
   type InjectedMessage,
 } from "@/pro/main/ipc/handlers/local_agent/prepare_step_utils";
 import type {
@@ -1348,25 +1349,49 @@ describe("prepare_step_utils", () => {
 
       expect(ensureToolResultOrdering(messages)).toBeNull();
     });
+
+    it("ignores malformed non-string toolCallId parts", () => {
+      const messages: ModelMessage[] = [
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool-call",
+              toolCallId: 123,
+              toolName: "read_file",
+              input: {},
+            } as any,
+          ],
+        },
+        { role: "user", content: [{ type: "text", text: "Injected" }] },
+        {
+          role: "tool",
+          content: [
+            {
+              type: "tool-result",
+              toolCallId: 123,
+              toolName: "read_file",
+              output: textToolResult("done"),
+            } as any,
+          ],
+        },
+      ];
+
+      expect(ensureToolResultOrdering(messages)).toBeNull();
+    });
   });
 
-  describe("compaction index delta adjustment", () => {
-    it("injection at stale index breaks ordering; adjusted index fixes it", () => {
-      // Simulate the compaction scenario end-to-end using the utility functions.
-
-      // --- During compaction step (step 1) ---
-      // Compacted messages: [user, compaction_summary, assistant(tool_use), tool(result)]
-      const compactedMessages: ModelMessage[] = [
-        { role: "user", content: "Build LPOAC website" },
-        { role: "assistant", content: "Conversation compacted." },
+  describe("sanitizeStepMessages", () => {
+    it("returns unchanged when an existing tool result is already canonical", () => {
+      const messages: ModelMessage[] = [
         {
           role: "assistant",
           content: [
             {
               type: "tool-call",
-              toolCallId: "toolu_crawl",
-              toolName: "web_crawl",
-              input: { url: "https://example.org" },
+              toolCallId: "call-1",
+              toolName: "read_file",
+              input: { path: "src/App.tsx" },
             },
           ],
         },
@@ -1375,130 +1400,36 @@ describe("prepare_step_utils", () => {
           content: [
             {
               type: "tool-result",
-              toolCallId: "toolu_crawl",
-              toolName: "web_crawl",
-              output: textToolResult("Web crawl completed."),
+              toolCallId: "call-1",
+              toolName: "read_file",
+              output: textToolResult("app"),
             },
           ],
         },
       ];
 
-      const allInjectedMessages: InjectedMessage[] = [];
-      const pendingUserMessages: UserMessageContentPart[][] = [
-        [{ type: "text", text: "Screenshot from crawl" }],
-      ];
+      const result = sanitizeStepMessages(messages);
 
-      // Process pending screenshot — index will be based on compacted length (4)
-      prepareStepMessages(
-        { messages: compactedMessages },
-        pendingUserMessages,
-        allInjectedMessages,
-      );
-      expect(allInjectedMessages[0].insertAtIndex).toBe(4);
-
-      // --- Apply the compaction index delta ---
-      // preCompactionBaseCount=1 (just user_msg), postCompactionBaseCount=2 (user + summary)
-      const compactionIndexDelta = 2 - 1; // = 1
-      for (const injection of allInjectedMessages) {
-        injection.insertAtIndex = Math.max(
-          0,
-          injection.insertAtIndex - compactionIndexDelta,
-        );
-      }
-      expect(allInjectedMessages[0].insertAtIndex).toBe(3);
-
-      // --- During step 2 ---
-      // SDK provides messages WITHOUT the compaction summary:
-      // [user, step0_assistant(tool_use), step0_tool(result), step1_assistant(tool_use), step1_tool(result)]
-      const sdkMessages: ModelMessage[] = [
-        { role: "user", content: "Build LPOAC website" },
-        {
-          role: "assistant",
-          content: [
-            {
-              type: "tool-call",
-              toolCallId: "toolu_crawl",
-              toolName: "web_crawl",
-              input: { url: "https://example.org" },
-            },
-          ],
-        },
-        {
-          role: "tool",
-          content: [
-            {
-              type: "tool-result",
-              toolCallId: "toolu_crawl",
-              toolName: "web_crawl",
-              output: textToolResult("Web crawl completed."),
-            },
-          ],
-        },
-        {
-          role: "assistant",
-          content: [
-            {
-              type: "tool-call",
-              toolCallId: "toolu_replace",
-              toolName: "search_replace",
-              input: {},
-            },
-          ],
-        },
-        {
-          role: "tool",
-          content: [
-            {
-              type: "tool-result",
-              toolCallId: "toolu_replace",
-              toolName: "search_replace",
-              output: textToolResult("ok"),
-            },
-          ],
-        },
-      ];
-
-      // Re-inject with adjusted index (3)
-      const result = injectMessagesAtPositions(
-        sdkMessages,
-        allInjectedMessages,
-      );
-
-      // Screenshot at index 3 = after step0_tool, before step1_assistant — correct!
-      expect(result.map((m) => m.role)).toEqual([
-        "user",
-        "assistant",
-        "tool",
-        "user", // screenshot at index 3
-        "assistant",
-        "tool",
-      ]);
+      expect(result.changed).toBe(false);
+      expect(result.messages).toBe(messages);
     });
 
-    it("without delta adjustment, stale index breaks tool_use/tool_result pairing", () => {
-      // Prove the bug: without adjustment, the screenshot lands in the wrong spot.
-      const allInjectedMessages: InjectedMessage[] = [
-        {
-          insertAtIndex: 4, // Stale index from compaction step (not adjusted)
-          sequence: 0,
-          message: {
-            role: "user",
-            content: [{ type: "text", text: "Screenshot" }],
-          },
-        },
-      ];
-
-      // SDK messages (no compaction summary)
-      const sdkMessages: ModelMessage[] = [
-        { role: "user", content: "Build website" },
+    it("merges split parallel tool results even without pending injections", () => {
+      const messages: ModelMessage[] = [
         {
           role: "assistant",
           content: [
             {
               type: "tool-call",
-              toolCallId: "toolu_crawl",
-              toolName: "web_crawl",
-              input: {},
+              toolCallId: "call-1",
+              toolName: "read_file",
+              input: { path: "src/App.tsx" },
+            },
+            {
+              type: "tool-call",
+              toolCallId: "call-2",
+              toolName: "read_file",
+              input: { path: "src/main.tsx" },
             },
           ],
         },
@@ -1507,20 +1438,9 @@ describe("prepare_step_utils", () => {
           content: [
             {
               type: "tool-result",
-              toolCallId: "toolu_crawl",
-              toolName: "web_crawl",
-              output: textToolResult("done"),
-            },
-          ],
-        },
-        {
-          role: "assistant",
-          content: [
-            {
-              type: "tool-call",
-              toolCallId: "toolu_replace",
-              toolName: "search_replace",
-              input: {},
+              toolCallId: "call-1",
+              toolName: "read_file",
+              output: textToolResult("app"),
             },
           ],
         },
@@ -1529,39 +1449,26 @@ describe("prepare_step_utils", () => {
           content: [
             {
               type: "tool-result",
-              toolCallId: "toolu_replace",
-              toolName: "search_replace",
-              output: textToolResult("ok"),
+              toolCallId: "call-2",
+              toolName: "read_file",
+              output: textToolResult("main"),
             },
           ],
         },
       ];
 
-      const broken = injectMessagesAtPositions(
-        sdkMessages,
-        allInjectedMessages,
-      );
+      const result = sanitizeStepMessages(messages);
 
-      // BUG: screenshot lands between step1 assistant and step1 tool
-      expect(broken.map((m) => m.role)).toEqual([
-        "user",
-        "assistant",
-        "tool",
-        "assistant",
-        "user", // WRONG — between step1's tool_use and tool_result
-        "tool",
-      ]);
-
-      // ensureToolResultOrdering fixes it as a safety net
-      const fixed = ensureToolResultOrdering(broken as ModelMessage[]);
-      expect(fixed).not.toBeNull();
-      expect(fixed!.map((m) => m.role)).toEqual([
-        "user",
-        "assistant",
-        "tool",
-        "assistant",
-        "tool",
-        "user", // Moved to safe position
+      expect(result.changed).toBe(true);
+      expect(result.messages).toEqual([
+        messages[0],
+        {
+          role: "tool",
+          content: [
+            (messages[1].content as any[])[0],
+            (messages[2].content as any[])[0],
+          ],
+        },
       ]);
     });
   });

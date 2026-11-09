@@ -3,6 +3,9 @@ import {
   parseAiMessagesJson,
   getAiMessagesJsonIfWithinLimit,
   MAX_AI_MESSAGES_SIZE,
+  normalizeToolCallIdsForOpenAIResponses,
+  sanitizeToolCallTranscript,
+  shouldNormalizeToolCallIdsForOpenAIResponses,
   type DbMessageForParsing,
 } from "@/ipc/utils/ai_messages_utils";
 import { AI_MESSAGES_SDK_VERSION } from "@/db/schema";
@@ -44,18 +47,29 @@ describe("parseAiMessagesJson", () => {
           },
         ],
       };
+      const toolResultMessage: ModelMessage = {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call-123",
+            toolName: "read_file",
+            output: { type: "text", value: "contents" },
+          },
+        ],
+      };
       const msg: DbMessageForParsing = {
         id: 2,
         role: "assistant",
         content: "fallback",
         aiMessagesJson: {
           sdkVersion: AI_MESSAGES_SDK_VERSION,
-          messages: [toolMessage],
+          messages: [toolMessage, toolResultMessage],
         },
       };
 
       const result = parseAiMessagesJson(msg);
-      expect(result).toEqual([toolMessage]);
+      expect(result).toEqual([toolMessage, toolResultMessage]);
     });
   });
 
@@ -257,6 +271,17 @@ describe("parseAiMessagesJson", () => {
                 },
               ],
             },
+            {
+              role: "tool",
+              content: [
+                {
+                  type: "tool-result",
+                  toolCallId: "call-123",
+                  toolName: "read_file",
+                  output: { type: "text", value: "contents" },
+                },
+              ],
+            },
           ] as ModelMessage[],
         },
       };
@@ -265,6 +290,57 @@ describe("parseAiMessagesJson", () => {
       const part = (result[0].content as any[])[0];
       expect(part.toolCallId).toBe("call-123");
       expect(part.providerOptions).toBeUndefined();
+    });
+
+    it("should preserve Gemini thought signatures until targeting OpenAI Responses", () => {
+      const oversizedToolCallId = `call_123__thought__${"x".repeat(350)}`;
+      const msg: DbMessageForParsing = {
+        id: 22,
+        role: "assistant",
+        content: "fallback",
+        aiMessagesJson: {
+          sdkVersion: AI_MESSAGES_SDK_VERSION,
+          messages: [
+            {
+              role: "assistant",
+              content: [
+                {
+                  type: "tool-call",
+                  toolCallId: oversizedToolCallId,
+                  toolName: "set_chat_summary",
+                  input: { summary: "Read README.md" },
+                },
+              ],
+            },
+            {
+              role: "tool",
+              content: [
+                {
+                  type: "tool-result",
+                  toolCallId: oversizedToolCallId,
+                  toolName: "set_chat_summary",
+                  output: { type: "text", value: "Summary updated" },
+                },
+              ],
+            },
+          ] as ModelMessage[],
+        },
+      };
+
+      const result = parseAiMessagesJson(msg);
+      const parsedToolCallId = (result[0].content as any[])[0].toolCallId;
+      const parsedToolResultId = (result[1].content as any[])[0].toolCallId;
+
+      expect(parsedToolCallId).toBe(oversizedToolCallId);
+      expect(parsedToolResultId).toBe(oversizedToolCallId);
+
+      const normalized = normalizeToolCallIdsForOpenAIResponses(result);
+      const toolCallId = (normalized[0].content as any[])[0].toolCallId;
+      const toolResultId = (normalized[1].content as any[])[0].toolCallId;
+
+      expect(toolCallId).toHaveLength(64);
+      expect(toolCallId).toMatch(/^call_[0-9a-f]{59}$/);
+      expect(toolResultId).toBe(toolCallId);
     });
 
     it("should sanitize tool-call with empty string input to empty object", () => {
@@ -283,6 +359,17 @@ describe("parseAiMessagesJson", () => {
                   toolCallId: "call-456",
                   toolName: "execute_sql",
                   input: "",
+                },
+              ],
+            },
+            {
+              role: "tool",
+              content: [
+                {
+                  type: "tool-result",
+                  toolCallId: "call-456",
+                  toolName: "execute_sql",
+                  output: { type: "text", value: "done" },
                 },
               ],
             },
@@ -315,6 +402,17 @@ describe("parseAiMessagesJson", () => {
                 },
               ],
             },
+            {
+              role: "tool",
+              content: [
+                {
+                  type: "tool-result",
+                  toolCallId: "call-789",
+                  toolName: "read_file",
+                  output: { type: "text", value: "contents" },
+                },
+              ],
+            },
           ] as ModelMessage[],
         },
       };
@@ -341,6 +439,17 @@ describe("parseAiMessagesJson", () => {
                   toolCallId: "call-valid",
                   toolName: "read_file",
                   input: { path: "/test" },
+                },
+              ],
+            },
+            {
+              role: "tool",
+              content: [
+                {
+                  type: "tool-result",
+                  toolCallId: "call-valid",
+                  toolName: "read_file",
+                  output: { type: "text", value: "contents" },
                 },
               ],
             },
@@ -378,6 +487,17 @@ describe("parseAiMessagesJson", () => {
                 {
                   type: "text",
                   text: "Here is my response",
+                },
+              ],
+            },
+            {
+              role: "tool",
+              content: [
+                {
+                  type: "tool-result",
+                  toolCallId: "call-123",
+                  toolName: "read_file",
+                  output: { type: "text", value: "contents" },
                 },
               ],
             },
@@ -447,6 +567,17 @@ describe("parseAiMessagesJson", () => {
                   toolCallId: "call-123",
                   toolName: "read_file",
                   input: { path: "/test" },
+                },
+              ],
+            },
+            {
+              role: "tool",
+              content: [
+                {
+                  type: "tool-result",
+                  toolCallId: "call-123",
+                  toolName: "read_file",
+                  output: { type: "text", value: "contents" },
                 },
               ],
             },
@@ -673,6 +804,42 @@ describe("parseAiMessagesJson", () => {
   });
 });
 
+describe("shouldNormalizeToolCallIdsForOpenAIResponses", () => {
+  it.each([
+    ["openai", "gpt-5.6-luna", true],
+    ["azure", "gpt-5", false],
+    ["auto", "value", true],
+    ["auto", "balanced", true],
+    ["auto", "auto", true],
+    ["google", "gemini-3.7-flash", false],
+  ])(
+    "returns $2 for provider $0 and model $1",
+    (providerId, modelName, expected) => {
+      expect(
+        shouldNormalizeToolCallIdsForOpenAIResponses(providerId, modelName),
+      ).toBe(expected);
+    },
+  );
+
+  it("returns the original array when every tool-call ID is compatible", () => {
+    const messages: ModelMessage[] = [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "call-compatible",
+            toolName: "read_file",
+            input: { path: "README.md" },
+          },
+        ],
+      },
+    ];
+
+    expect(normalizeToolCallIdsForOpenAIResponses(messages)).toBe(messages);
+  });
+});
+
 describe("getAiMessagesJsonIfWithinLimit", () => {
   it("should return undefined for empty array", () => {
     const result = getAiMessagesJsonIfWithinLimit([]);
@@ -726,7 +893,7 @@ describe("getAiMessagesJsonIfWithinLimit", () => {
     expect(result?.messages).toEqual(messages);
   });
 
-  it("should handle messages with complex content types", () => {
+  it("should strip orphaned tool calls before saving", () => {
     const messages: ModelMessage[] = [
       {
         role: "assistant",
@@ -745,6 +912,311 @@ describe("getAiMessagesJsonIfWithinLimit", () => {
     const result = getAiMessagesJsonIfWithinLimit(messages);
     expect(result).toBeDefined();
     expect(result?.sdkVersion).toBe(AI_MESSAGES_SDK_VERSION);
-    expect(result?.messages[0]).toEqual(messages[0]);
+    expect(result?.messages[0]).toEqual({
+      role: "assistant",
+      content: [{ type: "text", text: "Here is the result" }],
+    });
+  });
+});
+
+describe("sanitizeToolCallTranscript", () => {
+  it("preserves message references when the transcript is already canonical", () => {
+    const messages: ModelMessage[] = [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "call-1",
+            toolName: "read_file",
+            input: { path: "src/App.tsx" },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call-1",
+            toolName: "read_file",
+            output: { type: "text", value: "file contents" },
+          },
+        ],
+      },
+      { role: "user", content: "Next request" },
+    ];
+
+    const result = sanitizeToolCallTranscript(messages);
+
+    expect(result).toEqual(messages);
+    expect(result[0]).toBe(messages[0]);
+    expect(result[1]).toBe(messages[1]);
+    expect(result[2]).toBe(messages[2]);
+  });
+
+  it("moves user messages after the matching tool result", () => {
+    const messages: ModelMessage[] = [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "call-1",
+            toolName: "read_file",
+            input: { path: "src/App.tsx" },
+          },
+        ],
+      },
+      { role: "user", content: "Injected screenshot context" },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call-1",
+            toolName: "read_file",
+            output: { type: "text", value: "file contents" },
+          },
+        ],
+      },
+    ];
+
+    expect(sanitizeToolCallTranscript(messages)).toEqual([
+      messages[0],
+      messages[2],
+      messages[1],
+    ]);
+  });
+
+  it("strips assistant tool calls that have no matching result", () => {
+    const messages: ModelMessage[] = [
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "Let me check." },
+          {
+            type: "tool-call",
+            toolCallId: "call-1",
+            toolName: "read_file",
+            input: { path: "src/App.tsx" },
+          },
+        ],
+      },
+      { role: "user", content: "Next request" },
+    ];
+
+    expect(sanitizeToolCallTranscript(messages)).toEqual([
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "Let me check." }],
+      },
+      messages[1],
+    ]);
+  });
+
+  it("drops assistant messages that only contain orphaned tool calls", () => {
+    const messages: ModelMessage[] = [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "call-1",
+            toolName: "read_file",
+            input: { path: "src/App.tsx" },
+          },
+        ],
+      },
+      { role: "user", content: "Next request" },
+    ];
+
+    expect(sanitizeToolCallTranscript(messages)).toEqual([messages[1]]);
+  });
+
+  it("merges split parallel tool results into one immediate tool message", () => {
+    const messages: ModelMessage[] = [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "call-1",
+            toolName: "read_file",
+            input: { path: "src/App.tsx" },
+          },
+          {
+            type: "tool-call",
+            toolCallId: "call-2",
+            toolName: "read_file",
+            input: { path: "src/main.tsx" },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call-1",
+            toolName: "read_file",
+            output: { type: "text", value: "app" },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call-2",
+            toolName: "read_file",
+            output: { type: "text", value: "main" },
+          },
+        ],
+      },
+    ];
+
+    expect(sanitizeToolCallTranscript(messages)).toEqual([
+      messages[0],
+      {
+        role: "tool",
+        content: [
+          (messages[1].content as any[])[0],
+          (messages[2].content as any[])[0],
+        ],
+      },
+    ]);
+  });
+
+  it("preserves completed parallel tool pairs when another result is missing", () => {
+    const messages: ModelMessage[] = [
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "Checking the project." },
+          {
+            type: "tool-call",
+            toolCallId: "call-1",
+            toolName: "read_file",
+            input: { path: "src/App.tsx" },
+          },
+          {
+            type: "tool-call",
+            toolCallId: "call-2",
+            toolName: "read_file",
+            input: { path: "src/main.tsx" },
+          },
+          {
+            type: "tool-call",
+            toolCallId: "call-3",
+            toolName: "list_files",
+            input: { path: "src" },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call-1",
+            toolName: "read_file",
+            output: { type: "text", value: "app" },
+          },
+        ],
+      },
+      { role: "user", content: "Injected context" },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call-3",
+            toolName: "list_files",
+            output: { type: "text", value: "files" },
+          },
+        ],
+      },
+    ];
+
+    expect(sanitizeToolCallTranscript(messages)).toEqual([
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "Checking the project." },
+          (messages[0].content as any[])[1],
+          (messages[0].content as any[])[3],
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          (messages[1].content as any[])[0],
+          (messages[3].content as any[])[0],
+        ],
+      },
+      messages[2],
+    ]);
+  });
+
+  it("cleans collected tool-result metadata before merging", () => {
+    const messages: ModelMessage[] = [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "call-1",
+            toolName: "read_file",
+            input: { path: "src/App.tsx" },
+          },
+        ],
+      },
+      { role: "user", content: "Injected screenshot context" },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call-1",
+            toolName: "read_file",
+            output: { type: "text", value: "file contents" },
+            providerOptions: {
+              openai: { itemId: "msg_expired" },
+            },
+          } as any,
+        ],
+      },
+    ];
+
+    const result = sanitizeToolCallTranscript(messages);
+    const toolResult = (result[1].content as any[])[0];
+
+    expect(result.map((message) => message.role)).toEqual([
+      "assistant",
+      "tool",
+      "user",
+    ]);
+    expect(toolResult.providerOptions).toBeUndefined();
+  });
+
+  it("drops dangling tool results without a preceding assistant tool call", () => {
+    const messages: ModelMessage[] = [
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call-1",
+            toolName: "read_file",
+            output: { type: "text", value: "file contents" },
+          },
+        ],
+      },
+      { role: "assistant", content: "Done" },
+    ];
+
+    expect(sanitizeToolCallTranscript(messages)).toEqual([messages[1]]);
   });
 });

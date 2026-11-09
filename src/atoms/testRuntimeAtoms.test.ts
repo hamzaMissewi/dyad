@@ -1,0 +1,576 @@
+import { describe, expect, it } from "vitest";
+import { createStore } from "jotai";
+import { selectedAppIdAtom } from "@/atoms/appAtoms";
+import {
+  appendTestRunOutputAtom,
+  applyTestRunFinishedAtom,
+  applyTestRunStartedAtom,
+  clearTestRuntimeForAppAtom,
+  currentTestRunStateAtom,
+  currentTestSpecsAtom,
+  dismissedNeonTestingBannerAppIdsAtom,
+  dismissedTestRunThroughIdByAppIdAtom,
+  setTestRunStateForAppAtom,
+  setTestSpecsForAppAtom,
+  testRunOutputByAppIdAtom,
+  testRunStateByAppIdAtom,
+  testSpecsByAppIdAtom,
+} from "@/atoms/testRuntimeAtoms";
+
+describe("test runtime atoms", () => {
+  it("keeps an infrastructure failure visible through sibling progress and completion", () => {
+    const store = createStore();
+    for (const runId of [1, 2])
+      store.set(applyTestRunStartedAtom, { appId: 1, runId, source: "panel" });
+    store.set(applyTestRunFinishedAtom, {
+      appId: 1,
+      expectedRunId: 1,
+      isPartialRun: false,
+      res: {
+        appId: 1,
+        results: [],
+        infraError: { message: "Neon branch limit reached" },
+        isolation: { mode: "neon-branch" },
+      },
+    });
+    store.set(setTestRunStateForAppAtom, {
+      appId: 1,
+      runId: 2,
+      update: (prev) => ({ ...prev, phase: "running" }),
+    });
+    expect(store.get(testRunStateByAppIdAtom).get(1)).toMatchObject({
+      phase: "running",
+      runError: { message: "Neon branch limit reached" },
+      isolation: { mode: "neon-branch" },
+    });
+    store.set(applyTestRunFinishedAtom, {
+      appId: 1,
+      expectedRunId: 2,
+      isPartialRun: false,
+      res: { appId: 1, results: [] },
+    });
+    expect(store.get(testRunStateByAppIdAtom).get(1)?.runError?.message).toBe(
+      "Neon branch limit reached",
+    );
+    store.set(applyTestRunStartedAtom, { appId: 1, runId: 3, source: "panel" });
+    expect(store.get(testRunStateByAppIdAtom).get(1)?.runError).toBeUndefined();
+  });
+
+  it("retains separate output owners when partial results from different runs are merged", () => {
+    const store = createStore();
+    const file = "e2e-tests/a.spec.ts";
+    for (const runId of [1, 2]) {
+      store.set(applyTestRunStartedAtom, {
+        appId: 1,
+        runId,
+        source: "panel",
+        testFile: file,
+        testLine: runId,
+      });
+      store.set(appendTestRunOutputAtom, {
+        appId: 1,
+        runId,
+        chunk: `output ${runId}`,
+      });
+      store.set(applyTestRunFinishedAtom, {
+        appId: 1,
+        expectedRunId: runId,
+        isPartialRun: true,
+        res: {
+          appId: 1,
+          results: [
+            {
+              file,
+              status: "failed",
+              tests: [
+                { title: `case ${runId}`, line: runId, status: "failed" },
+              ],
+            },
+          ],
+        },
+      });
+    }
+    expect(
+      store
+        .get(testRunStateByAppIdAtom)
+        .get(1)
+        ?.results[file].tests?.map((test) => test.runId),
+    ).toEqual([1, 2]);
+    expect(store.get(testRunOutputByAppIdAtom).get(1)).toEqual(
+      new Map([
+        [1, "output 1"],
+        [2, "output 2"],
+      ]),
+    );
+    store.set(applyTestRunStartedAtom, {
+      appId: 1,
+      runId: 3,
+      source: "panel",
+      testFile: file,
+    });
+    expect(store.get(testRunOutputByAppIdAtom).get(1)?.size).toBe(0);
+  });
+  it("clears only selected files and merges mixed batch results", () => {
+    const store = createStore();
+    const files = [
+      "e2e-tests/a.spec.ts",
+      "e2e-tests/b.spec.ts",
+      "e2e-tests/c.spec.ts",
+    ];
+    store.set(setTestSpecsForAppAtom, {
+      appId: 1,
+      specs: files.map((file) => ({ file, tests: [] })),
+    });
+    store.set(setTestRunStateForAppAtom, {
+      appId: 1,
+      update: (prev) => ({
+        ...prev,
+        results: Object.fromEntries(
+          files.map((file) => [file, { file, status: "passed" as const }]),
+        ),
+      }),
+    });
+    store.set(applyTestRunStartedAtom, {
+      appId: 1,
+      testFiles: files.slice(0, 2),
+      source: "agent",
+    });
+    const running = store.get(testRunStateByAppIdAtom).get(1)!;
+    expect(running.runningFiles).toEqual(files.slice(0, 2));
+    expect(Object.keys(running.results)).toEqual([files[2]]);
+    store.set(applyTestRunFinishedAtom, {
+      appId: 1,
+      isPartialRun: false,
+      res: {
+        appId: 1,
+        results: [
+          { file: files[0], status: "passed" },
+          { file: files[1], status: "failed", error: "broken" },
+        ],
+      },
+    });
+    const finished = store.get(testRunStateByAppIdAtom).get(1)!;
+    expect(finished.runningFiles).toEqual([]);
+    expect(finished.results[files[0]].status).toBe("passed");
+    expect(finished.results[files[1]].status).toBe("failed");
+    expect(finished.results[files[2]].status).toBe("passed");
+  });
+
+  it.each([false, true])(
+    "preserves unselected cases in a grep batch (whole suite: %s)",
+    (wholeSuite) => {
+      const store = createStore();
+      const files = ["e2e-tests/a.spec.ts", "e2e-tests/b.spec.ts"];
+      const tests = [
+        { title: "login", line: 3 },
+        { title: "logout", line: 8 },
+      ];
+      store.set(setTestSpecsForAppAtom, {
+        appId: 1,
+        specs: files.map((file) => ({ file, tests })),
+      });
+      store.set(setTestRunStateForAppAtom, {
+        appId: 1,
+        update: (prev) => ({
+          ...prev,
+          results: Object.fromEntries(
+            files.map((file) => [
+              file,
+              {
+                file,
+                status: "failed" as const,
+                tests: tests.map((test) => ({
+                  ...test,
+                  status: "failed" as const,
+                  error: "old failure",
+                })),
+              },
+            ]),
+          ),
+        }),
+      });
+      store.set(applyTestRunStartedAtom, {
+        appId: 1,
+        ...(wholeSuite ? {} : { testFiles: files }),
+        grep: "login",
+        source: "agent",
+      });
+      const running = store.get(testRunStateByAppIdAtom).get(1)!;
+      expect(running.runningTests).toEqual(files.map((file) => `${file}:3`));
+      expect(Object.keys(running.results)).toEqual(files);
+      store.set(applyTestRunFinishedAtom, {
+        appId: 1,
+        isPartialRun: true,
+        res: {
+          appId: 1,
+          results: files.map((file) => ({
+            file,
+            status: "passed" as const,
+            tests: [{ ...tests[0], status: "passed" as const }],
+          })),
+        },
+      });
+      for (const file of files) {
+        const result = store.get(testRunStateByAppIdAtom).get(1)!.results[file];
+        expect(result.tests?.map((test) => test.status)).toEqual([
+          "passed",
+          "failed",
+        ]);
+      }
+    },
+  );
+
+  it("keeps unknown hierarchical grep matches visible alongside known matches", () => {
+    const store = createStore();
+    store.set(setTestSpecsForAppAtom, {
+      appId: 1,
+      specs: [
+        {
+          file: "e2e-tests/a.spec.ts",
+          tests: [{ title: "auth login", line: 3 }],
+        },
+        { file: "e2e-tests/b.spec.ts", tests: [{ title: "login", line: 5 }] },
+      ],
+    });
+    store.set(applyTestRunStartedAtom, {
+      appId: 1,
+      grep: "auth",
+      source: "agent",
+    });
+    expect(store.get(testRunStateByAppIdAtom).get(1)?.runningTests).toEqual([
+      "e2e-tests/a.spec.ts:3",
+      "e2e-tests/b.spec.ts:5",
+    ]);
+  });
+
+  it("clears specs and run state for one app", () => {
+    const store = createStore();
+    store.set(dismissedNeonTestingBannerAppIdsAtom, [1, 2]);
+    store.set(
+      dismissedTestRunThroughIdByAppIdAtom,
+      new Map([
+        [1, 3],
+        [2, 5],
+      ]),
+    );
+    store.set(selectedAppIdAtom, 1);
+    store.set(setTestSpecsForAppAtom, {
+      appId: 1,
+      specs: [{ file: "tests/a.spec.ts", tests: [] }],
+    });
+    store.set(setTestRunStateForAppAtom, {
+      appId: 1,
+      update: {
+        phase: "running",
+        results: {},
+        runningFiles: ["tests/a.spec.ts"],
+      },
+    });
+
+    expect(store.get(currentTestSpecsAtom)).toHaveLength(1);
+    expect(store.get(currentTestRunStateAtom).phase).toBe("running");
+
+    store.set(clearTestRuntimeForAppAtom, 1);
+
+    expect(store.get(dismissedNeonTestingBannerAppIdsAtom)).toEqual([2]);
+    expect(store.get(dismissedTestRunThroughIdByAppIdAtom)).toEqual(
+      new Map([[2, 5]]),
+    );
+    expect(store.get(testSpecsByAppIdAtom).has(1)).toBe(false);
+    expect(store.get(testRunStateByAppIdAtom).has(1)).toBe(false);
+    expect(store.get(currentTestSpecsAtom)).toEqual([]);
+    expect(store.get(currentTestRunStateAtom).phase).toBe("idle");
+  });
+
+  it("applyTestRunStartedAtom marks the app setting up and clears its output", () => {
+    const store = createStore();
+    store.set(setTestSpecsForAppAtom, {
+      appId: 1,
+      specs: [
+        { file: "tests/a.spec.ts", tests: [] },
+        { file: "tests/b.spec.ts", tests: [] },
+      ],
+    });
+    store.set(
+      testRunOutputByAppIdAtom,
+      new Map([[1, new Map([[1, "stale output"]])]]),
+    );
+
+    // Whole-suite run (no file): every spec is running.
+    store.set(applyTestRunStartedAtom, { appId: 1, source: "panel" });
+    let state = store.get(testRunStateByAppIdAtom).get(1)!;
+    expect(state.phase).toBe("setup");
+    expect(state.source).toBe("panel");
+    expect(state.runningFiles).toEqual(["tests/a.spec.ts", "tests/b.spec.ts"]);
+    expect(store.get(testRunOutputByAppIdAtom).get(1)?.size ?? 0).toBe(0);
+
+    // Single-test run: only that test spins; other files' results survive.
+    store.set(setTestRunStateForAppAtom, {
+      appId: 1,
+      update: (prev) => ({
+        ...prev,
+        phase: "idle",
+        results: {
+          "tests/b.spec.ts": { file: "tests/b.spec.ts", status: "passed" },
+        },
+      }),
+    });
+    store.set(applyTestRunStartedAtom, {
+      appId: 1,
+      testFile: "tests/a.spec.ts",
+      testLine: 3,
+      source: "panel",
+    });
+    state = store.get(testRunStateByAppIdAtom).get(1)!;
+    expect(state.runningFiles).toEqual(["tests/a.spec.ts"]);
+    expect(state.runningTests).toEqual(["tests/a.spec.ts:3"]);
+    expect(state.results["tests/b.spec.ts"]?.status).toBe("passed");
+  });
+
+  it("applyTestRunFinishedAtom reconciles report paths onto known spec keys", () => {
+    const store = createStore();
+    store.set(setTestSpecsForAppAtom, {
+      appId: 1,
+      specs: [{ file: "tests/a.spec.ts", tests: [] }],
+    });
+    store.set(applyTestRunStartedAtom, { appId: 1, source: "panel" });
+
+    // Playwright reports the file testDir-relative ("a.spec.ts"); the result
+    // must land under the spec list's "tests/a.spec.ts" key.
+    store.set(applyTestRunFinishedAtom, {
+      appId: 1,
+      res: {
+        appId: 1,
+        results: [{ file: "a.spec.ts", status: "passed" }],
+        isolation: { mode: "neon-branch" },
+      },
+      isPartialRun: false,
+    });
+    const state = store.get(testRunStateByAppIdAtom).get(1)!;
+    expect(state.phase).toBe("idle");
+    expect(state.runningFiles).toEqual([]);
+    expect(state.results["tests/a.spec.ts"]?.status).toBe("passed");
+    expect(state.isolation).toEqual({ mode: "neon-branch" });
+  });
+
+  it("preserves completed results alongside an environment restore warning", () => {
+    const store = createStore();
+    store.set(applyTestRunStartedAtom, { appId: 1, source: "panel" });
+    store.set(applyTestRunFinishedAtom, {
+      appId: 1,
+      res: {
+        appId: 1,
+        results: [{ file: "e2e-tests/a.spec.ts", status: "passed" }],
+        infraError: { message: "Could not restore .env.local" },
+      },
+      isPartialRun: false,
+    });
+    const state = store.get(testRunStateByAppIdAtom).get(1)!;
+    expect(state.phase).toBe("idle");
+    expect(state.results["e2e-tests/a.spec.ts"]?.status).toBe("passed");
+    expect(state.runError).toEqual({
+      message: "Could not restore .env.local",
+      kind: "infra",
+    });
+  });
+
+  it("marks a run main reported as stopped with its cause", () => {
+    const store = createStore();
+    store.set(applyTestRunStartedAtom, { appId: 1, source: "agent" });
+    store.set(applyTestRunFinishedAtom, {
+      appId: 1,
+      res: {
+        appId: 1,
+        results: [],
+        infraError: {
+          message: "Test run stopped from the Tests panel.",
+          stopReason: { kind: "tests-panel-stop" },
+        },
+      },
+      isPartialRun: false,
+    });
+    const state = store.get(testRunStateByAppIdAtom).get(1)!;
+    expect(state.runError).toEqual({
+      message: "Test run stopped from the Tests panel.",
+      kind: "stopped",
+      stopReason: { kind: "tests-panel-stop" },
+    });
+  });
+
+  it.each([false, true])(
+    "keeps completed cases and marks interrupted files partial (filtered: %s)",
+    (isPartialRun) => {
+      const store = createStore();
+      const files = [
+        "e2e-tests/a.spec.ts",
+        "e2e-tests/b.spec.ts",
+        "e2e-tests/c.spec.ts",
+      ];
+      store.set(setTestSpecsForAppAtom, {
+        appId: 1,
+        // The static parser need not know every dynamically declared case.
+        specs: files.map((file) => ({ file, tests: [] })),
+      });
+      store.set(applyTestRunStartedAtom, {
+        appId: 1,
+        source: "panel",
+        testFiles: files,
+      });
+      store.set(applyTestRunFinishedAtom, {
+        appId: 1,
+        isPartialRun,
+        res: {
+          appId: 1,
+          results: [
+            {
+              file: "a.spec.ts",
+              status: "passed",
+              tests: [{ title: "done", line: 3, status: "passed" }],
+            },
+            {
+              file: "b.spec.ts",
+              status: "passed",
+              incomplete: true,
+              tests: [{ title: "first case", line: 3, status: "passed" }],
+            },
+          ],
+          infraError: { message: "Test run stopped." },
+        },
+      });
+      const state = store.get(testRunStateByAppIdAtom).get(1)!;
+      expect(state.results[files[0]].status).toBe("passed");
+      expect(state.results[files[1]].status).toBe("partial");
+      expect(state.results[files[1]].tests?.[0].status).toBe("passed");
+      expect(state.results[files[2]]).toBeUndefined();
+      expect(state.runError?.message).toBe("Test run stopped.");
+      expect(state.runningFiles).toEqual([]);
+    },
+  );
+
+  it.each([true, false])(
+    "keeps a newer run's case when an older run reconciles last (older run partial: %s)",
+    (olderRunPartial) => {
+      const store = createStore();
+      const file = "tests/a.spec.ts";
+      store.set(setTestSpecsForAppAtom, {
+        appId: 1,
+        specs: [
+          {
+            file,
+            tests: [
+              { title: "shared", line: 3 },
+              { title: "other", line: 8 },
+            ],
+          },
+        ],
+      });
+      const finish = (
+        runId: number,
+        tests: { title: string; line: number; status: "passed" | "failed" }[],
+        isPartialRun: boolean,
+        reconcileOnly = false,
+      ) =>
+        store.set(applyTestRunFinishedAtom, {
+          appId: 1,
+          expectedRunId: runId,
+          isPartialRun,
+          reconcileOnly,
+          res: {
+            appId: 1,
+            results: [{ file, status: "failed", tests }],
+          },
+        });
+      const olderTests = [
+        { title: "shared", line: 3, status: "failed" as const },
+        ...(olderRunPartial
+          ? []
+          : [{ title: "other", line: 8, status: "passed" as const }]),
+      ];
+      for (const runId of [1, 2])
+        store.set(applyTestRunStartedAtom, {
+          appId: 1,
+          runId,
+          source: "agent",
+          testFile: file,
+          testLine: runId === 2 || olderRunPartial ? 3 : undefined,
+        });
+      finish(1, olderTests, olderRunPartial);
+      finish(2, [{ title: "shared", line: 3, status: "passed" }], true);
+      finish(1, olderTests, olderRunPartial, true);
+
+      const result = store.get(testRunStateByAppIdAtom).get(1)?.results[file];
+      expect(result?.tests?.find((test) => test.line === 3)).toMatchObject({
+        status: "passed",
+        runId: 2,
+      });
+      if (!olderRunPartial)
+        expect(result?.tests?.find((test) => test.line === 8)).toMatchObject({
+          status: "passed",
+          runId: 1,
+        });
+    },
+  );
+
+  it("merges grep-targeted run results instead of replacing the whole file", () => {
+    const store = createStore();
+    store.set(setTestSpecsForAppAtom, {
+      appId: 1,
+      specs: [
+        {
+          file: "tests/a.spec.ts",
+          tests: [
+            { title: "passes", line: 3 },
+            { title: "fails", line: 8 },
+          ],
+        },
+      ],
+    });
+    store.set(setTestRunStateForAppAtom, {
+      appId: 1,
+      update: {
+        phase: "idle",
+        runningFiles: [],
+        results: {
+          "tests/a.spec.ts": {
+            file: "tests/a.spec.ts",
+            status: "failed",
+            tests: [
+              { title: "passes", line: 3, status: "passed" },
+              { title: "fails", line: 8, status: "failed" },
+            ],
+          },
+        },
+      },
+    });
+
+    store.set(applyTestRunStartedAtom, {
+      appId: 1,
+      testFile: "tests/a.spec.ts",
+      grep: "fails",
+      source: "panel",
+    });
+    store.set(applyTestRunFinishedAtom, {
+      appId: 1,
+      res: {
+        appId: 1,
+        results: [
+          {
+            file: "tests/a.spec.ts",
+            status: "passed",
+            tests: [{ title: "fails", line: 8, status: "passed" }],
+          },
+        ],
+      },
+      isPartialRun: true,
+    });
+
+    const result = store.get(testRunStateByAppIdAtom).get(1)?.results[
+      "tests/a.spec.ts"
+    ];
+    expect(result?.status).toBe("passed");
+    expect(result?.tests).toEqual([
+      { title: "passes", line: 3, status: "passed" },
+      { title: "fails", line: 8, status: "passed" },
+    ]);
+  });
+});

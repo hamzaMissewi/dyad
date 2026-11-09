@@ -78,7 +78,14 @@ export function useMcp() {
   const toolsByServer = useMemo(() => {
     const map: Record<number, McpTool[]> = {};
     for (const [id, result] of Object.entries(toolsByServerQuery.data || {})) {
-      map[Number(id)] = result.tools;
+      // A failed or unauthorized listing has no real tool list, only a
+      // placeholder empty array. Leave the server out so absence means
+      // "no successful discovery" and the UI shows a placeholder count
+      // instead of a misleading zero; the outcome itself is reported
+      // via statusByServer.
+      if (result.status === "ok") {
+        map[Number(id)] = result.tools;
+      }
     }
     return map;
   }, [toolsByServerQuery.data]);
@@ -87,6 +94,16 @@ export function useMcp() {
     const map: Record<number, McpListToolsResult["status"]> = {};
     for (const [id, result] of Object.entries(toolsByServerQuery.data || {})) {
       map[Number(id)] = result.status;
+    }
+    return map;
+  }, [toolsByServerQuery.data]);
+
+  const errorByServer = useMemo(() => {
+    const map: Record<number, string> = {};
+    for (const [id, result] of Object.entries(toolsByServerQuery.data || {})) {
+      if (result.status !== "ok" && result.errorMessage) {
+        map[Number(id)] = result.errorMessage;
+      }
     }
     return map;
   }, [toolsByServerQuery.data]);
@@ -116,7 +133,20 @@ export function useMcp() {
     mutationFn: async (params: McpServerUpdate) => {
       return ipc.mcp.updateServer(params);
     },
-    onSuccess: async () => {
+    onSuccess: async (_result, params) => {
+      // Drop this server's cached probe result before re-discovering, so a
+      // status from before the change (e.g. a 401 from before its key was
+      // saved) can't briefly show as a failure. The batched query keeps
+      // previous data through a refetch, which would otherwise retain it.
+      queryClient.setQueriesData<Record<number, McpListToolsResult>>(
+        { queryKey: queryKeys.mcp.toolsByServer.all },
+        (old) => {
+          if (!old || !(params.id in old)) return old;
+          const next = { ...old };
+          delete next[params.id];
+          return next;
+        },
+      );
       await queryClient.invalidateQueries({ queryKey: queryKeys.mcp.servers });
       await queryClient.invalidateQueries({
         queryKey: queryKeys.mcp.toolsByServer.all,
@@ -134,12 +164,18 @@ export function useMcp() {
       await queryClient.invalidateQueries({
         queryKey: queryKeys.mcp.toolsByServer.all,
       });
+      // A deleted catalog plugin becomes addable again.
+      await queryClient.invalidateQueries({ queryKey: queryKeys.mcp.catalog });
     },
     meta: { showErrorToast: true },
   });
 
   const startOAuthMutation = useMutation({
-    mutationFn: async (params: { serverId: number; callbackPort?: number }) => {
+    mutationFn: async (params: {
+      serverId: number;
+      rendererMessageId: string;
+      callbackPort?: number;
+    }) => {
       return ipc.mcp.startOAuth(params);
     },
     onSuccess: async () => {
@@ -203,7 +239,11 @@ export function useMcp() {
   const startOAuth = async (params: {
     serverId: number;
     callbackPort?: number;
-  }) => startOAuthMutation.mutateAsync(params);
+  }) =>
+    startOAuthMutation.mutateAsync({
+      ...params,
+      rendererMessageId: crypto.randomUUID(),
+    });
 
   const disconnectOAuth = async (serverId: number) =>
     disconnectOAuthMutation.mutateAsync(serverId);
@@ -222,12 +262,18 @@ export function useMcp() {
     servers: serversQuery.data || [],
     toolsByServer,
     statusByServer,
+    errorByServer,
     consentsList: consentsQuery.data || [],
     consentsMap,
     isLoading:
       serversQuery.isLoading ||
       toolsByServerQuery.isLoading ||
       consentsQuery.isLoading,
+    // Tool discovery connects to live servers and can take seconds
+    // (LIST_TOOLS_TIMEOUT_MS), while the servers query is a local DB
+    // read. Callers that render per-server placeholders for pending
+    // tool counts gate on this instead of `isLoading`.
+    isServersLoading: serversQuery.isLoading,
     error:
       serversQuery.error || toolsByServerQuery.error || consentsQuery.error,
     refetchAll,

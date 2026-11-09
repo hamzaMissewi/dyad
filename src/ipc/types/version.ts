@@ -1,5 +1,11 @@
 import { z } from "zod";
-import { defineContract, createClient } from "../contracts/core";
+import {
+  defineContract,
+  createClient,
+  createEventClient,
+  defineEvent,
+} from "../contracts/core";
+import { SafeGitRefSchema } from "../../shared/git_refs";
 
 // =============================================================================
 // Version Schemas
@@ -30,28 +36,47 @@ export const CurrentChatMessageIdSchema = z.object({
 export const RevertVersionParamsSchema = z.object({
   appId: z.number(),
   previousVersionId: z.string(),
+  expectedHeadOid: z.string().optional(),
   currentChatMessageId: CurrentChatMessageIdSchema.optional(),
+  targetBranchName: z
+    .string()
+    .refine(
+      (v) => !v.startsWith("-"),
+      "targetBranchName must not start with '-'",
+    )
+    .optional(),
 });
 
 export type RevertVersionParams = z.infer<typeof RevertVersionParamsSchema>;
 
-export const RevertVersionResponseSchema = z.union([
-  z.object({ successMessage: z.string() }),
-  z.object({ warningMessage: z.string() }),
-]);
-
-export type RevertVersionResponse = z.infer<typeof RevertVersionResponseSchema>;
-
-export const CheckoutVersionParamsSchema = z.object({
-  appId: z.number(),
-  // Unlike getVersionChanges, this accepts arbitrary git refs (e.g. the "main"
-  // branch for the restore-to-latest flow), so it can't be constrained to a hex
-  // SHA. We still reject leading-dash values so a ref can't be interpreted as a
-  // git option when passed to native `git checkout`.
-  versionId: z
-    .string()
-    .refine((v) => !v.startsWith("-"), "versionId must not start with '-'"),
+export const VersionCommandResultSchema = z.object({
+  repositoryOutcome: z.enum(["target-applied", "unchanged"]),
+  notification: z
+    .object({
+      kind: z.enum(["success", "warning"]),
+      message: z.string(),
+    })
+    .nullable(),
+  runtimeAction: z.enum(["none", "restart"]),
+  affectedChatId: z.number().nullable(),
+  createdChatId: z.number().nullable(),
 });
+
+export type VersionCommandResult = z.infer<typeof VersionCommandResultSchema>;
+export type RevertVersionResponse = VersionCommandResult;
+
+export const CheckoutVersionParamsSchema = z.discriminatedUnion("purpose", [
+  z.object({
+    purpose: z.literal("preview"),
+    appId: z.number(),
+    versionId: SafeGitRefSchema,
+  }),
+  z.object({
+    purpose: z.literal("return"),
+    appId: z.number(),
+    branch: SafeGitRefSchema,
+  }),
+]);
 
 export const VersionChangeTypeSchema = z.enum(["added", "modified", "deleted"]);
 
@@ -74,13 +99,8 @@ export const GetVersionChangesParamsSchema = z.object({
     .regex(/^[0-9a-fA-F]{4,64}$/, "versionId must be a hex commit SHA"),
 });
 
-export const CheckoutVersionResponseSchema = z.object({
-  warningMessage: z.string().optional(),
-});
-
-export type CheckoutVersionResponse = z.infer<
-  typeof CheckoutVersionResponseSchema
->;
+export const CheckoutVersionResponseSchema = VersionCommandResultSchema;
+export type CheckoutVersionResponse = VersionCommandResult;
 
 const CommitHashSchema = z
   .string()
@@ -105,27 +125,95 @@ export const VersionMetadataResultSchema = z.object({
   note: z.string().nullable(),
 });
 
+export const RestoreToMessageParamsSchema = z.object({
+  // Constrain to positive integers: these are autoIncrement primary keys, so
+  // negative, zero, and float values are always invalid and should fail fast
+  // with a descriptive error rather than silently matching no row.
+  appId: z.number().int().positive(),
+  chatId: z.number().int().positive(),
+  messageId: z.number().int().positive(),
+  // When true (the default), the codebase (and database, if applicable) is
+  // reverted to the version before this message in addition to forking the
+  // chat. When false, only the chat is forked and the codebase is left as-is.
+  restoreCodebase: z.boolean().optional(),
+  // When invoked while the Version pane is previewing a historical commit,
+  // HEAD is detached. The renderer passes the branch it will return to so
+  // fork-only chats can be anchored to the live branch instead of the preview.
+  targetBranchName: z
+    .string()
+    .refine(
+      (v) => !v.startsWith("-"),
+      "targetBranchName must not start with '-'",
+    )
+    .optional(),
+});
+
+export type RestoreToMessageParams = z.infer<
+  typeof RestoreToMessageParamsSchema
+>;
+
+export const RestoreToMessageResponseSchema = VersionCommandResultSchema;
+
+export type RestoreToMessageResponse = z.infer<
+  typeof RestoreToMessageResponseSchema
+>;
+
+export const VersionPreviewPresentationResultSchema = z
+  .object({
+    operationId: z.string(),
+    appId: z.number().int().positive(),
+    notification: z
+      .object({
+        kind: z.enum(["success", "warning", "error"]),
+        message: z.string(),
+      })
+      .nullable(),
+    affectedChatId: z.number().int().positive().nullable(),
+    createdChatId: z.number().int().positive().nullable(),
+  })
+  .strict();
+
 // =============================================================================
 // Version Contracts
 // =============================================================================
 
 export const versionContracts = {
+  acquirePreviewWindowInterest: defineContract({
+    channel: "version-preview:acquire-window-interest",
+    input: z.object({ appId: z.number().int().positive() }).strict(),
+    output: z.object({ acquired: z.boolean() }).strict(),
+  }),
+
+  restorePreviewWindowInterest: defineContract({
+    channel: "version-preview:restore-window-interest",
+    input: z.object({ appId: z.number().int().positive() }).strict(),
+    output: z.object({ acquired: z.boolean() }).strict(),
+  }),
+
+  releasePreviewWindowInterest: defineContract({
+    channel: "version-preview:release-window-interest",
+    input: z
+      .object({
+        appId: z.number().int().positive(),
+        operationId: z.string().min(1),
+        exit: z.discriminatedUnion("type", [
+          z.object({ type: z.literal("close") }).strict(),
+          z
+            .object({
+              type: z.literal("switch-app"),
+              nextAppId: z.number().int().positive().nullable(),
+            })
+            .strict(),
+        ]),
+      })
+      .strict(),
+    output: z.object({ cleanupStarted: z.boolean() }).strict(),
+  }),
+
   listVersions: defineContract({
     channel: "list-versions",
-    input: z.object({ appId: z.number() }),
+    input: z.object({ appId: z.number(), ref: SafeGitRefSchema.optional() }),
     output: z.array(VersionSchema),
-  }),
-
-  revertVersion: defineContract({
-    channel: "revert-version",
-    input: RevertVersionParamsSchema,
-    output: RevertVersionResponseSchema,
-  }),
-
-  checkoutVersion: defineContract({
-    channel: "checkout-version",
-    input: CheckoutVersionParamsSchema,
-    output: CheckoutVersionResponseSchema,
   }),
 
   getVersionChanges: defineContract({
@@ -138,12 +226,14 @@ export const versionContracts = {
     channel: "set-version-favorite",
     input: SetVersionFavoriteParamsSchema,
     output: VersionMetadataResultSchema,
+    invalidates: (input) => [{ family: "versions", appId: input.appId }],
   }),
 
   setVersionNote: defineContract({
     channel: "set-version-note",
     input: SetVersionNoteParamsSchema,
     output: VersionMetadataResultSchema,
+    invalidates: (input) => [{ family: "versions", appId: input.appId }],
   }),
 
   getCurrentBranch: defineContract({
@@ -158,3 +248,12 @@ export const versionContracts = {
 // =============================================================================
 
 export const versionClient = createClient(versionContracts);
+
+export const versionEvents = {
+  previewResult: defineEvent({
+    channel: "version-preview:result",
+    payload: VersionPreviewPresentationResultSchema,
+  }),
+} as const;
+
+export const versionEventClient = createEventClient(versionEvents);

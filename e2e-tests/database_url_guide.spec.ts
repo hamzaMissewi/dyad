@@ -1,17 +1,31 @@
 import { expect } from "@playwright/test";
-import { testSkipIfWindows, Timeout } from "./helpers/test_helper";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { testWithConfigSkipIfWindows, Timeout } from "./helpers/test_helper";
 
-testSkipIfWindows(
+testWithConfigSkipIfWindows({
+  preLaunchHook: async ({ userDataDir }) => {
+    await fs.mkdir(userDataDir, { recursive: true });
+    await fs.writeFile(
+      path.join(userDataDir, "user-settings.json"),
+      JSON.stringify({ enableNeonBranchProtection: false }),
+    );
+  },
+})(
   "unified database section shows env vars for development and production",
   async ({ po }) => {
     await po.setUp({ autoApprove: true });
-    await po.navigation.goToHubAndSelectTemplate("Next.js Template");
+    await po.navigation.goToTemplatesAndSelectTemplate("Next.js Template");
     await po.chatActions.selectChatMode("build");
     await po.sendPrompt("tc=basic", { timeout: Timeout.EXTRA_LONG });
-    await po.sendPrompt("tc=add-neon");
-
     await po.appManagement.startDatabaseIntegrationSetup("neon");
     await po.appManagement.clickConnectNeonButton();
+    // Reaching the project picker proves the OAuth return advanced through
+    // resource loading and the connector re-rendered as connected.
+    await expect(po.page.getByTestId("neon-project-select")).toBeVisible({
+      timeout: Timeout.MEDIUM,
+    });
+    await expect(po.page.getByTestId("connect-neon-button")).toBeHidden();
     await po.appManagement.selectNeonProject("Test Project");
 
     await po.navigation.clickBackButton();

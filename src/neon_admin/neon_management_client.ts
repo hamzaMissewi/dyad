@@ -3,6 +3,7 @@ import { readSettings, writeSettings } from "../main/settings";
 import { Api, createApiClient } from "@neondatabase/api-client";
 import log from "electron-log";
 import { IS_TEST_BUILD } from "../ipc/utils/test_utils";
+import { fetchWithRetry } from "../ipc/utils/retryWithRateLimit";
 import { DyadError, DyadErrorKind } from "@/errors/dyad_error";
 import { getNeonErrorMessage } from "./neon_errors";
 
@@ -28,7 +29,9 @@ function isTokenExpired(expiresIn?: number): boolean {
  * Refreshes the Neon access token using the refresh token
  * Updates settings with new tokens and expiration time
  */
-export async function refreshNeonToken(): Promise<void> {
+let refreshNeonTokenPromise: Promise<void> | null = null;
+
+async function refreshNeonTokenOnce(): Promise<void> {
   const settings = readSettings();
   const refreshToken = settings.neon?.refreshToken?.value;
 
@@ -44,10 +47,11 @@ export async function refreshNeonToken(): Promise<void> {
   }
 
   try {
-    // Make request to Neon refresh endpoint
-    const response = await fetch(
+    // Make request to Neon refresh endpoint. Use fetchWithRetry so a burst of
+    // token refreshes (e.g. running several in-app tests back-to-back) backs
+    // off on 429 instead of failing the whole flow.
+    const response = await fetchWithRetry(
       "https://oauth.dyad.sh/api/integrations/neon/refresh",
-
       {
         method: "POST",
         headers: {
@@ -55,6 +59,7 @@ export async function refreshNeonToken(): Promise<void> {
         },
         body: JSON.stringify({ refreshToken }),
       },
+      "Refresh Neon token",
     );
 
     if (!response.ok) {
@@ -87,6 +92,15 @@ export async function refreshNeonToken(): Promise<void> {
     logger.error("Error refreshing Neon token:", error);
     throw error;
   }
+}
+
+export function refreshNeonToken(): Promise<void> {
+  if (!refreshNeonTokenPromise) {
+    refreshNeonTokenPromise = refreshNeonTokenOnce().finally(() => {
+      refreshNeonTokenPromise = null;
+    });
+  }
+  return refreshNeonTokenPromise;
 }
 
 // Stable timestamp for mock branches so the apply-time staleness check in
@@ -150,7 +164,11 @@ export async function getNeonClient(): Promise<Api<unknown>> {
               id: branchId,
               name: params.branch?.name || "development",
               project_id: projectId,
-              parent_id: params.branch?.parent_id || "test-main-branch-id",
+              // Schema-only branches are root branches.
+              parent_id:
+                params.branch?.init_source === "schema-only"
+                  ? undefined
+                  : params.branch?.parent_id || "test-main-branch-id",
               default: false,
               created_at: new Date().toISOString(),
               updated_at: new Date().toISOString(),
@@ -186,10 +204,10 @@ export async function getNeonClient(): Promise<Api<unknown>> {
               default: true,
             },
             {
+              // A root branch, as Dyad creates it (see neon_dev_branch.ts).
               id: "test-development-branch-id",
               name: "development",
               project_id: projectId,
-              parent_id: "test-main-branch-id",
               created_at: MOCK_BRANCH_TIMESTAMP,
               updated_at: MOCK_BRANCH_TIMESTAMP,
               default: false,
@@ -305,7 +323,7 @@ export async function getNeonClient(): Promise<Api<unknown>> {
             id: branchId,
             project_id: projectId,
             name: getMockBranchName(branchId),
-            default: false,
+            default: branchId === "test-main-branch-id",
             created_at: new Date().toISOString(),
             updated_at: new Date().toISOString(),
           },
@@ -373,12 +391,20 @@ export async function getNeonClient(): Promise<Api<unknown>> {
 
     return createApiClient({
       apiKey: newAccessToken,
+      baseURL: getNeonApiBaseUrl(),
     });
   }
 
   return createApiClient({
     apiKey: neonAccessToken,
+    baseURL: getNeonApiBaseUrl(),
   });
+}
+
+// Overridable so benchmarks/tests can point the management client at a local
+// Neon API stand-in; undefined preserves the SDK default (console.neon.tech).
+function getNeonApiBaseUrl(): string | undefined {
+  return process.env.DYAD_NEON_API_BASE_URL || undefined;
 }
 
 /**
@@ -420,6 +446,7 @@ export async function getNeonOrganizationId(): Promise<string> {
 // importers of neon_management_client keep working unchanged.
 export {
   getNeonErrorMessage,
+  isBranchLimitError,
   isRetentionWindowError,
   getRetentionWindowFromError,
 } from "./neon_errors";

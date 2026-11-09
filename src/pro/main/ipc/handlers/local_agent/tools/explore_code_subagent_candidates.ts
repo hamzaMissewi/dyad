@@ -50,6 +50,7 @@ export interface SubagentObservation {
   args: unknown;
   result: string;
   candidates: ExplorerCandidate[];
+  warnings?: string[];
 }
 
 export const candidateIdSchema = z
@@ -706,8 +707,9 @@ function candidateKey(candidate: ExplorerCandidate): string {
 }
 
 export function formatCandidateRef(candidate: ExplorerCandidate): string {
-  const range = formatRange(candidate.range);
-  return range ? `${candidate.path}:${range}` : candidate.path;
+  return candidate.range
+    ? `${candidate.path}:${formatRange(candidate.range)}`
+    : candidate.path;
 }
 
 export function formatRange(range: CandidateRange | null): string {
@@ -754,7 +756,8 @@ function isTestPath(path: string): boolean {
     path.includes("/__tests__/") ||
     path.includes("/test/") ||
     path.includes("/tests/") ||
-    path.includes("/e2e/")
+    path.includes("/e2e/") ||
+    path.includes("/e2e-tests/")
   );
 }
 

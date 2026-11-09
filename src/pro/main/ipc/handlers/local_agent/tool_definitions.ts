@@ -1,12 +1,20 @@
+import { withReferencedAppRead } from "./tools/referenced_app_read";
+import { recordShellReviewOutcome } from "./shell_review_history";
+import { runShellTool } from "./tools/run_shell";
+import { isShellExperimentAvailable } from "@/shared/shell_capability";
 /**
  * Tool definitions for Local Agent v2
  * Each tool includes a zod schema, description, and execute function
  */
 
 import { IpcMainInvokeEvent } from "electron";
-import crypto from "node:crypto";
+import log from "electron-log";
 import { readSettings, writeSettings } from "@/main/settings";
 import type { SqlConsentMetadata } from "@/shared/sqlConsentMetadata";
+import {
+  rememberUserInputSubscriber,
+  userInputRegistry,
+} from "@/user_input/main";
 import { writeFileTool } from "./tools/write_file";
 import { deleteFileTool } from "./tools/delete_file";
 import { renameFileTool } from "./tools/rename_file";
@@ -30,21 +38,62 @@ import { webFetchTool } from "./tools/web_fetch";
 import { generateImageTool } from "./tools/generate_image";
 import { updateTodosTool } from "./tools/update_todos";
 import { runTypeChecksTool } from "./tools/run_type_checks";
+import { runTestsTool } from "./tools/run_tests";
+import { runPreCommitTool } from "./tools/run_pre_commit";
+import { runBuildTool } from "./tools/run_build";
+import { generateTestAssertionsTool } from "./tools/generate_test_assertions";
+import {
+  reinstallAndRestartAppTool,
+  restartAppTool,
+} from "./tools/app_lifecycle";
 import { grepTool } from "./tools/grep";
 import { codeSearchTool } from "./tools/code_search";
-import { exploreCodeTool } from "./tools/explore_code";
+import { exploreChatHistoryTool } from "./tools/explore_chat_history";
+import { searchChatsTool } from "./tools/search_chats";
+import { readChatTool } from "./tools/read_chat";
+import {
+  cancelAgentTool,
+  exploreCodeTool,
+  followupTaskTool,
+  listAgentsTool,
+  sendMessageTool,
+  spawnAgentTool,
+  waitAgentsTool,
+} from "./tools/subagent_tools";
 import { planningQuestionnaireTool } from "./tools/planning_questionnaire";
 import { writePlanTool } from "./tools/write_plan";
 import { exitPlanTool } from "./tools/exit_plan";
 import { readGuideTool } from "./tools/read_guide";
-import { executeSandboxScriptTool } from "./tools/execute_sandbox_script";
+import {
+  buildExecuteSandboxScriptDescription,
+  executeSandboxScriptTool,
+} from "./tools/execute_sandbox_script";
 import { searchMcpToolsTool } from "./tools/search_mcp_tools";
 import { getMcpToolSchemaTool } from "./tools/get_mcp_tool_schema";
+import {
+  suggestPluginTool,
+  type SuggestablePlugin,
+} from "./tools/suggest_plugin";
+import {
+  estimateMcpInlineTokens,
+  getMcpInlineTokenThreshold,
+  type McpToolDef,
+} from "./tools/mcp_type_defs";
 import { writeAppBlueprintTool } from "./tools/write_app_blueprint";
+import {
+  gitDiffTool,
+  gitLogTool,
+  gitRestoreFileTool,
+  gitShowCommitTool,
+  gitShowFileTool,
+  gitStatusTool,
+} from "./tools/git";
 import type { LanguageModelV3ToolResultOutput } from "@ai-sdk/provider";
+import { asSchema } from "ai";
 import {
   escapeXmlAttr,
   escapeXmlContent,
+  resolveToolDescription,
   type ToolDefinition,
   type AgentContext,
   type ToolResult,
@@ -52,6 +101,9 @@ import {
 import {
   assertAppBlueprintApproved,
   requireToolConsentOrThrow,
+  shouldTrackToolFileMutation,
+  shouldTrackToolMutation,
+  trackAppMutation,
   trackFileEditTool,
 } from "./tools/tool_invocation";
 import type { AgentToolConsent } from "@/lib/schemas";
@@ -59,6 +111,22 @@ import { getSupabaseClientCode } from "@/supabase_admin/supabase_context";
 import { getNeonClientCode } from "@/neon_admin/neon_context";
 import { DyadError, DyadErrorKind } from "@/errors/dyad_error";
 import { ExecuteAddDependencyError } from "@/ipc/processors/executeAddDependency";
+import { withTrackedMutation } from "./subagents/mutation_activity_tracker";
+import { estimateTokens } from "@/ipc/utils/token_utils";
+
+const logger = log.scope("local_agent_tools");
+
+function recordStreamingToolActivity(
+  ctx: AgentContext,
+  activity: Parameters<NonNullable<AgentContext["onToolActivity"]>>[0],
+): void {
+  const update = ctx.onToolActivity?.(activity);
+  if (update) {
+    void update.catch((error) =>
+      logger.warn("Failed to record streaming sub-agent activity", error),
+    );
+  }
+}
 
 function getToolErrorDisplayDetails(error: unknown): string {
   if (error instanceof ExecuteAddDependencyError) {
@@ -87,9 +155,24 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
   executeSqlTool,
   readFileTool,
   listFilesTool,
+  gitStatusTool,
+  gitDiffTool,
+  gitLogTool,
+  gitShowCommitTool,
+  gitShowFileTool,
+  gitRestoreFileTool,
   grepTool,
   codeSearchTool,
+  exploreChatHistoryTool,
+  searchChatsTool,
+  readChatTool,
   exploreCodeTool,
+  spawnAgentTool,
+  listAgentsTool,
+  waitAgentsTool,
+  cancelAgentTool,
+  sendMessageTool,
+  followupTaskTool,
   getSupabaseProjectInfoTool,
   getNeonProjectInfoTool,
   getDatabaseTableSchemaTool,
@@ -103,10 +186,18 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
   generateImageTool,
   updateTodosTool,
   runTypeChecksTool,
+  runPreCommitTool,
+  runShellTool,
+  runBuildTool,
+  runTestsTool,
+  generateTestAssertionsTool,
+  restartAppTool,
+  reinstallAndRestartAppTool,
   readGuideTool,
   executeSandboxScriptTool,
   searchMcpToolsTool,
   getMcpToolSchemaTool,
+  suggestPluginTool,
   // Plan mode tools
   planningQuestionnaireTool,
   writePlanTool,
@@ -136,48 +227,6 @@ function getAgentToolConsentSettings(
 // ============================================================================
 // Agent Tool Consent Management
 // ============================================================================
-
-interface PendingConsentEntry {
-  chatId: number;
-  resolve: (d: "accept-once" | "accept-always" | "decline") => void;
-}
-
-const pendingConsentResolvers = new Map<string, PendingConsentEntry>();
-
-export function waitForAgentToolConsent(
-  requestId: string,
-  chatId: number,
-): Promise<"accept-once" | "accept-always" | "decline"> {
-  return new Promise((resolve) => {
-    pendingConsentResolvers.set(requestId, { chatId, resolve });
-  });
-}
-
-export function resolveAgentToolConsent(
-  requestId: string,
-  decision: "accept-once" | "accept-always" | "decline",
-) {
-  const entry = pendingConsentResolvers.get(requestId);
-  if (entry) {
-    pendingConsentResolvers.delete(requestId);
-    entry.resolve(decision);
-  }
-}
-
-/**
- * Clean up all pending consent requests for a given chat.
- * Called when a stream is cancelled/aborted to prevent orphaned promises
- * and stale UI banners.
- */
-export function clearPendingConsentsForChat(chatId: number): void {
-  for (const [requestId, entry] of pendingConsentResolvers) {
-    if (entry.chatId === chatId) {
-      pendingConsentResolvers.delete(requestId);
-      // Resolve with decline so the tool execution fails gracefully
-      entry.resolve("decline");
-    }
-  }
-}
 
 export function getDefaultConsent(toolName: AgentToolName): AgentToolConsent {
   const tool = TOOL_DEFINITIONS.find((t) => t.name === toolName);
@@ -245,14 +294,27 @@ export async function requireAgentToolConsent(
   params: {
     chatId: number;
     toolName: AgentToolName;
+    confirmation?: "shell-approval" | "shell-review-retry";
     toolDescription?: string | null;
     inputPreview?: string | null;
     metadata?: SqlConsentMetadata | null;
+    abortSignal?: AbortSignal;
+    subagent?: {
+      threadId: string;
+      persona: "explorer" | "implementer";
+      taskName: string;
+    };
   },
 ): Promise<boolean> {
   const current = getAgentToolConsent(params.toolName);
 
-  if (current === "always") return true;
+  if (params.confirmation && params.toolName !== "run_shell")
+    throw new DyadError(
+      "Shell confirmation requires run_shell",
+      DyadErrorKind.Validation,
+    );
+  if (current === "never" && params.confirmation) return false;
+  if (current === "always" && !params.confirmation) return true;
   if (current === "never")
     throw new DyadError(
       "Should not ask for consent for a tool marked as 'never'",
@@ -260,6 +322,7 @@ export async function requireAgentToolConsent(
     );
 
   if (
+    !params.confirmation &&
     shouldAutoApproveAgentTool({
       toolName: params.toolName,
       metadata: params.metadata,
@@ -269,23 +332,21 @@ export async function requireAgentToolConsent(
     return true;
   }
 
-  // Ask renderer for a decision via event bridge
-  const requestId = `agent:${params.toolName}:${crypto.randomUUID()}`;
-  (event.sender as any).send("agent-tool:consent-request", {
-    requestId,
-    ...params,
+  rememberUserInputSubscriber(event.sender);
+  const requestId = userInputRegistry.request({
+    kind: "agent-consent",
+    confirmation: params.confirmation,
+    allowAlways: params.confirmation ? false : undefined,
+    chatId: params.chatId,
+    toolName: params.toolName,
+    toolDescription: params.toolDescription,
+    inputPreview: params.inputPreview,
+    metadata: params.metadata,
+    subagent: params.subagent,
+    classifier: "none",
   });
-
-  const response = await waitForAgentToolConsent(requestId, params.chatId);
-
-  if (response === "accept-always") {
-    setAgentToolConsent(params.toolName, "always");
-    return true;
-  }
-  if (response === "decline") {
-    return false;
-  }
-  return response === "accept-once";
+  const response = await userInputRegistry.park(requestId, params.abortSignal);
+  return response?.kind === "agent-consent" && response.decision !== "decline";
 }
 
 // ============================================================================
@@ -371,7 +432,17 @@ function convertToolResultForAiSdk(
   );
 }
 
+function serializeActivityOutput(result: ToolResult): string {
+  return typeof result === "string" ? result : JSON.stringify(result);
+}
+
 export interface BuildAgentToolSetOptions {
+  /**
+   * Selects the fail-closed surface for the active writable mode. Build mode
+   * intentionally exposes only the tools needed to create an app without
+   * Agent-only orchestration, Engine, diagnostics, or verification tools.
+   */
+  toolProfile?: "agent" | "build";
   /**
    * If true, exclude tools that modify state (files, database, etc.).
    * Used for read-only modes like "ask" mode.
@@ -396,6 +467,191 @@ export interface BuildAgentToolSetOptions {
    * If false, exclude app blueprint tools (write_app_blueprint).
    */
   enableAppBlueprint?: boolean;
+}
+
+export const BUILD_MODE_TOOL_NAMES = [
+  "write_file",
+  "search_replace",
+  "copy_file",
+  "delete_file",
+  "rename_file",
+  "add_dependency",
+  "execute_sql",
+  "read_file",
+  "list_files",
+  "grep",
+  "get_supabase_project_info",
+  "get_neon_project_info",
+  "get_database_table_schema",
+  "set_chat_summary",
+  "add_integration",
+  "enable_nitro",
+  "restart_app",
+  "reinstall_and_restart_app",
+  "update_todos",
+  "read_guide",
+  "planning_questionnaire",
+  "write_app_blueprint",
+] as const satisfies readonly AgentToolName[];
+
+const BUILD_MODE_TOOL_NAME_SET = new Set<AgentToolName>(BUILD_MODE_TOOL_NAMES);
+
+export async function estimateAgentToolTokens({
+  appPath,
+  toolProfile = "agent",
+  readOnly = false,
+  planModeOnly = false,
+  basicAgentMode = false,
+  freeModelMode = false,
+  enableAppBlueprint,
+  isDyadPro,
+  frameworkType,
+  supabaseProjectId,
+  supabaseProviderToolsAvailable = false,
+  neonProjectId,
+  neonActiveBranchId,
+  neonProviderToolsAvailable = false,
+  testingEnabled = false,
+  canUseExplorerSubagent = false,
+  canUseImplementerSubagent = false,
+  canUseAdvancedSubagentTools = false,
+  runTypeScriptForWholeProject = false,
+  preCommitHookAvailable = false,
+  reinstallAndRestartAppToolAvailable = true,
+  mcpToolDefs = [],
+  suggestablePlugins = [],
+}: {
+  toolProfile?: "agent" | "build";
+  readOnly?: boolean;
+  planModeOnly?: boolean;
+  basicAgentMode?: boolean;
+  freeModelMode?: boolean;
+  enableAppBlueprint: boolean;
+  isDyadPro: boolean;
+  frameworkType: AgentContext["frameworkType"];
+  supabaseProjectId: string | null;
+  supabaseProviderToolsAvailable?: boolean;
+  neonProjectId: string | null;
+  neonActiveBranchId: string | null;
+  neonProviderToolsAvailable?: boolean;
+  testingEnabled?: boolean;
+  canUseExplorerSubagent?: boolean;
+  canUseImplementerSubagent?: boolean;
+  canUseAdvancedSubagentTools?: boolean;
+  runTypeScriptForWholeProject?: boolean;
+  preCommitHookAvailable?: boolean;
+  reinstallAndRestartAppToolAvailable?: boolean;
+  mcpToolDefs?: McpToolDef[];
+  suggestablePlugins?: SuggestablePlugin[];
+  appPath?: string;
+}): Promise<number> {
+  const estimateContext = {
+    appPath,
+    freeModelMode,
+    isDyadPro,
+    frameworkType,
+    supabaseProjectId,
+    supabaseProviderToolsAvailable,
+    neonProjectId,
+    neonActiveBranchId,
+    neonProviderToolsAvailable,
+    referencedApps: new Map(),
+    testingEnabled,
+    canUseExplorerSubagent,
+    canUseImplementerSubagent,
+    canUseAdvancedSubagentTools,
+    runTypeScriptForWholeProject,
+    preCommitHookAvailable,
+    reinstallAndRestartAppToolAvailable,
+    suggestablePlugins,
+    sandboxWriteFileHostEnabled: !readOnly && !planModeOnly,
+  } as AgentContext;
+  const options: BuildAgentToolSetOptions = {
+    toolProfile,
+    readOnly,
+    planModeOnly,
+    basicAgentMode,
+    freeModelMode,
+    enableAppBlueprint,
+  };
+  const mcpInSandboxEnabled =
+    toolProfile !== "build" &&
+    !readOnly &&
+    !planModeOnly &&
+    shouldIncludeTool(executeSandboxScriptTool, estimateContext, options);
+  estimateContext.mcpToolsEnabled = mcpInSandboxEnabled;
+  estimateContext.mcpToolDefs = mcpToolDefs;
+  estimateContext.isMcpToolSearchAvailable =
+    mcpInSandboxEnabled &&
+    !!readSettings().enableMcpToolSearch &&
+    estimateMcpInlineTokens(mcpToolDefs) > getMcpInlineTokenThreshold();
+
+  let declarations = await Promise.all(
+    TOOL_DEFINITIONS.filter((definition) =>
+      shouldIncludeTool(definition, estimateContext, options),
+    ).map(async (definition) => ({
+      type: "function" as const,
+      name: definition.name,
+      description: resolveToolDescription(definition, estimateContext),
+      inputSchema: await asSchema(
+        definition.getInputSchema?.(estimateContext) ?? definition.inputSchema,
+      ).jsonSchema,
+    })),
+  );
+
+  let useMcpToolSearch = estimateContext.isMcpToolSearchAvailable;
+  if (
+    useMcpToolSearch &&
+    !declarations.some((declaration) => declaration.name === "search_mcp_tools")
+  ) {
+    useMcpToolSearch = false;
+    declarations = declarations.filter(
+      (declaration) => declaration.name !== "get_mcp_tool_schema",
+    );
+  }
+  const hasGetSchemaTool = declarations.some(
+    (declaration) => declaration.name === "get_mcp_tool_schema",
+  );
+  const sandboxDeclaration = declarations.find(
+    (declaration) => declaration.name === "execute_sandbox_script",
+  );
+  if (sandboxDeclaration) {
+    sandboxDeclaration.description = await buildExecuteSandboxScriptDescription(
+      mcpToolDefs,
+      {
+        useSearch: useMcpToolSearch,
+        hasGetSchemaTool,
+        includeWriteFile: !!estimateContext.sandboxWriteFileHostEnabled,
+      },
+    );
+  }
+
+  if (
+    toolProfile !== "build" &&
+    !readOnly &&
+    !planModeOnly &&
+    !mcpInSandboxEnabled
+  ) {
+    const uniqueMcpTools = new Map(
+      mcpToolDefs.map((definition) => [definition.toolKey, definition]),
+    );
+    declarations.push(
+      ...[...uniqueMcpTools.values()].map((definition) => ({
+        type: "function" as const,
+        name: definition.toolKey,
+        description: definition.description ?? "",
+        inputSchema: definition.inputSchema,
+      })),
+    );
+  }
+
+  return estimateTokens(JSON.stringify(declarations));
+}
+
+export function estimateBuildModeToolTokens(
+  options: Omit<Parameters<typeof estimateAgentToolTokens>[0], "toolProfile">,
+): Promise<number> {
+  return estimateAgentToolTokens({ ...options, toolProfile: "build" });
 }
 
 /**
@@ -449,6 +705,16 @@ function toolModifiesState(
   return tool.modifiesState === true;
 }
 
+function toolAllowedInReadOnlyModes(
+  tool: (typeof TOOL_DEFINITIONS)[number],
+  ctx: AgentContext,
+): boolean {
+  if (typeof tool.allowInReadOnlyModes === "function") {
+    return tool.allowInReadOnlyModes(ctx);
+  }
+  return tool.allowInReadOnlyModes === true;
+}
+
 /**
  * Whether a tool belongs in this turn's tool set. Single source of truth for
  * inclusion, so a caller that needs the answer before the set is built (e.g. a
@@ -459,14 +725,33 @@ export function shouldIncludeTool(
   tool: (typeof TOOL_DEFINITIONS)[number],
   ctx: AgentContext,
   options: BuildAgentToolSetOptions = {},
+  phase: "discovery" | "invocation" = "discovery",
 ): boolean {
+  if (
+    tool.name === "run_shell" &&
+    !isShellExperimentAvailable({
+      settings: ctx.inferenceSettings ?? readSettings(),
+      isDyadPro: ctx.isDyadPro,
+      ...options,
+      freeModelMode: options.freeModelMode ?? ctx.freeModelMode,
+      isChild: !!ctx.mutationActivityOwner?.persona,
+    })
+  )
+    return false;
   if (getAgentToolConsent(tool.name) === "never") {
+    return false;
+  }
+  if (
+    options.toolProfile === "build" &&
+    !BUILD_MODE_TOOL_NAME_SET.has(tool.name)
+  ) {
     return false;
   }
   // In plan mode, skip state-modifying tools unless they're planning-specific.
   if (
     options.planModeOnly &&
     toolModifiesState(tool, ctx) &&
+    !toolAllowedInReadOnlyModes(tool, ctx) &&
     !PLANNING_SPECIFIC_TOOLS.has(tool.name)
   ) {
     return false;
@@ -482,6 +767,21 @@ export function shouldIncludeTool(
   if (options.freeModelMode && tool.usesEngineEndpoint) {
     return false;
   }
+  if (tool.subagentOnly && !ctx.isDyadPro) {
+    return false;
+  }
+  // search_chats is superseded by the explore_chat_history sub-agent wherever
+  // the explorer is present (Pro): broad recall routes through the explorer
+  // and targeted drill-down through read_chat. When the explorer is filtered
+  // out (non-Pro, free-model mode), direct search remains available so chat
+  // history stays reachable.
+  if (
+    phase === "discovery" &&
+    tool.name === "search_chats" &&
+    shouldIncludeTool(exploreChatHistoryTool, ctx, options)
+  ) {
+    return false;
+  }
   // Skip app blueprint tools when the feature is disabled.
   if (
     options.enableAppBlueprint === false &&
@@ -490,9 +790,15 @@ export function shouldIncludeTool(
     return false;
   }
   // In read-only mode, skip tools that modify state.
-  if (options.readOnly && toolModifiesState(tool, ctx)) {
+  if (
+    options.readOnly &&
+    toolModifiesState(tool, ctx) &&
+    !toolAllowedInReadOnlyModes(tool, ctx)
+  ) {
     return false;
   }
+  if (phase === "discovery" && tool.isDiscoverable && !tool.isDiscoverable(ctx))
+    return false;
   if (tool.isEnabled) {
     const enabled = tool.isEnabled(ctx);
     if (!enabled) {
@@ -502,14 +808,60 @@ export function shouldIncludeTool(
   return true;
 }
 
-/**
- * Build ToolSet for AI SDK from tool definitions
- */
+/** Refresh reviewer context from tools the agent can actually invoke. */
+export function refreshShellReviewToolInventory(
+  ctx: AgentContext,
+  registeredTools: Record<string, { description?: string }>,
+  options: BuildAgentToolSetOptions = {},
+): void {
+  if (!ctx.shellReviewContext) return;
+  const definitions = new Map<string, (typeof TOOL_DEFINITIONS)[number]>(
+    TOOL_DEFINITIONS.map((tool) => [tool.name, tool]),
+  );
+  for (const entry of ctx.shellReviewContext.tools) {
+    const definition = definitions.get(entry.name);
+    const registered = registeredTools[entry.name];
+    entry.available =
+      !!registered &&
+      (!definition ||
+        shouldIncludeTool(definition, ctx, options, "invocation"));
+    if (registered?.description) entry.description = registered.description;
+  }
+  for (const [name, tool] of Object.entries(registeredTools)) {
+    if (
+      name !== "run_shell" &&
+      !ctx.shellReviewContext.tools.some((entry) => entry.name === name)
+    ) {
+      const definition = definitions.get(name);
+      ctx.shellReviewContext.tools.push({
+        name,
+        description: tool.description ?? "",
+        available:
+          !definition ||
+          shouldIncludeTool(definition, ctx, options, "invocation"),
+      });
+    }
+  }
+}
+
+/** Build ToolSet for AI SDK from tool definitions. */
 export function buildAgentToolSet(
   ctx: AgentContext,
   options: BuildAgentToolSetOptions = {},
 ) {
   const toolSet: Record<string, any> = {};
+  if (shouldIncludeTool(runShellTool, ctx, options)) {
+    ctx.shellReviewContext = {
+      tools: TOOL_DEFINITIONS.filter((tool) => tool.name !== "run_shell").map(
+        (tool) => ({
+          name: tool.name,
+          description: resolveToolDescription(tool, ctx),
+          available: false, // Resolved from the callable tool set after registration.
+        }),
+      ),
+      history: [],
+    };
+  }
 
   for (const tool of TOOL_DEFINITIONS) {
     if (!shouldIncludeTool(tool, ctx, options)) {
@@ -517,59 +869,195 @@ export function buildAgentToolSet(
     }
 
     toolSet[tool.name] = {
-      description: tool.description,
-      inputSchema: tool.inputSchema,
-      execute: async (args: any) => {
+      description: resolveToolDescription(tool, ctx),
+      inputSchema: tool.getInputSchema?.(ctx) ?? tool.inputSchema,
+      execute: async (
+        args: any,
+        executionOptions?: { toolCallId?: string },
+      ) => {
+        const toolCallId = executionOptions?.toolCallId;
+        let presentationXml = "";
+        let executionStarted = false;
+        const invocationCtx =
+          toolCallId && ctx.onToolActivity
+            ? {
+                ...ctx,
+                onXmlStream: (xml: string) => {
+                  presentationXml = xml;
+                  recordStreamingToolActivity(ctx, {
+                    toolCallId,
+                    toolName: tool.name,
+                    status: "pending",
+                    presentationXml: xml,
+                  });
+                },
+                onXmlComplete: (xml: string) => {
+                  presentationXml = xml;
+                  recordStreamingToolActivity(ctx, {
+                    toolCallId,
+                    toolName: tool.name,
+                    status: "pending",
+                    presentationXml: xml,
+                  });
+                },
+              }
+            : ctx;
         try {
-          // Guard against state-modifying tools running before the app
-          // blueprint approval is resolved. `write_app_blueprint` owns the
-          // approval gate; blueprint tools themselves are allowed through so
-          // the flow can progress to approval. Skip entirely when the
-          // blueprint feature is disabled — otherwise a plan left over from
-          // before the toggle would permanently block the agent.
-          //
-          // When the feature is enabled, also block if NO plan exists yet —
-          // the prompt instructs the model to call write_app_blueprint first,
-          // but the prompt isn't an enforcement boundary. Without this check,
-          // a model that skips write_app_blueprint can still call e.g.
-          // write_file and bypass the required blueprint approval flow.
+          // The SDK is not the authority for validation: MCP and sandbox
+          // adapters must enter the same invocation boundary.
+          if (!shouldIncludeTool(tool, invocationCtx, options, "invocation")) {
+            throw new DyadError(
+              "Tool is unavailable in this turn",
+              DyadErrorKind.Precondition,
+            );
+          }
+          const schema = asSchema(
+            tool.getInputSchema?.(invocationCtx) ?? tool.inputSchema,
+          );
+          if (schema.validate) {
+            const validated = await schema.validate(args);
+            if (!validated.success) throw validated.error;
+            args = validated.value;
+          }
+          const mutationRequiresTracking =
+            toolModifiesState(tool, ctx) &&
+            (tool.mutationTracking ?? "automatic") === "automatic";
+          const processedArgs = await processArgPlaceholders(
+            args,
+            invocationCtx,
+          );
+
+          if (toolCallId && invocationCtx.onToolActivity) {
+            presentationXml = tool.buildXml?.(processedArgs, false) ?? "";
+            await invocationCtx.onToolActivity({
+              toolCallId,
+              toolName: tool.name,
+              status: "pending",
+              presentationXml,
+              inputJson: processedArgs,
+            });
+          }
+
+          // Reject tools that cannot pass the blueprint gate before asking
+          // the user for consent. Consent may wait indefinitely, but this
+          // precondition is synchronous and independent of mutation admission.
           if (
             toolModifiesState(tool, ctx) &&
+            tool.requiresBlueprintApproval !== false &&
             !APP_BLUEPRINT_TOOLS.has(tool.name) &&
             !PLANNING_SPECIFIC_TOOLS.has(tool.name) &&
             !CAPABILITY_GATED_BLUEPRINT_TOOLS.has(tool.name)
           ) {
             assertAppBlueprintApproved({
               toolName: tool.name,
-              chatId: ctx.chatId,
+              chatId: invocationCtx.chatId,
               enabled: options.enableAppBlueprint !== false,
             });
           }
 
-          const processedArgs = await processArgPlaceholders(args, ctx);
+          // Consent can wait indefinitely for the user. Resolve it before
+          // registering mutation activity so cancellation cannot let delayed
+          // consent enter a closed actor generation.
+          // Shell resolves consent after classification, including mandatory one-time approval.
+          if (tool.name !== "run_shell")
+            await requireToolConsentOrThrow(tool, processedArgs, invocationCtx);
+          const invoke = async () => {
+            if (
+              !shouldIncludeTool(tool, invocationCtx, options, "invocation")
+            ) {
+              throw new DyadError(
+                "Tool is no longer available",
+                DyadErrorKind.Precondition,
+              );
+            }
+            if (invocationCtx.abortSignal?.aborted) {
+              throw new DyadError(
+                "This agent run was cancelled.",
+                DyadErrorKind.UserCancelled,
+              );
+            }
+            // Track file edit tool usage before execution to capture all attempts
+            // (including failures) for retry/fallback telemetry
+            trackFileEditTool(invocationCtx, tool.name, processedArgs);
+            executionStarted = true;
+            const result = await withReferencedAppRead(
+              tool.name,
+              processedArgs,
+              invocationCtx,
+              (readCtx) => tool.execute(processedArgs, readCtx),
+            );
+            recordShellReviewOutcome(ctx, tool.name, processedArgs, { result });
 
-          // Check consent before executing the tool
-          await requireToolConsentOrThrow(tool, processedArgs, ctx);
+            // Only completed mutations unblock run_tests. Failed tool calls are
+            // still present in fileEditTracker for retry/fallback telemetry, but
+            // must not masquerade as a code change.
+            const didMutate = shouldTrackToolMutation(
+              tool,
+              processedArgs,
+              result,
+              invocationCtx,
+            );
+            trackAppMutation(
+              invocationCtx,
+              tool.name,
+              didMutate,
+              didMutate &&
+                (await shouldTrackToolFileMutation(
+                  tool,
+                  processedArgs,
+                  result,
+                  invocationCtx,
+                )),
+            );
 
-          // Track file edit tool usage before execution to capture all attempts
-          // (including failures) for retry/fallback telemetry
-          trackFileEditTool(ctx, tool.name, processedArgs);
+            if (toolCallId && invocationCtx.onToolActivity) {
+              await invocationCtx.onToolActivity({
+                toolCallId,
+                toolName: tool.name,
+                status: "completed",
+                presentationXml,
+                inputJson: processedArgs,
+                outputText: serializeActivityOutput(result),
+              });
+            }
 
-          const result = await tool.execute(processedArgs, ctx);
+            return convertToolResultForAiSdk(result);
+          };
 
-          return convertToolResultForAiSdk(result);
+          return mutationRequiresTracking
+            ? await withTrackedMutation(invocationCtx, invoke)
+            : await invoke();
         } catch (error) {
+          recordShellReviewOutcome(ctx, tool.name, args, {
+            error,
+            executed: executionStarted,
+          });
           const errorMessage = getToolErrorSummary(error);
           const errorDetails = getToolErrorDisplayDetails(error);
 
-          ctx.onXmlComplete(
-            `<dyad-output type="error" message="Tool '${tool.name}' failed: ${escapeXmlAttr(errorMessage)}">${escapeXmlContent(errorDetails)}</dyad-output>`,
-          );
+          const errorXml = `<dyad-output type="error" message="Tool '${tool.name}' failed: ${escapeXmlAttr(errorMessage)}">${escapeXmlContent(errorDetails)}</dyad-output>`;
+          invocationCtx.onXmlComplete(errorXml);
+          if (toolCallId && invocationCtx.onToolActivity) {
+            await invocationCtx.onToolActivity({
+              toolCallId,
+              toolName: tool.name,
+              status: invocationCtx.abortSignal?.aborted ? "aborted" : "error",
+              presentationXml: errorXml,
+              inputJson:
+                typeof args === "object" && args !== null ? args : undefined,
+              error: errorDetails,
+            });
+          }
           throw error;
         }
       },
     };
   }
 
+  if (ctx.shellReviewContext) {
+    ctx.refreshShellReviewTools = () =>
+      refreshShellReviewToolInventory(ctx, toolSet, options);
+    ctx.refreshShellReviewTools();
+  }
   return toolSet;
 }

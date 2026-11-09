@@ -81,8 +81,6 @@
     "selectDefaultChatMode": "Select default chat mode",
     "autoApprove": "Auto-approve changes",
     "autoApproveDescription": "This will automatically approve code changes and run them.",
-    "autoFixProblems": "Auto-fix problems",
-    "autoFixProblemsDescription": "This will automatically fix TypeScript errors.",
     "appBlueprint": "App Blueprint",
     "appBlueprintDescription": "When creating a new app, generate a lightweight app blueprint (name, design, color, template) before building."
   },
@@ -151,8 +149,8 @@
     "title": "Integrations"
   },
   "agentPermissions": {
-    "title": "Agent Permissions (Pro)",
-    "description": "Configure permissions for Agent built-in tools.",
+    "title": "Build and Agent Permissions",
+    "description": "Configure permissions for built-in Build and Agent tools.",
     "defaultAllowedTools": "Default allowed tools ({{count}})",
     "ask": "Ask",
     "alwaysAllow": "Always allow",
@@ -188,8 +186,12 @@
   },
   "experiments": {
     "title": "Experiments",
-    "enableNativeGit": "Enable Native Git",
-    "enableNativeGitDescription": "This doesn't require any external Git installation and offers a faster, native-Git performance experience."
+    "previewCookieIsolation": {
+      "label": "Isolate preview sign-in cookies",
+      "description": "Keep each app's HttpOnly sign-in cookies separate on shared localhost. On by default. Restart Dyad to apply changes to all previews.",
+      "loading": "Loading setting…",
+      "loadError": "Unable to load setting"
+    }
   },
   "dangerZone": {
     "title": "Danger Zone",

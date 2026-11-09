@@ -5,6 +5,7 @@ import type {
   LanguageModel,
   LanguageModelProvider,
 } from "@/ipc/types/language-model";
+import { EffortSettingsSchema } from "@/ipc/types/language-model";
 import {
   ThemeGenerationModelOptionSchema,
   type ThemeGenerationModelOption,
@@ -28,6 +29,7 @@ const logger = log.scope("remote_language_model_catalog");
 const REMOTE_LANGUAGE_MODEL_CATALOG_TIMEOUT_MS = 5_000;
 const DEFAULT_CACHE_TTL_MS = 60 * 60 * 1000;
 const FALLBACK_CACHE_TTL_MS = 30 * 1000;
+export const FALLBACK_CODEX_CLIENT_VERSION = "0.155.1";
 
 function getRemoteLanguageModelCatalogUrl() {
   if (process.env.DYAD_LANGUAGE_MODEL_CATALOG_URL) {
@@ -64,12 +66,15 @@ const CatalogModelSchema = z.object({
   temperature: z.number().optional(),
   maxOutputTokens: z.number().optional(),
   contextWindow: z.number().optional(),
+  effortSettings: EffortSettingsSchema.optional(),
   lifecycle: z
     .object({
       stage: z.enum(["stable", "preview", "deprecated"]).optional(),
     })
     .optional(),
 });
+
+const ApiProtocolSchema = z.enum(["responses", "chat-completions", "messages"]);
 
 const KNOWN_BUILTIN_MODEL_ALIASES = [
   "dyad/theme-generator/google",
@@ -79,6 +84,7 @@ const KNOWN_BUILTIN_MODEL_ALIASES = [
   "dyad/auto/anthropic",
   "dyad/auto/google",
   "dyad/auto/openrouter",
+  "dyad/auto/balanced",
   "dyad/help-bot/default",
 ] as const;
 
@@ -87,6 +93,16 @@ export type BuiltinModelAlias = (typeof KNOWN_BUILTIN_MODEL_ALIASES)[number];
 const LanguageModelCatalogResponseSchema = z.object({
   version: z.string(),
   expiresAt: z.string().datetime().optional(),
+  codexClientVersion: z
+    .string()
+    .regex(/^\d+\.\d+\.\d+$/)
+    .optional()
+    .catch(() => {
+      logger.warn(
+        "Ignoring invalid codexClientVersion in remote language model catalog",
+      );
+      return undefined;
+    }),
   providers: z.array(CatalogProviderSchema),
   modelsByProvider: z.record(z.string(), z.array(CatalogModelSchema)),
   aliases: z.array(
@@ -98,6 +114,7 @@ const LanguageModelCatalogResponseSchema = z.object({
       }),
       displayName: z.string().optional(),
       purpose: z.enum(["theme-generation", "auto-mode", "help-bot"]).optional(),
+      apiProtocol: ApiProtocolSchema.optional(),
     }),
   ),
   curatedSelections: z
@@ -114,6 +131,7 @@ type LanguageModelCatalogResponse = z.infer<
 type BuiltinLanguageModelCatalog = {
   providers: LanguageModelProvider[];
   modelsByProvider: Record<string, LanguageModel[]>;
+  codexClientVersion?: string;
   aliases: LanguageModelCatalogResponse["aliases"];
   themeGenerationOptions: ThemeGenerationModelOption[];
   expiresAt: number;
@@ -124,11 +142,17 @@ type BuiltinLanguageModelCatalog = {
 type ResolvedBuiltinModel = {
   providerId: string;
   apiName: string;
+  apiProtocol?: z.infer<typeof ApiProtocolSchema>;
 };
 
 let builtinCatalogCache: BuiltinLanguageModelCatalog | null = null;
 let builtinCatalogFetchPromise: Promise<BuiltinLanguageModelCatalog> | null =
   null;
+let lastKnownCodexClientVersion: string | undefined;
+// Tracks whether the current cache has already been extended through one
+// stale-while-revalidate grace cycle. Bounds stale-remote service so a
+// transient outage does not serve server-expired data indefinitely.
+let staleCatalogGraceExtended = false;
 
 const DEFAULT_THEME_GENERATION_OPTIONS: ThemeGenerationModelOption[] = [
   { id: "dyad/theme-generator/google", label: "Google" },
@@ -164,6 +188,7 @@ function buildFallbackCatalog(): BuiltinLanguageModelCatalog {
       contextWindow: model.contextWindow,
       temperature: model.temperature,
       dollarSigns: model.dollarSigns,
+      effortSettings: model.effortSettings,
       type: "cloud",
     }));
   }
@@ -236,6 +261,16 @@ function buildFallbackCatalog(): BuiltinLanguageModelCatalog {
         purpose: "auto-mode",
       },
       {
+        id: "dyad/auto/balanced",
+        resolvedModel: {
+          providerId: "openrouter",
+          apiName: "x-ai/grok-4.6",
+        },
+        displayName: "Auto (balanced)",
+        purpose: "auto-mode",
+        apiProtocol: "responses",
+      },
+      {
         id: "dyad/help-bot/default",
         resolvedModel: {
           providerId: "openai",
@@ -286,6 +321,7 @@ function convertRemoteCatalog(
           contextWindow: model.contextWindow,
           temperature: model.temperature,
           dollarSigns: model.dollarSigns,
+          effortSettings: model.effortSettings,
           type: "cloud" as const,
         })),
       ],
@@ -302,6 +338,7 @@ function convertRemoteCatalog(
     contextWindow: model.contextWindow,
     temperature: model.temperature,
     dollarSigns: model.dollarSigns,
+    effortSettings: model.effortSettings,
     type: "cloud" as const,
   }));
   if (remoteAutoModels.length === 0) {
@@ -323,6 +360,7 @@ function convertRemoteCatalog(
   return {
     providers,
     modelsByProvider,
+    codexClientVersion: remoteCatalog.codexClientVersion,
     aliases: mergedAliases,
     themeGenerationOptions: remoteCatalog.curatedSelections
       ?.themeGenerationOptions?.length
@@ -365,6 +403,9 @@ async function fetchRemoteCatalog(): Promise<BuiltinLanguageModelCatalog | null>
     const rawCatalog = await response.json();
     const remoteCatalog = LanguageModelCatalogResponseSchema.parse(rawCatalog);
     const convertedCatalog = convertRemoteCatalog(remoteCatalog);
+    if (convertedCatalog.codexClientVersion) {
+      lastKnownCodexClientVersion = convertedCatalog.codexClientVersion;
+    }
 
     logger.info("Loaded remote language model catalog", {
       catalogUrl,
@@ -399,7 +440,36 @@ function triggerBackgroundRefresh(): void {
     builtinCatalogFetchPromise = (async () => {
       try {
         const remoteCatalog = await fetchRemoteCatalog();
-        builtinCatalogCache = remoteCatalog ?? getFallbackCatalog();
+        if (remoteCatalog) {
+          builtinCatalogCache = remoteCatalog;
+          staleCatalogGraceExtended = false;
+        } else if (!builtinCatalogCache) {
+          builtinCatalogCache = getFallbackCatalog();
+          staleCatalogGraceExtended = false;
+        } else if (
+          builtinCatalogCache.source === "remote" &&
+          !staleCatalogGraceExtended
+        ) {
+          // The remote catalog is server-mutable and may diverge from the
+          // app-release-pinned fallback (see the alias sync commits in
+          // language_model_constants.ts). Preserve the stale-but-known remote
+          // data across one bounded grace revalidation cycle so a transient
+          // outage does not immediately re-route Auto mode to different upstream
+          // models. The next failed refresh falls through to the app-vetted
+          // fallback so we do not serve server-expired data indefinitely.
+          builtinCatalogCache = {
+            ...builtinCatalogCache,
+            expiresAt: Date.now() + FALLBACK_CACHE_TTL_MS,
+          };
+          staleCatalogGraceExtended = true;
+          logger.info(
+            "Preserved stale remote language model catalog for one grace revalidation cycle",
+            { version: builtinCatalogCache.version },
+          );
+        } else {
+          builtinCatalogCache = getFallbackCatalog();
+          staleCatalogGraceExtended = false;
+        }
         logger.info("Background refresh completed for language model catalog", {
           source: builtinCatalogCache.source,
           version: builtinCatalogCache.version,
@@ -419,7 +489,7 @@ function triggerBackgroundRefresh(): void {
 
 export async function getBuiltinLanguageModelCatalog(): Promise<BuiltinLanguageModelCatalog> {
   if (builtinCatalogCache && builtinCatalogCache.expiresAt > Date.now()) {
-    logger.info("Returning cached language model catalog", {
+    logger.debug("Returning cached language model catalog", {
       source: builtinCatalogCache.source,
       version: builtinCatalogCache.version,
       expiresAt: new Date(builtinCatalogCache.expiresAt).toISOString(),
@@ -470,6 +540,18 @@ export async function getBuiltinLanguageModelCatalog(): Promise<BuiltinLanguageM
   return builtinCatalogFetchPromise;
 }
 
+/** The subscription catalog request must not wait for Dyad's remote catalog. */
+export function getCodexClientVersion(): string {
+  if (!builtinCatalogCache || builtinCatalogCache.expiresAt <= Date.now()) {
+    triggerBackgroundRefresh();
+  }
+  return (
+    builtinCatalogCache?.codexClientVersion ??
+    lastKnownCodexClientVersion ??
+    FALLBACK_CODEX_CLIENT_VERSION
+  );
+}
+
 export async function getThemeGenerationModelOptions(): Promise<
   ThemeGenerationModelOption[]
 > {
@@ -481,9 +563,10 @@ export async function resolveBuiltinModelAlias(
   aliasId: BuiltinModelAlias | string,
 ): Promise<ResolvedBuiltinModel | null> {
   const catalog = await getBuiltinLanguageModelCatalog();
-  const resolvedModel =
-    catalog.aliases.find((alias) => alias.id === aliasId)?.resolvedModel ??
-    null;
+  const alias = catalog.aliases.find((candidate) => candidate.id === aliasId);
+  const resolvedModel = alias
+    ? { ...alias.resolvedModel, apiProtocol: alias.apiProtocol }
+    : null;
 
   logger.info("Resolved builtin model alias", {
     aliasId,
@@ -491,6 +574,7 @@ export async function resolveBuiltinModelAlias(
     version: catalog.version,
     resolvedProviderId: resolvedModel?.providerId,
     resolvedApiName: resolvedModel?.apiName,
+    apiProtocol: resolvedModel?.apiProtocol,
   });
 
   return resolvedModel;

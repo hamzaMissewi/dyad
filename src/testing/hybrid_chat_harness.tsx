@@ -1,3 +1,6 @@
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import path from "node:path";
+
 /**
  * setupHybridChatHarness — the "hybrid" chat-flow harness: the real React
  * <ChatPanel> (React Testing Library under happy-dom) wired to the REAL
@@ -34,8 +37,10 @@ import {
   render,
   screen,
   waitFor,
+  within,
   type RenderResult,
 } from "@testing-library/react";
+import { IS_TEST_BUILD } from "@/ipc/utils/test_utils";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
   createMemoryHistory,
@@ -46,7 +51,7 @@ import {
   RouterProvider,
 } from "@tanstack/react-router";
 import { createStore, Provider } from "jotai";
-import React, { useEffect } from "react";
+import React, { Suspense, lazy, useCallback, useEffect } from "react";
 import { Toaster } from "sonner";
 import { fetch as undiciFetch } from "undici";
 import { expect } from "vitest";
@@ -63,18 +68,89 @@ import {
 } from "./chat_flow_harness";
 import type { RendererEvent } from "./electron_mock";
 import { selectedAppIdAtom } from "@/atoms/appAtoms";
-import { chatInputValuesByIdAtom, selectedChatIdAtom } from "@/atoms/chatAtoms";
+import {
+  chatAnnotationsAtom,
+  type ChatAnnotation,
+} from "@/atoms/chatAnnotationAtoms";
+import {
+  attachmentsAtom,
+  chatAttachmentsByIdAtom,
+  chatInputValuesByIdAtom,
+  selectedChatIdAtom,
+} from "@/atoms/chatAtoms";
+import { selectedComponentsPreviewAtom } from "@/atoms/previewAtoms";
+import {
+  clearTestRuntimeForAppAtom,
+  testRunOutputByAppIdAtom,
+} from "@/atoms/testRuntimeAtoms";
+import { clearRecorderForAppAtom } from "@/atoms/recorderAtoms";
+import { planAcceptInNewChatByChatIdAtom } from "@/atoms/planAtoms";
 import { registerRendererIpcListeners } from "@/app_wiring/registerRendererIpcListeners";
-import { useQueueProcessor } from "@/hooks/useQueueProcessor";
+import { useChatStreamRuntime } from "@/hooks/useChatStream";
+import { usePlanEvents } from "@/hooks/usePlanEvents";
+import { useAppBlueprintEvents } from "@/hooks/useAppBlueprintEvents";
 import { ChatPanel } from "@/components/ChatPanel";
+import { AppList } from "@/components/AppList";
+import { ChatList } from "@/components/ChatList";
+import { PrivacyBanner } from "@/components/TelemetryBanner";
+import { SubscriptionStatusBanner } from "@/components/SubscriptionStatusBanner";
+import { VersionPreviewProvider } from "@/version_preview/VersionPreviewProvider";
+import { PreviewIframeProvider } from "@/preview_iframe/PreviewIframeProvider";
+import { PreviewIframeManager } from "@/preview_iframe/manager";
+import { createPreviewIframeCommandAdapter } from "@/preview_iframe/commands";
+import {
+  DeferredPreviewErrorFacade,
+  PreviewErrorFacadeProvider,
+} from "@/app_wiring/preview_error_facade";
+import { PackageManagerWarningProvider } from "@/package_manager_warnings/PackageManagerWarningProvider";
+import { PackageManagerWarningStore } from "@/package_manager_warnings/store";
+import {
+  ScreenshotProvider,
+  useScreenshotManager,
+} from "@/screenshot/ScreenshotProvider";
+import { AppRunRemoteManager } from "@/app_run/remote_manager";
+import {
+  AppRunRemoteProvider,
+  useAppRunRemoteManager,
+} from "@/app_run/AppRunRemoteProvider";
+import { TestAppRunRemoteConnection } from "@/app_run/testing";
+import { PlanHandoffProvider } from "@/plan_handoff/PlanHandoffProvider";
+import { ChatStreamRemoteManager } from "@/chat_stream/remote_manager";
+import { hasSessionChatQueue } from "@/chat_stream/persistence";
+import { ChatStreamProvider } from "@/chat_stream/ChatStreamProvider";
+import {
+  EntityDisposalProvider,
+  useEntityDisposal,
+  useRegisterEntityDisposer,
+} from "@/state_machines/react";
+import { ImageGenerationProvider } from "@/image_generation/ImageGenerationProvider";
+import { FirstPromptProvider } from "@/first_prompt/FirstPromptProvider";
+import { GithubOpsProvider } from "@/github_ops/GithubOpsProvider";
+import { uuidIdSource } from "@/state_machines/clock";
+import {
+  createFakeClock,
+  createSequentialIdSource,
+  type FakeClock,
+} from "@/state_machines/testing";
+import { PlanPanel } from "@/components/preview_panel/PlanPanel";
+import { SecurityPanel } from "@/components/preview_panel/SecurityPanel";
+import { SidebarProvider } from "@/components/ui/sidebar";
+import { TitleBar } from "@/app/TitleBar";
+import { DeepLinkProvider } from "@/contexts/DeepLinkContext";
 import { ThemeProvider } from "@/contexts/ThemeContext";
 import { chats } from "@/db/schema";
 import { ipc } from "@/ipc/types";
+import type {
+  ComponentSelection,
+  FileAttachment,
+  McpServer,
+} from "@/ipc/types";
 import { setModelClientFetchForTesting } from "@/ipc/utils/get_model_client";
 // Import from the dedicated schema module, NOT "@/routes/chat": the route file
 // statically imports ChatPage -> PreviewPanel -> Monaco, which would load into
 // every hybrid test and throw "Canceled" rejections on teardown.
 import { chatSearchSchema } from "@/routes/chatSearchSchema";
+import { appDetailsSearchSchema } from "@/routes/appDetailsSearchSchema";
 
 import {
   installRendererIpcBridge,
@@ -87,9 +163,48 @@ const SECOND_SETUP_ERROR =
 
 let activeHybridChatHarness = false;
 type JotaiStore = ReturnType<typeof createStore>;
+type HybridLocation = {
+  href: string;
+  pathname: string;
+  search: Record<string, unknown>;
+};
+type HybridRouter = {
+  state: { location: HybridLocation };
+  navigate: (opts: unknown) => unknown;
+};
 type HybridBridgeDiagnosticGlobal = typeof globalThis & {
   __DYAD_HYBRID_BRIDGE__?: RendererIpcBridge;
 };
+
+const LazyAppDetailsPage = lazy(() => import("@/pages/app-details"));
+const LazySettingsPage = lazy(() => import("@/pages/settings"));
+const LazyMediaPage = lazy(() => import("@/pages/media"));
+const LazyProviderSettingsPage = lazy(() =>
+  import("@/components/settings/ProviderSettingsPage").then((module) => ({
+    default: module.ProviderSettingsPage,
+  })),
+);
+const LazyImportAppDialog = lazy(() =>
+  import("@/components/ImportAppDialog").then((module) => ({
+    default: module.ImportAppDialog,
+  })),
+);
+const LazyDatabaseSection = lazy(() =>
+  import("@/components/preview_panel/DatabaseSection").then((module) => ({
+    default: module.DatabaseSection,
+  })),
+);
+const LazyDeployButton = lazy(() =>
+  import("@/components/preview_panel/DeployButton").then((module) => ({
+    default: module.DeployButton,
+  })),
+);
+const LazyPluginsPage = lazy(() => import("@/pages/plugins"));
+const LazyPluginDetailPage = lazy(() =>
+  import("@/components/plugins/PluginDetailPage").then((module) => ({
+    default: module.PluginDetailPage,
+  })),
+);
 
 export interface HybridChatHarnessOptions extends ChatFlowHarnessOptions {
   /**
@@ -106,7 +221,38 @@ export interface HybridChatHarnessOptions extends ChatFlowHarnessOptions {
    * intentionally exercising that failure path.
    */
   assertNoMissingChannels?: boolean;
+  /**
+   * Set E2E_TEST_BUILD/FAKE_LLM_PORT so main-process code that re-reads the
+   * environment at call time (GitHub handlers, the remote model catalog)
+   * routes to the harness fake server.
+   *
+   * This does NOT reach code that snapshots `IS_TEST_BUILD` at import time
+   * (Neon, Supabase, Vercel, provider key validation): those modules load with
+   * the harness's own static imports, before this option can set the env. A
+   * test that needs them must hoist the env var above all imports:
+   *
+   *   vi.hoisted(() => {
+   *     process.env.E2E_TEST_BUILD = "true";
+   *   });
+   *
+   * The harness warns when `testBuild: true` is passed without that hoist.
+   */
+  testBuild?: boolean;
 }
+
+export type HybridSurfaceRoute =
+  | "/"
+  | "/chat"
+  | "/app-details"
+  | "/database"
+  | "/deploy"
+  | "/import-app"
+  | "/settings"
+  | "/plugins"
+  | "/plugins/$serverId"
+  | "/settings/providers/$provider"
+  | "/library/media"
+  | "/media";
 
 export interface MountOptions {
   /** Chat to load. Default: the harness's default chat. */
@@ -115,6 +261,29 @@ export interface MountOptions {
   appId?: number;
   /** Install the same main->renderer listeners AppRoot registers. Default true. */
   wireAppEvents?: boolean;
+  /** Render the plan preview panel alongside ChatPanel for plan-mode tests. */
+  withPlanPanel?: boolean;
+  /** Render the security preview panel alongside ChatPanel. */
+  withSecurityPanel?: boolean;
+  /** Render the real app sidebar list next to the mounted route. */
+  withAppList?: boolean;
+  /** Render the real chat sidebar list next to the mounted route. */
+  withChatList?: boolean;
+  /** Render the real telemetry privacy banner next to the mounted route. */
+  withPrivacyBanner?: boolean;
+  /** Render the real global subscription status banner. */
+  withSubscriptionStatusBanner?: boolean;
+}
+
+export interface MountSurfaceOptions extends MountOptions {
+  /** Route to mount. Default: "/chat". */
+  route?: HybridSurfaceRoute;
+  /** Route search params. Defaults are filled for chat/app-details. */
+  search?: Record<string, unknown>;
+  /** Route params, e.g. `{ provider: "auto" }` for provider settings. */
+  params?: Record<string, string>;
+  /** Render the real title bar above the mounted route. */
+  withTitleBar?: boolean;
 }
 
 export interface TypeInChatResult {
@@ -122,6 +291,14 @@ export interface TypeInChatResult {
   sendButton: HTMLElement;
   /** Click Send — runs the real ChatInput.handleSubmit path. */
   send: () => void;
+}
+
+export interface ChatAttachmentSeed {
+  name: string;
+  content: BlobPart;
+  mimeType?: string;
+  type?: FileAttachment["type"];
+  lastModified?: number;
 }
 
 export interface HybridChatHarness extends ChatFlowHarness {
@@ -137,11 +314,83 @@ export interface HybridChatHarness extends ChatFlowHarness {
   mount: (opts?: MountOptions) => RenderResult;
 
   /**
+   * Render a supported app surface with the same query/jotai/theme/router
+   * scaffolding as `mount()`, backed by the real IPC handlers.
+   */
+  mountSurface: (opts?: MountSurfaceOptions) => RenderResult;
+
+  /** Advance the deterministic clock owned by the latest mounted first-prompt provider. */
+  advanceFirstPromptClock: (delayMs: number) => void;
+
+  /** The most recently mounted private router. */
+  router: () => HybridRouter;
+
+  /** Current private router location, for navigation assertions. */
+  currentLocation: () => HybridRouter["state"]["location"];
+
+  /** Query client owned by the most recently mounted renderer tree. */
+  queryClient: () => QueryClient;
+
+  /** Set the active selected app in the mounted Jotai store. */
+  setSelectedAppId: (appId: number | null) => void;
+
+  /** Seed/read a chat's transient plan-acceptance routing choice. */
+  setPlanAcceptInNewChat: (chatId: number, value: boolean) => void;
+  getPlanAcceptInNewChat: (chatId: number) => boolean | undefined;
+
+  /** Seed/read representative main-owned stream residue. */
+  seedChatStreamResidue: (chatId: number) => Promise<void>;
+  hasChatStreamResidue: (chatId: number) => boolean;
+
+  /** Seed/read representative app-scoped preview and test runtime state. */
+  seedAppRuntimeResidue: (appId: number) => void;
+  hasAppRuntimeResidue: (appId: number) => boolean;
+
+  /** Drive a Base UI popover/menu trigger in happy-dom. */
+  openPopover: (trigger: HTMLElement) => Promise<void>;
+
+  /** Click an item inside an already-open popover/menu/dialog. */
+  clickMenuItem: (name: string | RegExp) => Promise<HTMLElement>;
+
+  /** Find a Base UI dialog by accessible name. */
+  findDialog: (name: string | RegExp) => Promise<HTMLElement>;
+
+  /** Click a dialog action button and wait for the dialog to close. */
+  confirmDialog: (
+    dialogName: string | RegExp,
+    buttonName: string | RegExp,
+  ) => Promise<void>;
+
+  /** Toggle a Base UI switch and wait for its checked state. */
+  setSwitch: (switchElement: HTMLElement, checked: boolean) => Promise<void>;
+
+  /**
    * Seed the chat input the way LexicalChatInput's onChange does (happy-dom
    * can't type into its contenteditable), then wait for Send to enable. Returns
    * the button and a `send()` click helper.
    */
   typeInChat: (text: string, opts?: MountOptions) => Promise<TypeInChatResult>;
+
+  /**
+   * Seed the chat input without waiting for Send to enable. Use this when the
+   * scenario expects Send to stay disabled, e.g. while a proposal is pending.
+   */
+  setChatInputValue: (text: string, opts?: MountOptions) => void;
+  getChatInputValue: (chatId: number) => string;
+
+  /** Seed/read a chat's transient assistant-message annotations. */
+  setChatAnnotations: (chatId: number, annotations: ChatAnnotation[]) => void;
+  getChatAnnotations: (chatId: number) => ChatAnnotation[];
+
+  /**
+   * Seed the mounted chat's attachment draft with browser File objects, matching
+   * what the file picker/drop/paste handoff stores before submit converts files
+   * to IPC attachments.
+   */
+  setChatAttachments: (attachments: ChatAttachmentSeed[]) => void;
+
+  /** Seed selected preview components for queue edit/restore assertions. */
+  setSelectedComponents: (components: ComponentSelection[]) => void;
 
   /**
    * Seed the chat input, then submit via the Lexical Enter command (a real
@@ -220,6 +469,34 @@ export interface HybridChatHarness extends ChatFlowHarness {
 
   /** Insert a new chat row (same app by default) and return its id. */
   createChat: (appId?: number) => Promise<number>;
+
+  github: {
+    pushEvents: () => Promise<unknown>;
+    clearPushEvents: () => Promise<void>;
+    resetRepos: () => Promise<void>;
+  };
+
+  mcp: {
+    fakeStdioServerPath: string;
+    resetServers: () => Promise<void>;
+    addStdioServer: (opts?: {
+      name?: string;
+      env?: Record<string, string>;
+    }) => Promise<McpServer>;
+    addHttpServer: (opts?: {
+      name?: string;
+      headers?: Record<string, string>;
+    }) => Promise<{
+      server: McpServer;
+      url: string;
+      stop: () => Promise<void>;
+    }>;
+    waitForTool: (
+      serverId: number,
+      toolName: string,
+      timeoutMs?: number,
+    ) => Promise<void>;
+  };
 }
 
 /** Bridge sentEvents store `{ channel, args }`; the payload is `args[0]`. */
@@ -227,32 +504,113 @@ function eventPayload(e: { args: unknown[] }): unknown {
   return e.args[0];
 }
 
+const HYBRID_EXTRA_ENV_KEYS = [
+  "DYAD_SKIP_MANAGED_PNPM_INSTALL",
+  "DYAD_DEV_NODEJS_STATUS",
+  "E2E_TEST_BUILD",
+  "FAKE_LLM_PORT",
+] as const;
+
+function snapshotHybridEnv(): Map<string, string | undefined> {
+  return new Map(HYBRID_EXTRA_ENV_KEYS.map((key) => [key, process.env[key]]));
+}
+
+function restoreHybridEnv(snapshot: Map<string, string | undefined>): void {
+  for (const [key, value] of snapshot) {
+    if (value === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  }
+}
+
+function stopChildProcess(
+  child: ChildProcessWithoutNullStreams,
+): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      resolve();
+    }, 2_000);
+    child.once("exit", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    child.kill("SIGTERM");
+  });
+}
+
+function encodeSearch(search: Record<string, unknown>): string {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(search)) {
+    if (value === undefined || value === null) {
+      continue;
+    }
+    params.set(key, String(value));
+  }
+  const query = params.toString();
+  return query ? `?${query}` : "";
+}
+
 function HybridAppEventWiring({
   store,
   queryClient,
+  chatStreamManager,
 }: {
   store: JotaiStore;
   queryClient: QueryClient;
+  chatStreamManager: ChatStreamRemoteManager;
 }) {
+  const entityDisposal = useEntityDisposal();
   useEffect(
     () =>
       registerRendererIpcListeners({
         ipcClient: ipc,
         store,
         queryClient,
+        chatStreamManager,
+        entityDisposal,
       }),
-    [queryClient, store],
+    [chatStreamManager, entityDisposal, queryClient, store],
   );
   return null;
 }
 
-// The real app runs the queue processor at the layout level
-// (src/app/layout.tsx), above the chat route — so queued prompts drain even
-// when the chat page is closed. Mount the SAME hook here (hasChatId: false
-// internally, so it needs no router context) rather than replicating its
-// logic.
+function HybridEntityDisposalWiring({ store }: { store: JotaiStore }) {
+  // Mirrors renderer.tsx's own disposer, main-process teardown included. The
+  // atoms are only the UI half: a deleted app can still have a parked draft and
+  // a live session holding its lock in main, and a harness that skipped those
+  // calls would leave that path untested precisely where it matters.
+  const clearAppRuntime = useCallback(
+    (appId: number) => {
+      store.set(clearTestRuntimeForAppAtom, appId);
+      store.set(clearRecorderForAppAtom, appId);
+      void ipc.recording.discardRecordedTestDraft({ appId }).catch(() => {});
+      void ipc.recording.stopRecording({ appId }).catch(() => {});
+    },
+    [store],
+  );
+  useRegisterEntityDisposer("app", clearAppRuntime);
+  return null;
+}
+
+// The real app wires the chat stream machine runtime at the layout level
+// (src/app/layout.tsx), above the chat route — so streams and queued-prompt
+// dispatch keep working even when the chat page is closed. Mount the SAME
+// hook here rather than replicating its logic.
 function HybridAppShellHooks() {
-  useQueueProcessor();
+  const appRunManager = useAppRunRemoteManager();
+  const screenshotManager = useScreenshotManager();
+  useChatStreamRuntime({
+    requestPreviewReload: appRunManager.requestManualReload,
+    requestCapture: screenshotManager.requestCapture,
+  });
+  usePlanEvents();
+  useAppBlueprintEvents();
   return null;
 }
 
@@ -264,19 +622,29 @@ export async function setupHybridChatHarness(
   }
   activeHybridChatHarness = true;
 
-  // Prevent the UI's `nodejs-status` query from kicking off the real
-  // `npm install pnpm` background side effect (gated in node_handlers.ts).
-  // Snapshot the prior value so dispose can restore it instead of leaking it
-  // to everything else in this worker process.
-  const priorSkipPnpmInstall = process.env.DYAD_SKIP_MANAGED_PNPM_INSTALL;
-  const restoreSkipPnpmInstall = () => {
-    if (priorSkipPnpmInstall === undefined) {
-      delete process.env.DYAD_SKIP_MANAGED_PNPM_INSTALL;
-    } else {
-      process.env.DYAD_SKIP_MANAGED_PNPM_INSTALL = priorSkipPnpmInstall;
-    }
-  };
+  const envSnapshot = snapshotHybridEnv();
+  // IPC handlers share this process with the renderer. They need Node fetch:
+  // happy-dom strips Authorization on cross-origin requests even with its
+  // same-origin policy disabled, making authenticated fake-provider calls fail.
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = undiciFetch as unknown as typeof globalThis.fetch;
   process.env.DYAD_SKIP_MANAGED_PNPM_INSTALL = "true";
+  // The mounted UI queries Node status. Use the existing development override
+  // so host Node/pnpm subprocesses cannot delay bridge settling on busy CI.
+  process.env.DYAD_DEV_NODEJS_STATUS = "installed";
+  if (options.testBuild) {
+    if (!IS_TEST_BUILD) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        "[hybrid harness] testBuild: true, but IS_TEST_BUILD was already " +
+          "snapshotted as false at import time. Neon/Supabase/Vercel " +
+          "handlers will hit REAL endpoints. If this test needs them, add " +
+          '`vi.hoisted(() => { process.env.E2E_TEST_BUILD = "true"; });` ' +
+          "above the imports. See the testBuild JSDoc.",
+      );
+    }
+    process.env.E2E_TEST_BUILD = "true";
+  }
   setModelClientFetchForTesting(
     undiciFetch as unknown as Parameters<
       typeof setModelClientFetchForTesting
@@ -295,6 +663,10 @@ export async function setupHybridChatHarness(
     });
     const nodeHarness = node;
 
+    if (options.testBuild) {
+      process.env.FAKE_LLM_PORT = String(nodeHarness.fakeLlmPort);
+    }
+
     // Register every handler the UI invokes (the node harness only registers
     // chat_stream). Same code path as main.ts. Imported dynamically (after the
     // electron mock + db are live) — a static top-level import of the full
@@ -302,6 +674,9 @@ export async function setupHybridChatHarness(
     // (react-remove-scroll's tslib) and fails at module load.
     const { registerIpcHandlers } = await import("@/ipc/ipc_host");
     registerIpcHandlers();
+    const { registerLegacyChatStreamTestHandler } =
+      await import("@/ipc/handlers/chat_stream_handlers");
+    registerLegacyChatStreamTestHandler();
 
     const silenceActWarnings = options.silenceActWarnings ?? true;
     const bridge = installRendererIpcBridge(options.electronMock, {
@@ -320,7 +695,11 @@ export async function setupHybridChatHarness(
       bridge;
 
     let activeStore: JotaiStore | undefined;
+    let activeQueryClient: QueryClient | undefined;
     const queryClients: QueryClient[] = [];
+    const chatStreamManagers: ChatStreamRemoteManager[] = [];
+    let activeChatStreamManager: ChatStreamRemoteManager | undefined;
+    let activePreviewIframeManager: PreviewIframeManager | undefined;
     const assertNoMissingChannels = options.assertNoMissingChannels ?? true;
 
     const getActiveStore = (): JotaiStore => {
@@ -332,21 +711,104 @@ export async function setupHybridChatHarness(
       return activeStore;
     };
 
-    const mount = (opts: MountOptions = {}): RenderResult => {
+    let activeRouter: HybridRouter | undefined;
+    let activeFirstPromptClock: FakeClock | undefined;
+    const mcpHttpProcesses = new Set<ChildProcessWithoutNullStreams>();
+    const fakeStdioServerPath = path.join(
+      process.cwd(),
+      "testing",
+      "fake-stdio-mcp-server.mjs",
+    );
+    const fakeHttpServerPath = path.join(
+      process.cwd(),
+      "testing",
+      "fake-http-mcp-server.mjs",
+    );
+
+    const getActiveRouter = (): HybridRouter => {
+      if (!activeRouter) {
+        throw new Error(
+          "setupHybridChatHarness.mountSurface() must be called before reading the router",
+        );
+      }
+      return activeRouter;
+    };
+
+    const advanceFirstPromptClock = (delayMs: number): void => {
+      const clock = activeFirstPromptClock;
+      if (!clock) {
+        throw new Error(
+          "setupHybridChatHarness.mountSurface() must be called before advancing the first-prompt clock",
+        );
+      }
+      act(() => {
+        clock.advanceBy(delayMs);
+      });
+    };
+
+    const mountSurface = (opts: MountSurfaceOptions = {}): RenderResult => {
       const chatId = opts.chatId ?? nodeHarness.chatId;
       const appId = opts.appId ?? nodeHarness.appId;
+      const route = opts.route ?? "/chat";
       const store = createStore();
+      const chatStreamManager = new ChatStreamRemoteManager(store);
+      const firstPromptClock = createFakeClock();
+      const firstPromptIdSource = createSequentialIdSource();
+      chatStreamManagers.push(chatStreamManager);
+      activeChatStreamManager = chatStreamManager;
       activeStore = store;
+      activeFirstPromptClock = firstPromptClock;
 
       store.set(selectedAppIdAtom, appId);
-      store.set(selectedChatIdAtom, chatId);
+      store.set(selectedChatIdAtom, route === "/chat" ? chatId : null);
 
-      // A private route tree: useStreamChat/ChatInput call useSearch({from:"/chat"}),
-      // so a real "/chat" route is required. It imports the REAL search schema from
-      // src/routes/chat.tsx (chatSearchSchema) so this replica can't drift from
-      // production. It renders ChatPanel directly — mounting the real ChatPage would
-      // drag in PreviewPanel (Monaco, iframe runtime).
-      const rootRoute = createRootRoute({ component: Outlet });
+      const firstPromptChatStream = {
+        submit: (request: {
+          prompt: string;
+          chatId: number;
+          appId: number;
+          attachments: readonly FileAttachment[];
+          requestedChatMode?: "build" | "ask" | "local-agent" | "plan";
+          onAccepted: () => void;
+          onAcceptanceRejected: (reason: string) => void;
+        }) =>
+          chatStreamManager.ensure(request.chatId).send({
+            type: "submit",
+            request: {
+              ...request,
+              attachments: [...request.attachments],
+              selectedComponents: [],
+            },
+          }),
+      };
+
+      const RootComponent = () => (
+        <FirstPromptProvider
+          chatStream={firstPromptChatStream}
+          clock={firstPromptClock}
+          idSource={firstPromptIdSource}
+          settleDelayMs={0}
+        >
+          <PlanHandoffProvider>
+            <div data-testid="hybrid-surface-root">
+              {opts.wireAppEvents !== false && <HybridAppShellHooks />}
+              {opts.withTitleBar && <TitleBar />}
+              {opts.withAppList && <AppList show />}
+              {opts.withChatList && <ChatList show />}
+              {opts.withPrivacyBanner && <PrivacyBanner />}
+              {opts.withSubscriptionStatusBanner && (
+                <SubscriptionStatusBanner />
+              )}
+              <Outlet />
+            </div>
+          </PlanHandoffProvider>
+        </FirstPromptProvider>
+      );
+
+      // Private route tree: the harness uses the same route paths/search
+      // schemas that route consumers address, but renders narrow route
+      // components so mounting a surface does not pull in the full app shell.
+      const rootRoute = createRootRoute({ component: RootComponent });
       const chatTestRoute = createRoute({
         getParentRoute: () => rootRoute,
         path: "/chat",
@@ -354,20 +816,196 @@ export async function setupHybridChatHarness(
         component: function HybridChatRoute() {
           const search = chatTestRoute.useSearch();
           return (
-            <ChatPanel
-              chatId={search.id}
-              isPreviewOpen={false}
-              onTogglePreview={() => {}}
-            />
+            <>
+              <ChatPanel
+                chatId={search.id}
+                isPreviewOpen={!!opts.withPlanPanel || !!opts.withSecurityPanel}
+                onTogglePreview={() => {}}
+              />
+              {opts.withPlanPanel && <PlanPanel />}
+              {opts.withSecurityPanel && <SecurityPanel />}
+            </>
           );
         },
       });
+      const appDetailsTestRoute = createRoute({
+        getParentRoute: () => rootRoute,
+        path: "/app-details",
+        validateSearch: appDetailsSearchSchema,
+        component: function HybridAppDetailsRoute() {
+          return (
+            <Suspense fallback={<div data-testid="hybrid-surface-loading" />}>
+              <LazyAppDetailsPage />
+            </Suspense>
+          );
+        },
+      });
+      const databaseTestRoute = createRoute({
+        getParentRoute: () => rootRoute,
+        path: "/database",
+        component: function HybridDatabaseRoute() {
+          return (
+            <Suspense fallback={<div data-testid="hybrid-surface-loading" />}>
+              <LazyDatabaseSection appId={appId} />
+            </Suspense>
+          );
+        },
+      });
+      const deployTestRoute = createRoute({
+        getParentRoute: () => rootRoute,
+        path: "/deploy",
+        component: function HybridDeployRoute() {
+          return (
+            <Suspense fallback={<div data-testid="hybrid-surface-loading" />}>
+              <LazyDeployButton appId={appId} />
+            </Suspense>
+          );
+        },
+      });
+      const settingsTestRoute = createRoute({
+        getParentRoute: () => rootRoute,
+        path: "/settings",
+        component: function HybridSettingsRoute() {
+          return (
+            <Suspense fallback={<div data-testid="hybrid-surface-loading" />}>
+              <LazySettingsPage />
+            </Suspense>
+          );
+        },
+      });
+      const providerSettingsTestRoute = createRoute({
+        getParentRoute: () => rootRoute,
+        path: "/settings/providers/$provider",
+        params: {
+          parse: (params: { provider: string }) => ({
+            provider: params.provider,
+          }),
+        },
+        component: function HybridProviderSettingsRoute() {
+          const params = providerSettingsTestRoute.useParams() as {
+            provider: string;
+          };
+          return (
+            <Suspense fallback={<div data-testid="hybrid-surface-loading" />}>
+              <LazyProviderSettingsPage provider={params.provider} />
+            </Suspense>
+          );
+        },
+      });
+      const mediaTestRoute = createRoute({
+        getParentRoute: () => rootRoute,
+        path: "/library/media",
+        component: function HybridMediaRoute() {
+          return (
+            <Suspense fallback={<div data-testid="hybrid-surface-loading" />}>
+              <LazyMediaPage />
+            </Suspense>
+          );
+        },
+      });
+      const importAppTestRoute = createRoute({
+        getParentRoute: () => rootRoute,
+        path: "/import-app",
+        component: function HybridImportAppRoute() {
+          const [open, setOpen] = React.useState(true);
+          return (
+            <Suspense fallback={<div data-testid="hybrid-surface-loading" />}>
+              <LazyImportAppDialog
+                isOpen={open}
+                onClose={() => setOpen(false)}
+              />
+              {!open && <div data-testid="import-app-dialog-closed" />}
+            </Suspense>
+          );
+        },
+      });
+      const pluginsTestRoute = createRoute({
+        getParentRoute: () => rootRoute,
+        path: "/plugins",
+        component: function HybridPluginsRoute() {
+          return (
+            <Suspense fallback={<div data-testid="hybrid-surface-loading" />}>
+              <LazyPluginsPage />
+            </Suspense>
+          );
+        },
+      });
+      const pluginDetailTestRoute = createRoute({
+        getParentRoute: () => rootRoute,
+        path: "/plugins/$serverId",
+        params: {
+          parse: (params: { serverId: string }) => ({
+            serverId: Number(params.serverId),
+          }),
+          stringify: (params: { serverId: number }) => ({
+            serverId: String(params.serverId),
+          }),
+        },
+        component: function HybridPluginDetailRoute() {
+          const params = pluginDetailTestRoute.useParams() as {
+            serverId: number;
+          };
+          return (
+            <Suspense fallback={<div data-testid="hybrid-surface-loading" />}>
+              <LazyPluginDetailPage serverId={params.serverId} />
+            </Suspense>
+          );
+        },
+      });
+      const homeLiteRoute = createRoute({
+        getParentRoute: () => rootRoute,
+        path: "/",
+        component: function HybridHomeLiteRoute() {
+          return <div data-testid="hybrid-home-lite" />;
+        },
+      });
+
+      const routeTree = rootRoute.addChildren([
+        homeLiteRoute,
+        chatTestRoute,
+        appDetailsTestRoute,
+        databaseTestRoute,
+        deployTestRoute,
+        settingsTestRoute,
+        providerSettingsTestRoute,
+        mediaTestRoute,
+        importAppTestRoute,
+        pluginsTestRoute,
+        pluginDetailTestRoute,
+      ]);
+
+      const search = opts.search ?? {};
+      let initialPath: string;
+      if (route === "/chat") {
+        initialPath = `/chat${encodeSearch({ id: chatId, appId, ...search })}`;
+      } else if (route === "/app-details") {
+        initialPath = `/app-details${encodeSearch({ appId, ...search })}`;
+      } else if (route === "/database" || route === "/deploy") {
+        initialPath = `${route}${encodeSearch(search)}`;
+      } else if (route === "/settings/providers/$provider") {
+        const provider = opts.params?.provider ?? "auto";
+        initialPath = `/settings/providers/${provider}${encodeSearch(search)}`;
+      } else if (route === "/media" || route === "/library/media") {
+        initialPath = `/library/media${encodeSearch(search)}`;
+      } else if (route === "/import-app") {
+        initialPath = `/import-app${encodeSearch(search)}`;
+      } else if (route === "/settings") {
+        initialPath = `/settings${encodeSearch(search)}`;
+      } else if (route === "/plugins") {
+        initialPath = `/plugins${encodeSearch(search)}`;
+      } else if (route === "/plugins/$serverId") {
+        initialPath = `/plugins/${opts.params?.serverId ?? ""}${encodeSearch(search)}`;
+      } else {
+        initialPath = `/${encodeSearch(search)}`;
+      }
+
       const router = createRouter({
-        routeTree: rootRoute.addChildren([chatTestRoute]),
+        routeTree,
         history: createMemoryHistory({
-          initialEntries: [`/chat?id=${chatId}&appId=${appId}`],
+          initialEntries: [initialPath],
         }),
       });
+      activeRouter = router as unknown as HybridRouter;
 
       const queryClient = new QueryClient({
         defaultOptions: {
@@ -375,28 +1013,215 @@ export async function setupHybridChatHarness(
           mutations: { retry: false },
         },
       });
+      activeQueryClient = queryClient;
       queryClients.push(queryClient);
-
+      const previewErrors = new DeferredPreviewErrorFacade();
+      const packageWarnings = new PackageManagerWarningStore();
+      const appRunManager = new AppRunRemoteManager(
+        uuidIdSource,
+        new TestAppRunRemoteConnection(),
+      );
+      const previewIframeManager = new PreviewIframeManager(
+        createPreviewIframeCommandAdapter(store),
+      );
+      activePreviewIframeManager = previewIframeManager;
       const result = render(
         <QueryClientProvider client={queryClient}>
           <Provider store={store}>
-            <ThemeProvider>
-              {opts.wireAppEvents !== false && (
-                <>
-                  <HybridAppEventWiring
-                    store={store}
-                    queryClient={queryClient}
-                  />
-                  <HybridAppShellHooks />
-                </>
-              )}
-              <RouterProvider router={router as never} />
-              <Toaster richColors expand duration={500} />
-            </ThemeProvider>
+            <EntityDisposalProvider>
+              <HybridEntityDisposalWiring store={store} />
+              <PreviewErrorFacadeProvider facade={previewErrors}>
+                <PackageManagerWarningProvider manager={packageWarnings}>
+                  <ChatStreamProvider manager={chatStreamManager}>
+                    <AppRunRemoteProvider manager={appRunManager}>
+                      <GithubOpsProvider>
+                        <ImageGenerationProvider>
+                          <VersionPreviewProvider>
+                            <PreviewIframeProvider
+                              appRunState={appRunManager}
+                              manager={previewIframeManager}
+                            >
+                              <ScreenshotProvider>
+                                <ThemeProvider>
+                                  <DeepLinkProvider>
+                                    <SidebarProvider defaultOpen={false}>
+                                      {opts.wireAppEvents !== false && (
+                                        <HybridAppEventWiring
+                                          store={store}
+                                          queryClient={queryClient}
+                                          chatStreamManager={chatStreamManager}
+                                        />
+                                      )}
+                                      <RouterProvider
+                                        router={router as never}
+                                      />
+                                      <Toaster
+                                        richColors
+                                        expand
+                                        duration={500}
+                                      />
+                                    </SidebarProvider>
+                                  </DeepLinkProvider>
+                                </ThemeProvider>
+                              </ScreenshotProvider>
+                            </PreviewIframeProvider>
+                          </VersionPreviewProvider>
+                        </ImageGenerationProvider>
+                      </GithubOpsProvider>
+                    </AppRunRemoteProvider>
+                  </ChatStreamProvider>
+                </PackageManagerWarningProvider>
+              </PreviewErrorFacadeProvider>
+            </EntityDisposalProvider>
           </Provider>
         </QueryClientProvider>,
       );
       return result;
+    };
+
+    const mount = (opts: MountOptions = {}): RenderResult =>
+      mountSurface({ ...opts, route: "/chat" });
+
+    const setSelectedAppId = (appId: number | null) => {
+      const store = getActiveStore();
+      act(() => {
+        store.set(selectedAppIdAtom, appId);
+      });
+    };
+
+    const setPlanAcceptInNewChat = (chatId: number, value: boolean) => {
+      const store = getActiveStore();
+      act(() => {
+        const next = new Map(store.get(planAcceptInNewChatByChatIdAtom));
+        next.set(chatId, value);
+        store.set(planAcceptInNewChatByChatIdAtom, next);
+      });
+    };
+
+    const getPlanAcceptInNewChat = (chatId: number) =>
+      getActiveStore().get(planAcceptInNewChatByChatIdAtom).get(chatId);
+
+    const seedChatStreamResidue = async (chatId: number) => {
+      const manager = activeChatStreamManager;
+      if (!manager) throw new Error("Chat stream manager is not mounted");
+      await manager.dispatchQueueEvent(chatId, { type: "PAUSE_QUEUE" });
+    };
+
+    const hasChatStreamResidue = (chatId: number) =>
+      hasSessionChatQueue(chatId);
+
+    const seedAppRuntimeResidue = (appId: number) => {
+      const store = getActiveStore();
+      const previewIframeManager = activePreviewIframeManager;
+      if (!previewIframeManager) {
+        throw new Error("Preview iframe manager is not mounted");
+      }
+      act(() => {
+        previewIframeManager.send(appId, {
+          type: "IFRAME_ERROR",
+          message: "seeded",
+          source: "preview-app",
+        });
+        store.set(
+          testRunOutputByAppIdAtom,
+          new Map([[appId, new Map([[1, "seeded"]])]]),
+        );
+      });
+    };
+
+    const hasAppRuntimeResidue = (appId: number) => {
+      const store = getActiveStore();
+      return (
+        activePreviewIframeManager?.getSnapshot(appId).error !== undefined ||
+        store.get(testRunOutputByAppIdAtom).has(appId)
+      );
+    };
+
+    const setChatAttachments = (attachments: ChatAttachmentSeed[]) => {
+      const store = getActiveStore();
+      const fileAttachments = attachments.map(
+        (attachment): FileAttachment => ({
+          file: new File([attachment.content], attachment.name, {
+            type: attachment.mimeType ?? "text/plain",
+            lastModified: attachment.lastModified,
+          }),
+          type: attachment.type ?? "chat-context",
+        }),
+      );
+      act(() => {
+        const chatId = store.get(selectedChatIdAtom);
+        if (chatId == null) store.set(attachmentsAtom, fileAttachments);
+        else
+          store.set(chatAttachmentsByIdAtom, (previous) =>
+            new Map(previous).set(chatId, fileAttachments),
+          );
+      });
+    };
+
+    const setSelectedComponents = (components: ComponentSelection[]) => {
+      const store = getActiveStore();
+      act(() => {
+        store.set(selectedComponentsPreviewAtom, components);
+      });
+    };
+
+    // Popovers and dropdown menus render different data-slot values.
+    const OPEN_POPUP_SELECTOR =
+      '[data-slot="popover-content"], [data-slot="dropdown-menu-content"]';
+
+    const openPopover = async (trigger: HTMLElement): Promise<void> => {
+      trigger.focus();
+      fireEvent.pointerDown(trigger);
+      fireEvent.pointerUp(trigger);
+      fireEvent.click(trigger);
+      fireEvent.keyDown(trigger, { key: "ArrowDown" });
+      await waitFor(() => {
+        expect(document.querySelector(OPEN_POPUP_SELECTOR)).toBeTruthy();
+      });
+    };
+
+    const clickMenuItem = async (
+      name: string | RegExp,
+    ): Promise<HTMLElement> => {
+      // Scope to the open popup when there is one so a same-named button
+      // elsewhere in the page (e.g. a dialog's confirm) can't be matched.
+      const popup = document.querySelector<HTMLElement>(OPEN_POPUP_SELECTOR);
+      const item = popup
+        ? await within(popup).findByRole("button", { name })
+        : await screen.findByRole("button", { name });
+      fireEvent.pointerDown(item);
+      fireEvent.pointerUp(item);
+      fireEvent.click(item);
+      return item;
+    };
+
+    const findDialog = async (name: string | RegExp): Promise<HTMLElement> =>
+      screen.findByRole("dialog", { name });
+
+    const confirmDialog = async (
+      dialogName: string | RegExp,
+      buttonName: string | RegExp,
+    ): Promise<void> => {
+      const dialog = await findDialog(dialogName);
+      const button = await within(dialog).findByRole("button", {
+        name: buttonName,
+      });
+      fireEvent.click(button);
+      await waitFor(() => expect(dialog.isConnected).toBe(false));
+    };
+
+    const setSwitch = async (
+      switchElement: HTMLElement,
+      checked: boolean,
+    ): Promise<void> => {
+      if (switchElement.getAttribute("aria-checked") !== String(checked)) {
+        fireEvent.click(switchElement);
+      }
+      await waitFor(() => {
+        expect(switchElement.getAttribute("aria-checked")).toBe(
+          String(checked),
+        );
+      });
     };
 
     // Exactly what LexicalChatInput's onChange writes. Wrapped in act because
@@ -411,6 +1236,23 @@ export async function setupHybridChatHarness(
         store.set(chatInputValuesByIdAtom, next);
       });
     };
+    const getChatInputValue = (chatId: number) =>
+      getActiveStore().get(chatInputValuesByIdAtom).get(chatId) ?? "";
+
+    const setChatAnnotations = (
+      chatId: number,
+      annotations: ChatAnnotation[],
+    ): void => {
+      const store = getActiveStore();
+      const next = new Map(store.get(chatAnnotationsAtom));
+      if (annotations.length === 0) next.delete(chatId);
+      else next.set(chatId, annotations);
+      act(() => {
+        store.set(chatAnnotationsAtom, next);
+      });
+    };
+    const getChatAnnotations = (chatId: number): ChatAnnotation[] =>
+      getActiveStore().get(chatAnnotationsAtom).get(chatId) ?? [];
 
     const typeInChat = async (
       text: string,
@@ -418,7 +1260,9 @@ export async function setupHybridChatHarness(
     ): Promise<TypeInChatResult> => {
       seedChatInput(text, opts);
 
-      const sendButton = await screen.findByLabelText("sendMessage");
+      const sendButton = await screen.findByLabelText(
+        /^(sendMessage|Send message)$/,
+      );
       await waitFor(() => {
         expect((sendButton as HTMLButtonElement).hasAttribute("disabled")).toBe(
           false,
@@ -571,6 +1415,10 @@ export async function setupHybridChatHarness(
       // happy-dom won't open a Base UI Select on a bare click. Focus + ArrowDown
       // opens the popup; then pointer events + click + Enter on the option commit
       // the value (a bare click alone does nothing).
+      await waitFor(() => {
+        expect((trigger as HTMLButtonElement).disabled).toBe(false);
+        expect(trigger.getAttribute("aria-disabled")).not.toBe("true");
+      });
       trigger.focus();
       fireEvent.keyDown(trigger, { key: "ArrowDown" });
       const option = await screen.findByRole("option", { name: optionMatcher });
@@ -631,6 +1479,152 @@ export async function setupHybridChatHarness(
       return screen.getAllByText(matcher);
     };
 
+    const githubFetch = async (path: string, init?: RequestInit) => {
+      const response = await undiciFetch(`${nodeHarness.fakeLlmUrl}${path}`, {
+        ...init,
+        headers: {
+          Accept: "application/json",
+          ...init?.headers,
+        },
+      } as Parameters<typeof undiciFetch>[1]);
+      if (!response.ok) {
+        throw new Error(
+          `Fake GitHub helper failed ${path}: ${response.status} ${response.statusText}`,
+        );
+      }
+      return response;
+    };
+
+    const github = {
+      pushEvents: async (): Promise<unknown> => {
+        const response = await githubFetch("/github/api/test/push-events");
+        return response.json();
+      },
+      clearPushEvents: async (): Promise<void> => {
+        await githubFetch("/github/api/test/clear-push-events", {
+          method: "POST",
+        });
+      },
+      resetRepos: async (): Promise<void> => {
+        await githubFetch("/github/api/test/reset-repos", { method: "POST" });
+      },
+    };
+
+    const resetMcpServers = async (): Promise<void> => {
+      const servers = await ipc.mcp.listServers();
+      for (const server of servers) {
+        await ipc.mcp.deleteServer(server.id);
+      }
+    };
+
+    const waitForMcpTool = async (
+      serverId: number,
+      toolName: string,
+      timeoutMs = 10_000,
+    ): Promise<void> => {
+      await waitFor(
+        async () => {
+          const result = await ipc.mcp.listTools(serverId);
+          expect(result.status).toBe("ok");
+          expect(result.tools.map((tool) => tool.name)).toContain(toolName);
+        },
+        { timeout: timeoutMs },
+      );
+    };
+
+    const addStdioMcpServer = async (opts?: {
+      name?: string;
+      env?: Record<string, string>;
+    }): Promise<McpServer> => {
+      const server = await ipc.mcp.createServer({
+        name: opts?.name ?? "testing-mcp-server",
+        transport: "stdio",
+        command: "node",
+        args: [fakeStdioServerPath],
+        envJson: opts?.env ?? null,
+        enabled: true,
+      });
+      await waitForMcpTool(server.id, "calculator_add");
+      return server;
+    };
+
+    const addHttpMcpServer = async (opts?: {
+      name?: string;
+      headers?: Record<string, string>;
+    }): Promise<{
+      server: McpServer;
+      url: string;
+      stop: () => Promise<void>;
+    }> => {
+      // PORT=0 lets the OS pick a free port race-free; the child reports the
+      // bound port in its startup line and we parse it from there.
+      const child = spawn("node", [fakeHttpServerPath], {
+        env: { ...process.env, PORT: "0" },
+        stdio: "pipe",
+      });
+      mcpHttpProcesses.add(child);
+
+      const port = await new Promise<number>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          reject(new Error(`HTTP MCP server failed to start within timeout`));
+        }, 10_000);
+        let stdoutBuffer = "";
+        child.stdout.on("data", (data: Buffer) => {
+          stdoutBuffer += data.toString();
+          const match = stdoutBuffer.match(
+            /HTTP MCP server running on http:\/\/localhost:(\d+)\/mcp/,
+          );
+          if (match) {
+            clearTimeout(timeout);
+            resolve(Number(match[1]));
+          }
+        });
+        child.stderr.on("data", (data: Buffer) => {
+          const text = data.toString().trim();
+          if (text) {
+            // Surface the server's own startup/runtime errors in vitest output.
+            console.error(`HTTP MCP server stderr: ${text}`);
+          }
+        });
+        child.once("error", (error) => {
+          clearTimeout(timeout);
+          reject(error);
+        });
+        child.once("exit", (code, signal) => {
+          clearTimeout(timeout);
+          reject(
+            new Error(
+              `HTTP MCP server exited before ready: code=${code} signal=${signal}`,
+            ),
+          );
+        });
+      });
+
+      const url = `http://localhost:${port}/mcp`;
+      const server = await ipc.mcp.createServer({
+        name: opts?.name ?? "testing-mcp-server",
+        transport: "http",
+        url,
+        headersJson: opts?.headers ?? null,
+        enabled: true,
+      });
+      await waitForMcpTool(server.id, "calculator_add");
+
+      const stop = async () => {
+        mcpHttpProcesses.delete(child);
+        await stopChildProcess(child);
+      };
+      return { server, url, stop };
+    };
+
+    const mcp = {
+      fakeStdioServerPath,
+      resetServers: resetMcpServers,
+      addStdioServer: addStdioMcpServer,
+      addHttpServer: addHttpMcpServer,
+      waitForTool: waitForMcpTool,
+    };
+
     const dispose = async (): Promise<void> => {
       // Teardown ordering is load-bearing (see HYBRID_HARNESS.md "Race-free
       // teardown"):
@@ -658,8 +1652,23 @@ export async function setupHybridChatHarness(
         for (const qc of queryClients) {
           qc.clear();
         }
+        for (const manager of chatStreamManagers) {
+          manager.dispose();
+        }
         activeStore = undefined;
+        activeQueryClient = undefined;
+        activeRouter = undefined;
         bridge.uninstall();
+        // Server ids restart at 1 in the next harness's fresh db, so a cached
+        // client left here would be silently reused for a different server.
+        // Dynamic import: static top-level imports of the handler graph break
+        // module-load ordering (see the ipc_host import above).
+        const { mcpManager } = await import("@/ipc/utils/mcp_manager");
+        await mcpManager.disposeAll();
+        await Promise.all(
+          Array.from(mcpHttpProcesses, (child) => stopChildProcess(child)),
+        );
+        mcpHttpProcesses.clear();
         await nodeHarness.dispose();
       } catch (error) {
         teardownError = error;
@@ -670,7 +1679,8 @@ export async function setupHybridChatHarness(
         }
         activeHybridChatHarness = false;
         setModelClientFetchForTesting(undefined);
-        restoreSkipPnpmInstall();
+        globalThis.fetch = previousFetch;
+        restoreHybridEnv(envSnapshot);
       }
 
       if (settleError) {
@@ -692,6 +1702,36 @@ export async function setupHybridChatHarness(
       ...nodeHarness,
       bridge,
       mount,
+      mountSurface,
+      advanceFirstPromptClock,
+      router: getActiveRouter,
+      currentLocation: () => getActiveRouter().state.location,
+      queryClient: () => {
+        if (!activeQueryClient) {
+          throw new Error(
+            "setupHybridChatHarness.mount() must be called before reading the query client",
+          );
+        }
+        return activeQueryClient;
+      },
+      setSelectedAppId,
+      setPlanAcceptInNewChat,
+      getPlanAcceptInNewChat,
+      seedChatStreamResidue,
+      hasChatStreamResidue,
+      seedAppRuntimeResidue,
+      hasAppRuntimeResidue,
+      openPopover,
+      clickMenuItem,
+      findDialog,
+      confirmDialog,
+      setSwitch,
+      setChatInputValue: seedChatInput,
+      getChatInputValue,
+      setChatAnnotations,
+      getChatAnnotations,
+      setChatAttachments,
+      setSelectedComponents,
       typeInChat,
       pressEnterInChat,
       waitForStreamEnd,
@@ -702,12 +1742,15 @@ export async function setupHybridChatHarness(
       selectFromBaseUiSelect,
       selectChatMode,
       createChat,
+      github,
+      mcp,
       dispose,
     };
   } catch (error) {
     activeHybridChatHarness = false;
     setModelClientFetchForTesting(undefined);
-    restoreSkipPnpmInstall();
+    globalThis.fetch = previousFetch;
+    restoreHybridEnv(envSnapshot);
     if (node) {
       await node.dispose();
     }

@@ -1,5 +1,6 @@
 import { useSettings } from "@/hooks/useSettings";
 import { useFreeAgentQuota } from "@/hooks/useFreeAgentQuota";
+import { SettingField } from "@/components/settings/SettingField";
 import {
   Select,
   SelectContent,
@@ -16,10 +17,11 @@ import {
   isFreeProBuildModeCombination,
   isFreeProModel,
 } from "@/lib/freeProModel";
+import { FREE_AGENT_QUOTA_LIMIT } from "@/lib/free_agent_quota_limit";
 
 export function DefaultChatModeSelector() {
   const { settings, updateSettings, envVars } = useSettings();
-  const { isQuotaExceeded, isLoading: isQuotaLoading } = useFreeAgentQuota();
+  const { quotaStatus } = useFreeAgentQuota();
   const { t } = useTranslation("settings");
 
   useEffect(() => {
@@ -40,15 +42,7 @@ export function DefaultChatModeSelector() {
 
   const isProEnabled = isDyadProEnabled(settings);
   const isDyadFreeSelected = isFreeProModel(settings.selectedModel);
-  // Wait for quota status to load before determining effective default
-  const freeAgentQuotaAvailable = !isQuotaLoading && !isQuotaExceeded;
-  const effectiveDefault = getEffectiveDefaultChatMode(
-    settings,
-    envVars,
-    freeAgentQuotaAvailable,
-  );
-  // Show Basic Agent option if user is Pro OR if they have free quota available
-  const showBasicAgentOption = isProEnabled || freeAgentQuotaAvailable;
+  const effectiveDefault = getEffectiveDefaultChatMode(settings, envVars);
 
   const handleDefaultChatModeChange = (value: ChatMode) => {
     if (isFreeProBuildModeCombination(settings.selectedModel, value)) {
@@ -73,52 +67,49 @@ export function DefaultChatModeSelector() {
   };
 
   return (
-    <div className="space-y-1">
-      <div className="flex items-center space-x-2">
-        <label
-          htmlFor="default-chat-mode"
-          className="text-sm font-medium text-gray-700 dark:text-gray-300"
+    <SettingField
+      htmlFor="default-chat-mode"
+      label={t("workflow.defaultChatMode")}
+      description={t("workflow.defaultChatModeDescription")}
+    >
+      <Select
+        value={effectiveDefault}
+        onValueChange={(v) => v && handleDefaultChatModeChange(v)}
+      >
+        <SelectTrigger
+          className="w-full sm:w-[240px]"
+          id="default-chat-mode"
+          aria-describedby="default-chat-mode-description"
         >
-          {t("workflow.defaultChatMode")}
-        </label>
-        <Select
-          value={effectiveDefault}
-          onValueChange={(v) => v && handleDefaultChatModeChange(v)}
-        >
-          <SelectTrigger className="w-40" id="default-chat-mode">
-            <SelectValue>{getModeDisplayName(effectiveDefault)}</SelectValue>
-          </SelectTrigger>
-          <SelectContent>
-            {showBasicAgentOption && (
-              <SelectItem value="local-agent">
-                <div className="flex flex-col items-start">
-                  <span className="font-medium">
-                    {isProEnabled ? "Agent" : "Basic Agent"}
-                  </span>
-                  <span className="text-xs text-muted-foreground">
-                    {isProEnabled
-                      ? "Better at bigger tasks"
-                      : "Free tier (10 messages/day)"}
-                  </span>
-                </div>
-              </SelectItem>
-            )}
-            <SelectItem value="build" disabled={isDyadFreeSelected}>
-              <div className="flex flex-col items-start">
-                <span className="font-medium">Build</span>
-                <span className="text-xs text-muted-foreground">
-                  {isDyadFreeSelected
-                    ? "Use Agent with Dyad Free"
-                    : "Generate and edit code"}
-                </span>
-              </div>
-            </SelectItem>
-          </SelectContent>
-        </Select>
-      </div>
-      <div className="text-sm text-gray-500 dark:text-gray-400">
-        {t("workflow.defaultChatModeDescription")}
-      </div>
-    </div>
+          <SelectValue>{getModeDisplayName(effectiveDefault)}</SelectValue>
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="local-agent">
+            <div className="flex flex-col items-start">
+              <span className="font-medium">
+                {isProEnabled ? "Agent" : "Basic Agent"}
+              </span>
+              <span className="text-xs text-muted-foreground">
+                {isProEnabled
+                  ? "Better at bigger tasks"
+                  : quotaStatus?.isQuotaExceeded
+                    ? "Daily limit reached; preference applies after reset"
+                    : `Free tier (${FREE_AGENT_QUOTA_LIMIT} messages/day)`}
+              </span>
+            </div>
+          </SelectItem>
+          <SelectItem value="build" disabled={isDyadFreeSelected}>
+            <div className="flex flex-col items-start">
+              <span className="font-medium">Build</span>
+              <span className="text-xs text-muted-foreground">
+                {isDyadFreeSelected
+                  ? "Use Agent with Dyad Free"
+                  : "Generate and edit code"}
+              </span>
+            </div>
+          </SelectItem>
+        </SelectContent>
+      </Select>
+    </SettingField>
   );
 }

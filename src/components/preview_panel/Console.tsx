@@ -1,10 +1,6 @@
 import { selectedAppIdAtom } from "@/atoms/appAtoms";
-import {
-  currentConsoleEntriesAtom,
-  setConsoleEntriesForAppAtom,
-} from "@/atoms/previewRuntimeAtoms";
 import type { ConsoleEntry } from "@/ipc/types";
-import { useAtomValue, useSetAtom } from "jotai";
+import { useAtomValue } from "jotai";
 import { ipc } from "@/ipc/types";
 import { useEffect, useRef, useState, useMemo, useCallback, memo } from "react";
 import { Virtuoso, VirtuosoHandle } from "react-virtuoso";
@@ -12,6 +8,10 @@ import { ConsoleEntryComponent } from "./ConsoleEntry";
 import { ConsoleFilters } from "./ConsoleFilters";
 import { useSettings } from "@/hooks/useSettings";
 import { showError } from "@/lib/toast";
+import { appLogForwarder } from "@/lib/app_log_forwarder";
+import { useConsoleEntries } from "@/preview_console/hooks";
+import { useAppRunRemoteManager } from "@/app_run/AppRunRemoteProvider";
+import { matchesConsoleEntryFilters } from "./console_entry_filters";
 
 // Placeholder component shown during fast scrolling
 const ScrollSeekPlaceholder = () => {
@@ -56,6 +56,7 @@ const ConsoleItem = memo(
           timestamp={entry.timestamp}
           message={entry.message}
           sourceName={entry.sourceName}
+          runtimeBoundary={entry.runtimeBoundary}
           typeFilter={typeFilter}
           isExpanded={isExpanded}
           onToggleExpand={() => toggleExpanded(entryKey, index)}
@@ -69,13 +70,12 @@ ConsoleItem.displayName = "ConsoleItem";
 
 // Console component
 export const Console = () => {
-  const consoleEntries = useAtomValue(currentConsoleEntriesAtom);
-  const setConsoleEntries = useSetAtom(setConsoleEntriesForAppAtom);
   const selectedAppId = useAtomValue(selectedAppIdAtom);
+  const consoleEntries = useConsoleEntries(selectedAppId);
+  const appRunManager = useAppRunRemoteManager();
   const { settings } = useSettings();
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  const hasScrolledToBottom = useRef(false);
   const [showFilters, setShowFilters] = useState(false);
   const [containerHeight, setContainerHeight] = useState(0);
   const [expandedEntries, setExpandedEntries] = useState<Set<string>>(
@@ -90,9 +90,6 @@ export const Console = () => {
     "all" | "server" | "client" | "edge-function" | "network-requests"
   >("all");
   const [sourceFilter, setSourceFilter] = useState<string>("");
-
-  // Track container height for responsive filter visibility
-  const prevContainerHeight = useRef(0);
 
   // Track if user is near bottom (within 100px) for auto-scroll
   const [isNearBottom, setIsNearBottom] = useState(true);
@@ -110,17 +107,18 @@ export const Console = () => {
   const handleClearLogs = useCallback(async () => {
     if (selectedAppId) {
       try {
-        // Clear logs from backend store
+        // Clear logs from backend store, including any not yet forwarded
+        appLogForwarder.discard(selectedAppId);
         await ipc.misc.clearLogs({ appId: selectedAppId });
         // Clear logs from UI
-        setConsoleEntries({ appId: selectedAppId, entries: [] });
+        appRunManager.previewConsole.clear(selectedAppId);
       } catch (error) {
         showError(
           error instanceof Error ? error.message : "Failed to clear logs",
         );
       }
     }
-  }, [selectedAppId, setConsoleEntries]);
+  }, [appRunManager, selectedAppId]);
 
   useEffect(() => {
     const container = containerRef.current?.parentElement;
@@ -129,14 +127,7 @@ export const Console = () => {
     const resizeObserver = new ResizeObserver((entries) => {
       for (const entry of entries) {
         const newHeight = entry.contentRect.height;
-        const wasZero = prevContainerHeight.current === 0;
-        prevContainerHeight.current = newHeight;
         setContainerHeight(newHeight);
-        // Reset scroll flag when container becomes visible (height goes from 0 to > 0)
-        // This handles the case when console panel is opened
-        if (wasZero && newHeight > 0) {
-          hasScrolledToBottom.current = false;
-        }
       }
     });
 
@@ -161,20 +152,18 @@ export const Console = () => {
     return Array.from(sources).sort();
   }, [consoleEntries]);
 
-  // Filter and sort console entries by timestamp
+  // The bounded buffer keeps this copy small. Sort at display time because
+  // browser and dev-server producers can deliver timestamped entries out of
+  // order relative to each other.
   const filteredEntries = useMemo(() => {
     return consoleEntries
-      .filter((entry) => {
-        if (levelFilter !== "all" && entry.level !== levelFilter) return false;
-        if (typeFilter !== "all" && entry.type !== typeFilter) return false;
-        if (
-          sourceFilter &&
-          sourceFilter !== "all" &&
-          entry.sourceName !== sourceFilter
-        )
-          return false;
-        return true;
-      })
+      .filter((entry) =>
+        matchesConsoleEntryFilters(entry, {
+          level: levelFilter,
+          type: typeFilter,
+          source: sourceFilter,
+        }),
+      )
       .sort((a, b) => a.timestamp - b.timestamp);
   }, [consoleEntries, levelFilter, typeFilter, sourceFilter]);
 
@@ -264,6 +253,7 @@ export const Console = () => {
                       timestamp={entry.timestamp}
                       message={entry.message}
                       sourceName={entry.sourceName}
+                      runtimeBoundary={entry.runtimeBoundary}
                       typeFilter={typeFilter}
                       isExpanded={isExpanded}
                       onToggleExpand={() => toggleExpanded(entryKey)}
@@ -293,7 +283,6 @@ export const Console = () => {
                 // atBottomThreshold makes this fire when within 100px of bottom
                 setIsNearBottom(atBottom);
                 if (atBottom) {
-                  hasScrolledToBottom.current = true;
                   // Mark initial scroll as done after first time we reach bottom
                   if (!initialScrollDone.current) {
                     initialScrollDone.current = true;

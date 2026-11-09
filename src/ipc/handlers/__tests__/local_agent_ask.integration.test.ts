@@ -14,6 +14,9 @@
 // `engine: true`.
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
+import fs from "node:fs";
+import path from "node:path";
+
 import { screen, waitFor } from "@testing-library/react";
 
 import {
@@ -31,10 +34,14 @@ describe("local-agent ask mode (integration)", () => {
     harness = await setupHybridChatHarness({
       electronMock: h,
       engine: true,
+      // Custom providers retain their direct transport even with Pro enabled.
+      // Select a cloud model to exercise the Engine request contract.
+      selectedModel: { provider: "google", name: "gemini-2.5-pro" },
       chatMode: "ask",
       settings: {
         isTestMode: true,
         enableDyadPro: true,
+        enableImplementerSubagent: true,
         providerSettings: { auto: { apiKey: { value: "testdyadkey" } } },
         enableCodeExplorer: false,
       },
@@ -115,7 +122,10 @@ describe("local-agent ask mode (integration)", () => {
       /<dyad-script description="Check App\.tsx length" state="finished" truncated="false" execution-ms="\d+">/,
     );
     // The script output is App.tsx's length — verify against the real file.
-    const appTsxLength = harness.readAppFile("src/App.tsx").length;
+    const appTsxLength = fs.readFileSync(
+      path.join(harness.appDir, "src/App.tsx"),
+      "utf8",
+    ).length;
     const payloadMatch = content.match(
       /<dyad-script [^>]*>([\s\S]*?)<\/dyad-script>/,
     );
@@ -174,19 +184,31 @@ describe("local-agent ask mode (integration)", () => {
     const toolNames = tools.map((t) => t.function?.name ?? t.name).sort();
     // The exact read-only toolset the e2e request snapshot asserted.
     expect(toolNames).toEqual([
-      "code_search",
       "execute_sandbox_script",
+      "explore_chat_history",
+      "git_diff",
+      "git_log",
+      "git_show_commit",
+      "git_show_file",
+      "git_status",
       "grep",
       "list_files",
+      "read_chat",
       "read_file",
       "read_guide",
       "read_logs",
       "run_type_checks",
       "set_chat_summary",
+      "spawn_agent",
       "web_crawl",
       "web_fetch",
       "web_search",
     ]);
+    const spawnAgent = tools.find(
+      (tool) => (tool.function?.name ?? tool.name) === "spawn_agent",
+    );
+    expect(JSON.stringify(spawnAgent)).toContain('"explorer"');
+    expect(JSON.stringify(spawnAgent)).not.toContain('"implementer"');
     // Tool descriptions are masked by the harness, keeping the payload
     // snapshot-stable.
     for (const t of tools) {
@@ -197,6 +219,55 @@ describe("local-agent ask mode (integration)", () => {
     }
 
     // Every channel the UI invoked had a real handler.
+    expect([...harness.bridge.missingChannels]).toEqual([]);
+  }, 60_000);
+
+  it("provides Explorer spawning without Implementer in Plan mode", async () => {
+    const chatId = await harness.createChat();
+
+    harness.mount({ chatId });
+    await waitFor(
+      () => {
+        expect(screen.getByTestId("messages-list")).toBeTruthy();
+        expect(screen.getByTestId("chat-input-container")).toBeTruthy();
+      },
+      { timeout: 15_000 },
+    );
+    await harness.selectChatMode("plan");
+
+    const streamEnd = harness.waitForNextStreamEnd(chatId);
+    const { send } = await harness.typeInChat("[dump]", { chatId });
+    send();
+
+    await waitFor(
+      () => expect(screen.getByText(/dyad-dump-path/)).toBeTruthy(),
+      { timeout: 20_000 },
+    );
+    await streamEnd;
+
+    const req = harness.getServerDump({ type: "request" });
+    const tools = (req.parsed.body.tools ?? []) as Array<{
+      function?: { name: string; description: string };
+      name?: string;
+    }>;
+    const toolNames = tools.map((tool) => tool.function?.name ?? tool.name);
+    expect(toolNames).toContain("spawn_agent");
+    expect(toolNames).not.toContain("write_file");
+    for (const advancedTool of [
+      "list_agents",
+      "wait_agents",
+      "cancel_agent",
+      "send_message",
+      "followup_task",
+    ]) {
+      expect(toolNames).not.toContain(advancedTool);
+    }
+
+    const spawnAgent = tools.find(
+      (tool) => (tool.function?.name ?? tool.name) === "spawn_agent",
+    );
+    expect(JSON.stringify(spawnAgent)).toContain('"explorer"');
+    expect(JSON.stringify(spawnAgent)).not.toContain('"implementer"');
     expect([...harness.bridge.missingChannels]).toEqual([]);
   }, 60_000);
 });

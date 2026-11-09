@@ -1,6 +1,12 @@
+import {
+  isShellExperimentAvailable,
+  shellExecutionGuidance,
+} from "@/shared/shell_capability";
+import { isFreeProModel } from "@/lib/freeProModel";
+import { DEFAULT_ENABLE_SUGGESTED_PROMPTS } from "@/shared/settings_defaults";
 import { db } from "../../db";
-import { chats } from "../../db/schema";
-import { eq } from "drizzle-orm";
+import { chats, messages } from "../../db/schema";
+import { and, desc, eq, sql } from "drizzle-orm";
 import {
   constructSystemPrompt,
   readAiRules,
@@ -8,27 +14,49 @@ import {
 import { getThemePromptById } from "../utils/theme_utils";
 import {
   getSupabaseAvailableSystemPrompt,
+  SUPABASE_DISCONNECTED_SYSTEM_PROMPT,
   SUPABASE_NOT_AVAILABLE_SYSTEM_PROMPT,
 } from "../../prompts/supabase_prompt";
 import { buildNeonPromptForApp } from "../../neon_admin/neon_prompt_context";
+import { NEON_DISCONNECTED_SYSTEM_PROMPT } from "../../prompts/neon_prompt";
 import { getDyadAppPath } from "../../paths/paths";
 import { detectFrameworkType } from "../utils/framework_utils";
 import log from "electron-log";
-import { extractCodebase } from "../../utils/codebase";
 import {
   getSupabaseContext,
   getSupabaseClientCode,
 } from "../../supabase_admin/supabase_context";
 
 import { TokenCountParams, TokenCountResult } from "@/ipc/types";
-import { estimateTokens, getContextWindow } from "../utils/token_utils";
+import {
+  estimateTokens,
+  estimateTokensForLength,
+  getContextWindow,
+} from "../utils/token_utils";
+import { estimateAgentHistoryChars } from "../utils/chat_history_loader";
 import { createLoggedHandler } from "./safe_handle";
-import { validateChatContext } from "../utils/context_paths_utils";
 import { readSettings } from "@/main/settings";
+import {
+  normalizeModelSelection,
+  resolveDefaultModelSelection,
+} from "@/ipc/utils/model_effort";
 import { extractMentionedAppsCodebasesFromPrompt } from "../utils/mention_apps";
-import { isLocalAgentBackedMode, isTurboEditsV2Enabled } from "@/lib/schemas";
+import {
+  isDyadProEnabled,
+  isBasicAgentMode,
+  isLocalAgentBackedMode,
+  isTurboEditsV2Enabled,
+  hasSupabaseCredentialsForOrganization,
+} from "@/lib/schemas";
 import { DyadError, DyadErrorKind } from "@/errors/dyad_error";
 import { resolveChatModeForTurn } from "./chat_mode_resolution";
+import { isImplementerSubagentEnabled } from "@/lib/autoSidekick";
+import { estimateAgentToolTokens } from "@/pro/main/ipc/handlers/local_agent/tool_definitions";
+import { chatHasCompletedAppBlueprintQuestionnaire } from "@/pro/main/ipc/handlers/local_agent/local_agent_handler";
+import { getCachedMcpToolDefs } from "@/pro/main/ipc/handlers/local_agent/tools/mcp_type_defs";
+import { collectSuggestablePlugins } from "@/pro/main/ipc/handlers/local_agent/tools/suggest_plugin";
+import { resolveRootDatabasePromptState } from "@/shared/database_provider";
+import { getAppBlueprintForChat } from "./app_blueprint_handlers";
 
 const logger = log.scope("token_count_handlers");
 
@@ -40,12 +68,7 @@ export function registerTokenCountHandlers() {
     async (event, req: TokenCountParams): Promise<TokenCountResult> => {
       const chat = await db.query.chats.findFirst({
         where: eq(chats.id, req.chatId),
-        with: {
-          messages: {
-            orderBy: (messages, { asc }) => [asc(messages.createdAt)],
-          },
-          app: true,
-        },
+        with: { app: true },
       });
 
       if (!chat) {
@@ -55,52 +78,111 @@ export function registerTokenCountHandlers() {
         );
       }
 
-      // Prepare message history for token counting
-      const messageHistory = chat.messages
-        .map((message) => message.content)
-        .join("");
-      const messageHistoryTokens = estimateTokens(messageHistory);
-
       // Count input tokens
       const inputTokens = estimateTokens(req.input);
 
       const storedSettings = readSettings();
+      const selectedModel = chat.modelSelection
+        ? await normalizeModelSelection(chat.modelSelection)
+        : await resolveDefaultModelSelection(storedSettings);
       const { mode: selectedChatMode } = await resolveChatModeForTurn({
         storedChatMode: chat.chatMode,
-        settings: storedSettings,
+        settings: { ...storedSettings, selectedModel },
       });
       const settings = {
         ...storedSettings,
+        selectedModel,
         selectedChatMode,
       };
+      const willUseLocalAgentStream = isLocalAgentBackedMode(selectedChatMode);
+      // Estimated from stored sizes in SQLite: this runs whenever a chat is
+      // opened or finishes a turn, and materializing a large history here would
+      // cost as much main-process memory as sending it.
+      const messageHistoryTokens = willUseLocalAgentStream
+        ? estimateTokensForLength(await estimateAgentHistoryChars(chat.id))
+        : estimateTokensForLength(
+            (
+              await db
+                .select({
+                  length: sql<number>`coalesce(sum(length(${messages.content})), 0)`,
+                })
+                .from(messages)
+                .where(eq(messages.chatId, chat.id))
+            )[0].length,
+          );
 
       // Count system prompt tokens
       // Migration on read converts "agent" to "build", so no need to check for it here
       const themePrompt = await getThemePromptById(chat.app?.themeId ?? null);
       const frameworkType = detectFrameworkType(getDyadAppPath(chat.app.path));
+      const enableAppBlueprint =
+        settings.enableAppBlueprint === true && chat.app.needsAppBlueprint;
+      const appBlueprint = getAppBlueprintForChat(chat.id);
+      const hasAppBlueprint = Boolean(appBlueprint);
+      const planningQuestionnaireAvailable =
+        settings.agentToolConsents?.["planning_questionnaire"] !== "never";
+      const appBlueprintQuestionnaireCompleted =
+        await chatHasCompletedAppBlueprintQuestionnaire(chat.id);
       let systemPrompt = constructSystemPrompt({
         aiRules: await readAiRules(getDyadAppPath(chat.app.path)),
-        chatMode:
-          selectedChatMode === "local-agent" ? "build" : selectedChatMode,
+        chatMode: selectedChatMode === "ask" ? "local-agent" : selectedChatMode,
         enableTurboEditsV2: isTurboEditsV2Enabled(settings),
         themePrompt,
+        readOnly: selectedChatMode === "ask",
         frameworkType,
         hasSupabaseProject: !!chat.app?.supabaseProjectId,
+        implementerAvailable:
+          selectedChatMode === "local-agent" &&
+          isDyadProEnabled(settings) &&
+          isImplementerSubagentEnabled(settings),
+        testingEnabled: !!chat.app?.testingEnabled,
+        enableAppBlueprint,
+        hasAppBlueprint,
+        planningQuestionnaireAvailable,
+        appBlueprintQuestionnaireCompleted,
+        appBlueprint,
+        suggestedPromptsEnabled:
+          settings.enableSuggestedPrompts ?? DEFAULT_ENABLE_SUGGESTED_PROMPTS,
       });
       let supabaseContext = "";
+      const supabaseProviderToolsAvailable = Boolean(
+        chat.app.supabaseProjectId &&
+        hasSupabaseCredentialsForOrganization(
+          settings,
+          chat.app.supabaseOrganizationSlug,
+        ),
+      );
+      const neonCredentialsAvailable = Boolean(
+        chat.app.neonProjectId && settings.neon?.accessToken?.value,
+      );
+      const neonActiveBranchId =
+        chat.app.neonActiveBranchId ?? chat.app.neonDevelopmentBranchId;
+      const neonProviderToolsAvailable = Boolean(
+        neonCredentialsAvailable && neonActiveBranchId,
+      );
+      const rootDatabasePromptState = resolveRootDatabasePromptState({
+        hasSupabaseProject: Boolean(chat.app.supabaseProjectId),
+        supabaseCredentialsAvailable: supabaseProviderToolsAvailable,
+        hasNeonProject: Boolean(chat.app.neonProjectId),
+        neonCredentialsAvailable,
+      });
 
-      if (chat.app?.supabaseProjectId) {
+      if (rootDatabasePromptState === "supabase") {
         const supabaseClientCode = await getSupabaseClientCode({
-          projectId: chat.app.supabaseProjectId,
+          projectId: chat.app.supabaseProjectId!,
           organizationSlug: chat.app.supabaseOrganizationSlug ?? null,
         });
         systemPrompt +=
           "\n\n" + getSupabaseAvailableSystemPrompt(supabaseClientCode);
-        supabaseContext = await getSupabaseContext({
-          supabaseProjectId: chat.app.supabaseProjectId,
-          organizationSlug: chat.app.supabaseOrganizationSlug ?? null,
-        });
-      } else if (chat.app?.neonProjectId) {
+        if (!willUseLocalAgentStream) {
+          supabaseContext = await getSupabaseContext({
+            supabaseProjectId: chat.app.supabaseProjectId!,
+            organizationSlug: chat.app.supabaseOrganizationSlug ?? null,
+          });
+        }
+      } else if (rootDatabasePromptState === "supabase-disconnected") {
+        systemPrompt += "\n\n" + SUPABASE_DISCONNECTED_SYSTEM_PROMPT;
+      } else if (rootDatabasePromptState === "neon") {
         systemPrompt +=
           "\n\n" +
           (await buildNeonPromptForApp({
@@ -110,49 +192,80 @@ export function registerTokenCountHandlers() {
             neonDevelopmentBranchId: chat.app.neonDevelopmentBranchId,
             selectedChatMode,
           }));
-      } else {
+      } else if (rootDatabasePromptState === "neon-disconnected") {
+        systemPrompt += "\n\n" + NEON_DISCONNECTED_SYSTEM_PROMPT;
+      } else if (!willUseLocalAgentStream) {
         // Neon projects don't need Supabase (already handled above).
         systemPrompt += "\n\n" + SUPABASE_NOT_AVAILABLE_SYSTEM_PROMPT;
       }
 
-      const systemPromptTokens = estimateTokens(systemPrompt + supabaseContext);
-
-      // Extract codebase information if app is associated with the chat
-      let codebaseInfo = "";
-      let codebaseTokens = 0;
-
-      if (chat.app) {
-        const appPath = getDyadAppPath(chat.app.path);
-        const { formattedOutput, files } = await extractCodebase({
-          appPath,
-          chatContext: validateChatContext(chat.app.chatContext),
-        });
-        codebaseInfo = formattedOutput;
-        if (settings.enableDyadPro && settings.enableProSmartFilesContextMode) {
-          codebaseTokens = estimateTokens(
-            files
-              // It doesn't need to be the exact format but it's just to get a token estimate
-              .map(
-                (file) => `<dyad-file=${file.path}>${file.content}</dyad-file>`,
-              )
-              .join("\n\n"),
-          );
-        } else {
-          codebaseTokens = estimateTokens(codebaseInfo);
-        }
-        logger.log(
-          `Extracted codebase information from ${appPath}, tokens: ${codebaseTokens}`,
-        );
+      const isDyadPro = isDyadProEnabled(settings);
+      const freeModelMode = isFreeProModel(selectedModel);
+      const mcpToolDefs =
+        selectedChatMode === "local-agent" ? getCachedMcpToolDefs() : [];
+      // Cached only: an estimate must never wait on the catalog network
+      // fetch, and a failure here must not fail the whole count.
+      const suggestablePlugins =
+        selectedChatMode === "local-agent"
+          ? await collectSuggestablePlugins({
+              chatId: req.chatId,
+              cachedOnly: true,
+            }).catch((error: unknown) => {
+              logger.warn("Failed to read suggestable MCP servers", error);
+              return [];
+            })
+          : [];
+      if (
+        selectedChatMode === "local-agent" &&
+        isShellExperimentAvailable({ settings, isDyadPro, freeModelMode })
+      ) {
+        systemPrompt += `\n\n<shell_execution>\n${shellExecutionGuidance(process.platform, getDyadAppPath(chat.app.path))}\n</shell_execution>`;
       }
+      const toolDefinitionTokens = await estimateAgentToolTokens({
+        appPath: getDyadAppPath(chat.app.path),
+        toolProfile: selectedChatMode === "build" ? "build" : "agent",
+        readOnly: selectedChatMode === "ask",
+        planModeOnly: selectedChatMode === "plan",
+        basicAgentMode:
+          selectedChatMode === "local-agent" && isBasicAgentMode(settings),
+        enableAppBlueprint,
+        freeModelMode,
+        isDyadPro,
+        frameworkType,
+        supabaseProjectId: chat.app.supabaseProjectId,
+        supabaseProviderToolsAvailable,
+        neonProjectId: chat.app.neonProjectId,
+        neonActiveBranchId,
+        neonProviderToolsAvailable,
+        testingEnabled: !!chat.app.testingEnabled,
+        canUseExplorerSubagent:
+          selectedChatMode !== "build" &&
+          isDyadPro &&
+          settings.enableExplorerSubagent !== false,
+        canUseImplementerSubagent:
+          selectedChatMode === "local-agent" &&
+          isDyadPro &&
+          isImplementerSubagentEnabled(settings),
+        mcpToolDefs,
+        suggestablePlugins,
+        canUseAdvancedSubagentTools:
+          selectedChatMode === "local-agent" &&
+          isDyadPro &&
+          settings.enableAdvancedSubagents === true,
+        runTypeScriptForWholeProject:
+          settings.runTypeScriptForWholeProject === true,
+      });
+      const systemPromptTokens =
+        estimateTokens(systemPrompt + supabaseContext) + toolDefinitionTokens;
 
-      // Agent/ask/plan modes reach referenced apps via tool calls rather than
+      // Tool-backed modes inspect the current app on demand, so they do not
+      // inject the full codebase into the initial request.
+      const codebaseTokens = 0;
+
+      // Tool-backed modes reach referenced apps via tool calls rather than
       // injecting full codebases into the prompt, so mentioned apps contribute
       // ~0 tokens upfront. Match the extraction behavior in chat_stream_handlers
       // so the UI estimate tracks what's actually sent.
-      const willUseLocalAgentStream = isLocalAgentBackedMode(
-        settings.selectedChatMode,
-      );
-
       let mentionedAppsTokens = 0;
       if (!willUseLocalAgentStream) {
         const mentionedAppsCodebases =
@@ -171,7 +284,7 @@ export function registerTokenCountHandlers() {
 
           mentionedAppsTokens = estimateTokens(mentionedAppsContent);
 
-          logger.log(
+          logger.debug(
             `Extracted ${mentionedAppsCodebases.length} mentioned app codebases, tokens: ${mentionedAppsTokens}`,
           );
         }
@@ -186,9 +299,14 @@ export function registerTokenCountHandlers() {
         mentionedAppsTokens;
 
       // Find the last assistant message since totalTokens is only set on assistant messages
-      const lastAssistantMessage = [...chat.messages]
-        .reverse()
-        .find((m) => m.role === "assistant");
+      const [lastAssistantMessage] = await db
+        .select({ maxTokensUsed: messages.maxTokensUsed })
+        .from(messages)
+        .where(
+          and(eq(messages.chatId, chat.id), eq(messages.role, "assistant")),
+        )
+        .orderBy(desc(messages.createdAt), desc(messages.id))
+        .limit(1);
       const actualMaxTokens = lastAssistantMessage?.maxTokensUsed ?? null;
 
       return {
@@ -199,7 +317,7 @@ export function registerTokenCountHandlers() {
         mentionedAppsTokens,
         inputTokens,
         systemPromptTokens,
-        contextWindow: await getContextWindow(),
+        contextWindow: await getContextWindow(selectedModel),
       };
     },
   );

@@ -10,17 +10,14 @@ import {
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import type { ConsoleEntry } from "@/ipc/types";
-import {
-  currentConsoleEntriesAtom,
-  currentPreviewAppExitAtom,
-  currentPreviewRunStartedAtAtom,
-  type PreviewAppExit,
-} from "@/atoms/previewRuntimeAtoms";
+import type { AppExit } from "@/app_run/selectors";
 import { selectedAppIdAtom } from "@/atoms/appAtoms";
 import { selectedChatIdAtom } from "@/atoms/chatAtoms";
-import { useRunApp } from "@/hooks/useRunApp";
+import { runAppLifecycleInBackground, useRunApp } from "@/hooks/useRunApp";
+import { useAppExit, useAppRunState } from "@/hooks/useAppRun";
 import { useStreamChat } from "@/hooks/useStreamChat";
 import { cn } from "@/lib/utils";
+import { useConsoleEntries } from "@/preview_console/hooks";
 
 const STARTUP_LOG_MESSAGES = new Set([
   "Connecting to app...",
@@ -73,7 +70,7 @@ export function getPreviewLoadingSessionStartedAt({
   consoleEntries,
   runStartedAt,
 }: {
-  consoleEntries: ConsoleEntry[];
+  consoleEntries: readonly ConsoleEntry[];
   runStartedAt: number;
 }) {
   for (let i = consoleEntries.length - 1; i >= 0; i--) {
@@ -107,7 +104,7 @@ export function didPreviewCommandFail({
   sessionStartedAt,
   currentAppId,
 }: {
-  previewAppExit: PreviewAppExit | null;
+  previewAppExit: AppExit | null;
   sessionStartedAt: number;
   currentAppId: number | null;
 }) {
@@ -127,7 +124,7 @@ export function shouldShowPreviewErrorBanner({
   currentAppId,
 }: {
   errorMessages: string[];
-  previewAppExit: PreviewAppExit | null;
+  previewAppExit: AppExit | null;
   sessionStartedAt: number;
   currentAppId: number | null;
 }) {
@@ -157,10 +154,11 @@ export function PreviewLoadingScreen({
   hasStartupError,
 }: PreviewLoadingScreenProps) {
   const { t } = useTranslation("home");
-  const consoleEntries = useAtomValue(currentConsoleEntriesAtom);
-  const previewAppExit = useAtomValue(currentPreviewAppExitAtom);
-  const previewRunStartedAt = useAtomValue(currentPreviewRunStartedAtAtom);
   const selectedAppId = useAtomValue(selectedAppIdAtom);
+  const consoleEntries = useConsoleEntries(selectedAppId);
+  const runState = useAppRunState(selectedAppId);
+  const previewAppExit = useAppExit(selectedAppId);
+  const previewRunStartedAt = runState.startedAt;
   const selectedChatId = useAtomValue(selectedChatIdAtom);
   const { streamMessage, isStreaming } = useStreamChat();
   const { restartApp } = useRunApp();
@@ -254,7 +252,10 @@ export function PreviewLoadingScreen({
   };
 
   const handleRebuild = () => {
-    void restartApp({ removeNodeModules: true });
+    runAppLifecycleInBackground(
+      "rebuild",
+      restartApp({ removeNodeModules: true }),
+    );
   };
 
   const handleFixAllErrors = () => {

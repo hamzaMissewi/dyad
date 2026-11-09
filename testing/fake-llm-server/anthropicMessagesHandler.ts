@@ -43,10 +43,14 @@ function isToolResultMessage(message: any): boolean {
   );
 }
 
+function isToolResultOnlyMessage(message: any): boolean {
+  return isToolResultMessage(message) && getTextContent(message).trim() === "";
+}
+
 function getLastRealUserMessage(messages: any[]): any {
   for (let index = messages.length - 1; index >= 0; index--) {
     const message = messages[index];
-    if (message?.role === "user" && !isToolResultMessage(message)) {
+    if (message?.role === "user" && !isToolResultOnlyMessage(message)) {
       return message;
     }
   }
@@ -73,7 +77,7 @@ function getLatestMatchingUserText(
 ): string | undefined {
   for (let index = messages.length - 1; index >= 0; index--) {
     const message = messages[index];
-    if (message?.role !== "user" || isToolResultMessage(message)) {
+    if (message?.role !== "user" || isToolResultOnlyMessage(message)) {
       continue;
     }
     const text = getTextContent(message);
@@ -96,7 +100,7 @@ function isSyntheticContinuationUserText(text: string): boolean {
 function findOriginalLocalAgentFixture(messages: any[]): string | null {
   for (let index = messages.length - 1; index >= 0; index--) {
     const message = messages[index];
-    if (message?.role !== "user" || isToolResultMessage(message)) {
+    if (message?.role !== "user" || isToolResultOnlyMessage(message)) {
       continue;
     }
     const textContent = getTextContent(message);
@@ -285,7 +289,7 @@ export const createAnthropicMessagesHandler =
       : undefined;
     if (
       !localAgentFixture &&
-      (isToolResultMessage(lastMessage) ||
+      (isToolResultOnlyMessage(lastMessage) ||
         isSyntheticContinuationUserText(userTextContent))
     ) {
       localAgentFixture = findOriginalLocalAgentFixture(userMessages);
@@ -314,10 +318,12 @@ export const createAnthropicMessagesHandler =
     }
     if (userTextContent.startsWith("/security-review")) {
       messageContent =
-        fs.readFileSync(
-          path.join(resolveFixturesDir(), "security-review", "findings.md"),
-          "utf-8",
-        ) +
+        fs
+          .readFileSync(
+            path.join(resolveFixturesDir(), "security-review", "findings.md"),
+            "utf-8",
+          )
+          .replace(/\r\n/g, "\n") +
         "\n\n" +
         generateDump(req);
     }

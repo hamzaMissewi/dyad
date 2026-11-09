@@ -1,48 +1,30 @@
 import { test, Timeout } from "./helpers/test_helper";
-import { expect, type Page } from "@playwright/test";
+import { expect } from "@playwright/test";
 import fs from "fs";
 import path from "path";
-
-async function getActiveEditorModelPath(page: Page): Promise<string | null> {
-  return page.evaluate(() => {
-    // Monaco attaches itself to the window in the packaged app.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const monaco = (window as any).monaco;
-    if (!monaco) {
-      return null;
-    }
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const editor = monaco.editor.getEditors().find((candidate: any) => {
-      return candidate.getModel();
-    });
-    const model = editor?.getModel();
-    return model?.uri?.path ?? null;
-  });
-}
-
-async function selectFileAndWaitForEditor(page: Page, fileName: string) {
-  await page.getByText(fileName, { exact: true }).click();
-  await expect(async () => {
-    const modelPath = await getActiveEditorModelPath(page);
-    expect(modelPath).toContain(fileName);
-  }).toPass({ timeout: Timeout.MEDIUM });
-}
-
-async function replaceEditorContent(page: Page, content: string) {
-  const editorContent = page.getByRole("textbox", {
-    name: "Editor content",
-  });
-  await expect(editorContent).toBeVisible();
-  await editorContent.click({ force: true });
-  // Small delay to let Monaco settle after click before selecting all
-  await page.waitForTimeout(100);
-  await page.keyboard.press("ControlOrMeta+a");
-  await page.keyboard.type(content);
-}
+import {
+  replaceEditorContent,
+  selectFileAndWaitForEditor,
+} from "./helpers/monaco_editor";
 
 function normalizeLineEndings(value: string) {
-  return value.replace(/\r\n/g, "\n");
+  return value.replace(/\r\n?/g, "\n");
+}
+
+async function expectFileContent(
+  appPath: string,
+  relativePath: string,
+  expectedContent: string,
+) {
+  await expect
+    .poll(
+      () =>
+        normalizeLineEndings(
+          fs.readFileSync(path.join(appPath, relativePath), "utf8"),
+        ),
+      { timeout: Timeout.MEDIUM },
+    )
+    .toEqual(normalizeLineEndings(expectedContent));
 }
 
 test("edit code", async ({ po }) => {
@@ -60,17 +42,23 @@ test("edit code", async ({ po }) => {
     timeout: Timeout.LONG,
   });
 
-  await selectFileAndWaitForEditor(po.page, "made-with-dyad.tsx");
+  await selectFileAndWaitForEditor(
+    po.page,
+    "made-with-dyad.tsx",
+    editedFilePath,
+  );
   await replaceEditorContent(po.page, "export const MadeWithDyad = ;");
 
   // Save the file
   await po.page.getByTestId("save-file-button").click();
 
-  // Expect toast to be visible
-  await expect(po.page.getByText("File saved")).toBeVisible();
-
   // We are NOT snapshotting the app files because the Monaco UI edit
   // is not deterministic.
+  await expectFileContent(
+    appPath,
+    editedFilePath,
+    "export const MadeWithDyad = ;",
+  );
   const editedFile = fs.readFileSync(
     path.join(appPath, editedFilePath),
     "utf8",
@@ -100,38 +88,25 @@ test("edit code edits the right file during rapid switches", async ({ po }) => {
     timeout: Timeout.LONG,
   });
 
-  await selectFileAndWaitForEditor(po.page, "made-with-dyad.tsx");
+  await selectFileAndWaitForEditor(
+    po.page,
+    "made-with-dyad.tsx",
+    firstOpenedFilePath,
+  );
   for (const round of [1, 2, 3]) {
     firstFileEdit = `export const MadeWithDyad = "round-${round}";\n`;
     updatedRobotsFile = `User-agent: *\nDisallow: /round-${round}\n`;
 
     await replaceEditorContent(po.page, firstFileEdit);
-    // Brief pause between file switches to let Monaco persist changes
-    await po.page.waitForTimeout(200);
-    await selectFileAndWaitForEditor(po.page, "robots.txt");
+    await selectFileAndWaitForEditor(po.page, "robots.txt", robotsFilePath);
     await replaceEditorContent(po.page, updatedRobotsFile);
-    await po.page.waitForTimeout(200);
-    await selectFileAndWaitForEditor(po.page, "made-with-dyad.tsx");
+    await selectFileAndWaitForEditor(
+      po.page,
+      "made-with-dyad.tsx",
+      firstOpenedFilePath,
+    );
   }
 
-  await expect
-    .poll(
-      () =>
-        normalizeLineEndings(
-          fs.readFileSync(path.join(appPath, firstOpenedFilePath), "utf8"),
-        ),
-      { timeout: Timeout.MEDIUM },
-    )
-    .toEqual(firstFileEdit);
-  await expect
-    .poll(
-      () =>
-        normalizeLineEndings(
-          fs.readFileSync(path.join(appPath, robotsFilePath), "utf8"),
-        ),
-      {
-        timeout: Timeout.MEDIUM,
-      },
-    )
-    .toEqual(updatedRobotsFile);
+  await expectFileContent(appPath, firstOpenedFilePath, firstFileEdit);
+  await expectFileContent(appPath, robotsFilePath, updatedRobotsFile);
 });

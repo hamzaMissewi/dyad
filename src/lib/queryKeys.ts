@@ -15,14 +15,29 @@
  */
 
 export const queryKeys = {
+  subagents: {
+    all: ["subagents"] as const,
+    byChat: ({ chatId }: { chatId: number }) => ["subagents", chatId] as const,
+    messages: ({ chatId, threadId }: { chatId: number; threadId: string }) =>
+      ["subagents", chatId, "messages", threadId] as const,
+    activities: ({ chatId, threadId }: { chatId: number; threadId: string }) =>
+      ["subagents", chatId, "activities", threadId] as const,
+  },
+
   // ─────────────────────────────────────────────────────────────────────────────
   // System
   // ─────────────────────────────────────────────────────────────────────────────
   system: {
+    resourceUsage: ["system", "resourceUsage"] as const,
     all: ["system"] as const,
     appVersion: ["system", "appVersion"] as const,
     nodejsStatus: ["system", "nodejsStatus"] as const,
+    nativeTheme: ["system", "nativeTheme"] as const,
     platform: ["system", "platform"] as const,
+    claudeCodeStatus: ["system", "claudeCodeStatus"] as const,
+    claudeCodeModels: ["system", "claudeCodeModels"] as const,
+    claudeCodeUsage: ["system", "claudeCodeUsage"] as const,
+    subscriptionStatus: ["system", "subscriptionStatus"] as const,
     initialLoadTelemetryContext: [
       "system",
       "initialLoadTelemetryContext",
@@ -33,6 +48,7 @@ export const queryKeys = {
   // Settings
   // ─────────────────────────────────────────────────────────────────────────────
   settings: {
+    codexSubscription: ["settings", "codex-subscription"] as const,
     all: ["settings"] as const,
     user: ["settings", "user"] as const,
     envVars: ["settings", "envVars"] as const,
@@ -107,18 +123,33 @@ export const queryKeys = {
       appId: number | null;
       versionId: string | null;
     }) => ["versions", appId, "changes", versionId] as const,
+    restoreToMessageMutation: ({ appId }: { appId: number | null }) =>
+      ["restoreToMessageVersion", appId] as const,
+    revertMutation: ({ appId }: { appId: number | null }) =>
+      ["revertVersion", appId] as const,
   },
 
   branches: {
-    all: ["currentBranch"] as const,
+    all: ["branches"] as const,
+    byApp: ({ appId }: { appId: number | null }) =>
+      ["branches", appId] as const,
     current: ({ appId }: { appId: number | null }) =>
-      ["currentBranch", appId] as const,
+      ["branches", appId, "current"] as const,
+    inventory: ({ appId }: { appId: number }) =>
+      ["branches", appId, "inventory"] as const,
   },
 
   uncommittedFiles: {
     all: ["uncommittedFiles"] as const,
     byApp: ({ appId }: { appId: number | null }) =>
       ["uncommittedFiles", appId] as const,
+    diff: ({
+      appId,
+      filePath,
+    }: {
+      appId: number | null;
+      filePath: string | null;
+    }) => ["uncommittedFiles", appId, "diff", filePath] as const,
   },
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -128,6 +159,29 @@ export const queryKeys = {
     all: ["problems"] as const,
     byApp: ({ appId }: { appId: number | null }) =>
       ["problems", appId] as const,
+  },
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Tests
+  // ─────────────────────────────────────────────────────────────────────────────
+  tests: {
+    all: ["tests"] as const,
+    activeRun: ({ appId }: { appId: number | null }) =>
+      ["tests", appId, "active-run"] as const,
+    activeRuns: ({ appId }: { appId: number | null }) =>
+      ["tests", appId, "active-runs"] as const,
+    /** Prefix of every app's `run` mutation key. */
+    runs: ["tests", "run"] as const,
+    run: ({ appId }: { appId: number | null }) =>
+      ["tests", "run", appId] as const,
+    queue: ({ appId }: { appId: number | null }) =>
+      ["tests", appId, "queue"] as const,
+    recentRuns: ({ appId }: { appId: number | null }) =>
+      ["tests", appId, "recent-runs"] as const,
+    list: ({ appId }: { appId: number | null }) =>
+      ["tests", "list", appId] as const,
+    legacy: ({ appId }: { appId: number | null }) =>
+      ["tests", "legacy", appId] as const,
   },
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -174,7 +228,16 @@ export const queryKeys = {
   // App Name Check
   // ─────────────────────────────────────────────────────────────────────────────
   appName: {
+    // Prefix roots used only for invalidation: the check and folder-preview
+    // hooks both disable every React Query refetch trigger, so a lifecycle
+    // change must drop their cached entries entirely (see
+    // `RendererQueryInvalidationConsumer`). The per-name keys below are what
+    // the hooks read from; these roots are the prefixes that reach them all.
+    checkAll: ["checkAppName"] as const,
+    folderPreviewAll: ["appFolderPreview"] as const,
     check: ({ name }: { name: string }) => ["checkAppName", name] as const,
+    folderPreview: ({ name, appId }: { name: string; appId?: number }) =>
+      ["appFolderPreview", name, appId ?? null] as const,
   },
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -281,6 +344,57 @@ export const queryKeys = {
       ["vercel", "syncPreview", appId] as const,
   },
 
+  cloudflare: {
+    all: ["cloudflare"] as const,
+    accounts: ["cloudflare", "accounts"] as const,
+    workers: ({ accountId }: { accountId: string | null }) =>
+      ["cloudflare", "workers", accountId] as const,
+    appStatus: ({ appId }: { appId: number }) =>
+      ["cloudflare", "appStatus", appId] as const,
+    repoAccess: ({ appId, accountId }: { appId: number; accountId: string }) =>
+      ["cloudflare", "repoAccess", appId, accountId] as const,
+    deploymentStatus: ({
+      appId,
+      rootDirectory,
+    }: {
+      appId: number;
+      rootDirectory: string;
+    }) => ["cloudflare", "deploymentStatus", appId, rootDirectory] as const,
+  },
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Coolify Deployments
+  // ─────────────────────────────────────────────────────────────────────────────
+  coolify: {
+    all: ["coolify"] as const,
+    status: ({ appId }: { appId: number }) =>
+      ["coolify", "status", appId] as const,
+    /**
+     * Keyed by instance and token: servers and projects belong to both, and
+     * two tokens on one instance can see different teams.
+     *
+     * The token comes from the status query, which lags the write, so in
+     * principle a list fetched with one token can land under another's key.
+     * Changing a token requires signing out first, which disables these
+     * queries, so nothing reaches that state through the form today.
+     */
+    discovery: (instanceUrl: string | null, tokenId: string | null) =>
+      [
+        "coolify",
+        "discovery",
+        instanceUrl ?? "none",
+        tokenId ?? "none",
+      ] as const,
+    /** What the main process is doing with a server right now. */
+    setup: ["coolify", "setup"] as const,
+    /** The public half of the key Dyad puts on servers it sets up. */
+    serverKey: ["coolify", "serverKey"] as const,
+    /** What Dyad knows about signing in to the server it set up. */
+    credentials: ["coolify", "credentials"] as const,
+    /** Every instance's list, for invalidating after a token change. */
+    discoveryAll: ["coolify", "discovery"] as const,
+  },
+
   // ─────────────────────────────────────────────────────────────────────────────
   // App Upgrades
   // ─────────────────────────────────────────────────────────────────────────────
@@ -303,6 +417,7 @@ export const queryKeys = {
         ["mcp", "tools-by-server", serverIds] as const,
     },
     consents: ["mcp", "consents"] as const,
+    catalog: ["mcp", "catalog"] as const,
   },
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -312,6 +427,23 @@ export const queryKeys = {
     all: ["supabase"] as const,
     organizations: ["supabase", "organizations"] as const,
     projects: ["supabase", "projects"] as const,
+    redeploy: ({ appId }: { appId: number }) =>
+      ["supabase", "redeploy", appId] as const,
+    /**
+     * Scoped by project too: the answer is about one app/project pairing, so
+     * repointing an app at another project (or branch) must not reuse the old
+     * project's verdict. Invalidate with `legacyAppKeyForApp` to clear every
+     * project's entry for an app.
+     */
+    legacyAppKey: ({
+      appId,
+      projectId,
+    }: {
+      appId: number | null;
+      projectId: string | null;
+    }) => ["supabase", "legacyAppKey", appId, projectId] as const,
+    legacyAppKeyForApp: ({ appId }: { appId: number | null }) =>
+      ["supabase", "legacyAppKey", appId] as const,
     branches: ({
       projectId,
       organizationSlug,
@@ -336,6 +468,27 @@ export const queryKeys = {
   github: {
     all: ["github"] as const,
     repos: ["github", "repos"] as const,
+    collaborators: ({
+      appId,
+      owner,
+      repo,
+    }: {
+      appId: number;
+      owner: string;
+      repo: string;
+    }) => ["github", "collaborators", appId, owner, repo] as const,
+  },
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // GitLab
+  // ─────────────────────────────────────────────────────────────────────────────
+  gitlab: {
+    all: ["gitlab"] as const,
+    status: ["gitlab", "status"] as const,
+    namespaces: ["gitlab", "namespaces"] as const,
+    projects: ["gitlab", "projects"] as const,
+    branches: ({ projectId }: { projectId: number }) =>
+      ["gitlab", "branches", projectId] as const,
   },
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -367,6 +520,8 @@ export const queryKeys = {
       appId: number | null;
       branchType: "production" | "development";
     }) => ["neon", "branch-env-vars", appId, branchType] as const,
+    developmentBranchStatus: ({ appId }: { appId: number | null }) =>
+      ["neon", "development-branch-status", appId] as const,
   },
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -398,6 +553,7 @@ export type QueryKeyOf<T> = T extends readonly unknown[]
 
 /** All possible query keys (useful for typing queryClient operations) */
 export type AppQueryKey =
+  | QueryKeyOf<(typeof queryKeys.subagents)[keyof typeof queryKeys.subagents]>
   | QueryKeyOf<(typeof queryKeys.system)[keyof typeof queryKeys.system]>
   | QueryKeyOf<(typeof queryKeys.settings)[keyof typeof queryKeys.settings]>
   | QueryKeyOf<(typeof queryKeys.apps)[keyof typeof queryKeys.apps]>
@@ -413,6 +569,7 @@ export type AppQueryKey =
       (typeof queryKeys.uncommittedFiles)[keyof typeof queryKeys.uncommittedFiles]
     >
   | QueryKeyOf<(typeof queryKeys.problems)[keyof typeof queryKeys.problems]>
+  | QueryKeyOf<(typeof queryKeys.tests)[keyof typeof queryKeys.tests]>
   | QueryKeyOf<
       (typeof queryKeys.contextPaths)[keyof typeof queryKeys.contextPaths]
     >
@@ -453,5 +610,6 @@ export type AppQueryKey =
   | QueryKeyOf<(typeof queryKeys.github)[keyof typeof queryKeys.github]>
   | QueryKeyOf<(typeof queryKeys.migration)[keyof typeof queryKeys.migration]>
   | QueryKeyOf<(typeof queryKeys.neon)[keyof typeof queryKeys.neon]>
+  | QueryKeyOf<(typeof queryKeys.coolify)[keyof typeof queryKeys.coolify]>
   | QueryKeyOf<(typeof queryKeys.appEnvVars)[keyof typeof queryKeys.appEnvVars]>
   | QueryKeyOf<(typeof queryKeys.media)[keyof typeof queryKeys.media]>;

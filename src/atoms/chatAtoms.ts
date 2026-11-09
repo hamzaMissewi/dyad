@@ -1,47 +1,28 @@
 import type {
+  Chat,
   FileAttachment,
   Message,
   AgentTodo,
   ComponentSelection,
 } from "@/ipc/types";
 import type { ListedApp } from "@/ipc/types/app";
-import type { SqlConsentMetadata } from "@/shared/sqlConsentMetadata";
 import type { Getter, Setter } from "jotai";
 import { atom } from "jotai";
 import { atomWithStorage } from "jotai/utils";
+import {
+  chatAnnotationsAtom,
+  clearChatAnnotations,
+} from "@/atoms/chatAnnotationAtoms";
 import { planAcceptInNewChatByChatIdAtom } from "@/atoms/planAtoms";
-
-// Chat completion events - used to notify when a stream has completed
-export type ChatCompletionEvent = {
-  sequence: number;
-  chatId: number;
-  title?: string;
-};
-
-let nextChatCompletionSequence = 0;
-
-//  atom that holds the latest chat completion event
-export const chatCompletionEventAtom = atom<ChatCompletionEvent | null>(null);
-
-// Atom to publish new chat completion events
-export const publishChatCompletionEventAtom = atom(
-  null,
-  (_get, set, payload: Omit<ChatCompletionEvent, "sequence">) => {
-    set(chatCompletionEventAtom, {
-      sequence: ++nextChatCompletionSequence,
-      ...payload,
-    });
-  },
-);
+import { dismissedSuggestedPromptsByChatIdAtom } from "@/atoms/suggestedPromptsAtoms";
+import { createChatTabSessionStorage } from "@/window_infrastructure/chat_tab_session_storage";
 
 // Per-chat atoms implemented with maps keyed by chatId
 export const chatMessagesByIdAtom = atom<Map<number, Message[]>>(new Map());
-export const chatErrorByIdAtom = atom<Map<number, string | null>>(new Map());
 
 // Atom to hold the currently selected chat ID
 export const selectedChatIdAtom = atom<number | null>(null);
 
-export const isStreamingByIdAtom = atom<Map<number, boolean>>(new Map());
 export const chatInputValuesByIdAtom = atom<Map<number, string>>(new Map());
 export const chatInputValueAtom = atom(
   (get) => {
@@ -66,9 +47,6 @@ export const chatInputValueAtom = atom(
 export const homeChatInputValueAtom = atom<string>("");
 homeChatInputValueAtom.debugLabel = "homeChatInputValueAtom";
 
-export const pendingFirstPromptAtom = atom<boolean>(false);
-pendingFirstPromptAtom.debugLabel = "pendingFirstPromptAtom";
-
 export const homeSelectedAppAtom = atom<ListedApp | null>(null);
 homeSelectedAppAtom.debugLabel = "homeSelectedAppAtom";
 
@@ -78,9 +56,9 @@ homeSelectedAppAtom.debugLabel = "homeSelectedAppAtom";
 export const hasManuallySelectedChatModeAtom = atom<boolean>(false);
 hasManuallySelectedChatModeAtom.debugLabel = "hasManuallySelectedChatModeAtom";
 
-// Used for scrolling to the bottom of the chat messages (per chat)
-export const chatStreamCountByIdAtom = atom<Map<number, number>>(new Map());
-export const recentStreamChatIdsAtom = atom<Set<number>>(new Set<number>());
+export const scrollToBottomRequestedChatIdsAtom = atom<Set<number>>(
+  new Set<number>(),
+);
 export const recentViewedChatIdsAtom = atom<number[]>([]);
 // Track explicitly closed tabs - these should not reappear in the tab bar
 export const closedChatIdsAtom = atom<Set<number>>(new Set<number>());
@@ -139,12 +117,24 @@ function sessionsHaveSameShape(
   );
 }
 
+const chatTabSessionStorage = createChatTabSessionStorage(() =>
+  typeof window === "undefined" ? undefined : window.localStorage,
+);
+
 export const chatTabSessionStorageAtom = atomWithStorage<ChatTabSession>(
   "chat-tab-session",
   EMPTY_CHAT_TAB_SESSION,
-  undefined,
+  chatTabSessionStorage,
   { getOnInit: true },
 );
+
+export const initializeChatTabSessionStorageAtom = atom(null, (_get, set) => {
+  const configuredSession = chatTabSessionStorage.getItem(
+    "chat-tab-session",
+    EMPTY_CHAT_TAB_SESSION,
+  );
+  set(chatTabSessionStorageAtom, configuredSession);
+});
 
 // When enabled, tabs are kept grouped by app on every render (a live layout),
 // so newly opened chats automatically slot into their app's group. Turned off
@@ -169,7 +159,11 @@ export const closedTabHistoryAtom = atom<ClosedTabRecord[]>([]);
 const MAX_CLOSED_TAB_HISTORY = 10;
 const MAX_RECENT_VIEWED_CHAT_IDS = 100;
 
-function dedupeValidChatIds(chatIds: number[], validChatIds: Set<number>) {
+function dedupeValidChatIds(
+  chatIds: number[],
+  validChatIds: Set<number>,
+  limit = MAX_RECENT_VIEWED_CHAT_IDS,
+) {
   const deduped: number[] = [];
   const seen = new Set<number>();
 
@@ -179,7 +173,7 @@ function dedupeValidChatIds(chatIds: number[], validChatIds: Set<number>) {
     }
     seen.add(chatId);
     deduped.push(chatId);
-    if (deduped.length >= MAX_RECENT_VIEWED_CHAT_IDS) {
+    if (deduped.length >= limit) {
       break;
     }
   }
@@ -194,16 +188,67 @@ export const hydrateChatTabSessionAtom = atom(
     const session = isChatTabSession(storedSession)
       ? storedSession
       : EMPTY_CHAT_TAB_SESSION;
-    const openChatIds = dedupeValidChatIds(session.openChatIds, validChatIds);
+    const currentSelectedChatId = get(selectedChatIdAtom);
+    const selectedChatIdOpenedBeforeHydration =
+      currentSelectedChatId !== null && validChatIds.has(currentSelectedChatId)
+        ? currentSelectedChatId
+        : null;
+    const currentOpenChatIds = dedupeValidChatIds(
+      [
+        ...get(recentViewedChatIdsAtom),
+        ...get(sessionOpenedChatIdsAtom),
+        ...(selectedChatIdOpenedBeforeHydration === null
+          ? []
+          : [selectedChatIdOpenedBeforeHydration]),
+      ],
+      validChatIds,
+    );
+    if (
+      selectedChatIdOpenedBeforeHydration !== null &&
+      !currentOpenChatIds.includes(selectedChatIdOpenedBeforeHydration)
+    ) {
+      currentOpenChatIds.pop();
+      currentOpenChatIds.push(selectedChatIdOpenedBeforeHydration);
+    }
+    const currentOpenChatIdSet = new Set(currentOpenChatIds);
+    const openChatIds = dedupeValidChatIds(
+      [...session.openChatIds, ...currentOpenChatIds],
+      validChatIds,
+      Number.POSITIVE_INFINITY,
+    );
+    // Stored order remains first, but live tabs have priority at the cap:
+    // evict stored-only tail entries before dropping anything opened during
+    // this startup window.
+    for (
+      let index = openChatIds.length - 1;
+      openChatIds.length > MAX_RECENT_VIEWED_CHAT_IDS && index >= 0;
+      index -= 1
+    ) {
+      if (!currentOpenChatIdSet.has(openChatIds[index])) {
+        openChatIds.splice(index, 1);
+      }
+    }
+    while (openChatIds.length > MAX_RECENT_VIEWED_CHAT_IDS) {
+      const removableIndex = openChatIds.findIndex(
+        (chatId) => chatId !== selectedChatIdOpenedBeforeHydration,
+      );
+      if (removableIndex < 0) break;
+      openChatIds.splice(removableIndex, 1);
+    }
+    const openChatIdSet = new Set(openChatIds);
     const closedChatIds = dedupeValidChatIds(
-      session.closedChatIds,
+      [...session.closedChatIds, ...get(closedChatIdsAtom)].filter(
+        (chatId) =>
+          !openChatIdSet.has(chatId) && !currentOpenChatIdSet.has(chatId),
+      ),
       validChatIds,
     );
     const selectedChatId =
-      session.selectedChatId !== null &&
+      selectedChatIdOpenedBeforeHydration ??
+      (session.selectedChatId !== null &&
       openChatIds.includes(session.selectedChatId)
         ? session.selectedChatId
-        : null;
+        : null);
 
     set(recentViewedChatIdsAtom, openChatIds);
     set(sessionOpenedChatIdsAtom, new Set(openChatIds));
@@ -357,23 +402,20 @@ export const pushRecentViewedChatIdAtom = atom(
     addToSessionSet(get, set, chatId);
   },
 );
-export const removeRecentViewedChatIdAtom = atom(
+export const removeTransferredChatTabAtom = atom(
   null,
-  (get, set, record: ClosedTabRecord) => {
-    const { chatId } = record;
+  (get, set, chatId: number) => {
     set(
       recentViewedChatIdsAtom,
       get(recentViewedChatIdsAtom).filter((id) => id !== chatId),
     );
-    // Add to closed set so it doesn't reappear
-    const closedIds = get(closedChatIdsAtom);
-    const newClosedIds = new Set(closedIds);
-    newClosedIds.add(chatId);
-    set(closedChatIdsAtom, newClosedIds);
-    // Also remove from session tracking (consistent with closeMultipleTabsAtom)
     removeFromSessionSet(get, set, [chatId]);
-
-    pushClosedTabHistory(get, set, [record]);
+    const inputs = get(chatInputValuesByIdAtom);
+    if (inputs.has(chatId)) {
+      const next = new Map(inputs);
+      next.delete(chatId);
+      set(chatInputValuesByIdAtom, next);
+    }
   },
 );
 // Prune closed chat IDs that no longer exist in the chats list
@@ -471,6 +513,12 @@ export const removeChatIdFromAllTrackingAtom = atom(
     // Remove from closed-tab history
     removeFromClosedTabHistory(get, set, chatId);
     // Clear per-chat input
+    const attachmentDrafts = get(chatAttachmentsByIdAtom);
+    if (attachmentDrafts.has(chatId)) {
+      const next = new Map(attachmentDrafts);
+      next.delete(chatId);
+      set(chatAttachmentsByIdAtom, next);
+    }
     const inputs = get(chatInputValuesByIdAtom);
     if (inputs.has(chatId)) {
       const next = new Map(inputs);
@@ -484,37 +532,31 @@ export const removeChatIdFromAllTrackingAtom = atom(
       next.delete(chatId);
       set(planAcceptInNewChatByChatIdAtom, next);
     }
+    const dismissedSuggestions = get(dismissedSuggestedPromptsByChatIdAtom);
+    if (dismissedSuggestions.has(chatId)) {
+      const next = new Map(dismissedSuggestions);
+      next.delete(chatId);
+      set(dismissedSuggestedPromptsByChatIdAtom, next);
+    }
+    // Clear unsent message annotations so they don't accumulate for a chat
+    // that no longer exists (or resurface if the id is ever reused)
+    const annotations = get(chatAnnotationsAtom);
+    if (annotations.has(chatId)) {
+      set(chatAnnotationsAtom, clearChatAnnotations(annotations, chatId));
+    }
   },
 );
 
 export const attachmentsAtom = atom<FileAttachment[]>([]);
 attachmentsAtom.debugLabel = "attachmentsAtom";
 
-// Tool consent request queue. Holds both agent-tool and MCP-tool consents;
-// `kind` routes the decision back to the right IPC channel.
-export interface PendingToolConsent {
-  kind: "agent" | "mcp";
-  requestId: string;
-  chatId: number;
-  toolName: string;
-  toolDescription?: string | null;
-  inputPreview?: string | null;
-  metadata?: SqlConsentMetadata | null;
-  // MCP-only fields.
-  serverId?: number;
-  serverName?: string | null;
-  classifierReason?: string | null;
-  // True while the auto-approve classifier is still deciding (shows a spinner).
-  classifierPending?: boolean;
-}
-
-export const pendingToolConsentsAtom = atom<PendingToolConsent[]>([]);
+// The home composer has no chat yet; its attachments remain in attachmentsAtom.
+export const chatAttachmentsByIdAtom = atom<Map<number, FileAttachment[]>>(
+  new Map(),
+);
 
 // Agent todos per chat
 export const agentTodosByChatIdAtom = atom<Map<number, AgentTodo[]>>(new Map());
-
-// Flag: set when user switches to plan mode from another mode in a chat with messages
-export const needsFreshPlanChatAtom = atom<boolean>(false);
 
 // Queued messages (multiple messages per chat, sent in sequence after streams complete)
 export interface QueuedMessageItem {
@@ -522,27 +564,12 @@ export interface QueuedMessageItem {
   prompt: string;
   attachments?: FileAttachment[];
   selectedComponents?: ComponentSelection[];
+  // Extra stream-request fields projected from the main-owned queue snapshot.
+  redo?: boolean;
+  appId?: number;
+  requestedChatMode?: Chat["chatMode"] | null;
+  editable?: boolean;
+  removable?: boolean;
+  /** Legacy persisted marker; never written by current queue code. */
+  userInputRequestId?: string;
 }
-
-// Map<chatId, QueuedMessageItem[]>
-export const queuedMessagesByIdAtom = atom<Map<number, QueuedMessageItem[]>>(
-  new Map(),
-);
-
-// Tracks whether the last stream for a chat completed successfully (via onEnd, not cancelled or errored)
-// This is used to safely process the queue only when we're certain the stream finished normally
-export const streamCompletedSuccessfullyByIdAtom = atom<Map<number, boolean>>(
-  new Map(),
-);
-
-// Tracks if the queue is paused for each chat (Map<chatId, isPaused>)
-export const queuePausedByIdAtom = atom<Map<number, boolean>>(new Map());
-
-// Sidecar overlay for tool-input XML preview during Pro/Agent v2 streaming.
-// Lives outside message.content so the patch protocol stays strictly
-// append-only — buildXml output rewrites its prefix per JSON delta, which
-// would otherwise force non-tail patch escalation to fullMessages. Keyed by
-// chat id; only the last streaming assistant message renders it.
-export const streamingPreviewByChatIdAtom = atom<Map<number, string>>(
-  new Map(),
-);

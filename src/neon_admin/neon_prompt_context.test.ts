@@ -5,6 +5,10 @@ import { filterGuideByFramework } from "../prompts/guides/filter_guide_by_framew
 
 const getCachedEmailPasswordConfig = vi.fn();
 const getNeonContext = vi.fn();
+const readSettings = vi.fn();
+const normalizeGuideNewlines = (guide: string) => guide.replace(/\r\n/g, "\n");
+
+vi.mock("@/main/settings", () => ({ readSettings }));
 
 vi.mock("./neon_management_client", () => ({
   getCachedEmailPasswordConfig,
@@ -20,10 +24,43 @@ vi.mock("./neon_context", async () => {
   };
 });
 
+vi.mock("../paths/paths", () => ({
+  getDyadAppPath: (appPath: string) => appPath,
+}));
+
+vi.mock("../ipc/utils/framework_utils", () => ({
+  detectFrameworkType: () => "vite",
+  detectNextJsMajorVersion: () => null,
+}));
+
 describe("buildNeonPromptAdditions", () => {
   beforeEach(() => {
     vi.resetAllMocks();
+    readSettings.mockReturnValue({});
   });
+
+  it.each([true, false, undefined])(
+    "uses the preview domains setting (%s) for inline authentication guidance",
+    async (enableAppPreviewDomains) => {
+      readSettings.mockReturnValue({ enableAppPreviewDomains });
+      const { buildNeonPromptAdditions } =
+        await import("./neon_prompt_context");
+      const prompt = await buildNeonPromptAdditions({
+        projectId: "project-123",
+        frameworkType: "vite-nitro",
+        includeContext: false,
+        isLocalAgentMode: false,
+      });
+
+      expect(prompt.includes("app-<numeric app ID>.localhost")).toBe(
+        enableAppPreviewDomains === true,
+      );
+      expect(prompt.includes("shared cookies across ports")).toBe(
+        enableAppPreviewDomains !== true,
+      );
+      expect(prompt).not.toContain("[[PREVIEW_COOKIE_GUIDANCE]]");
+    },
+  );
 
   it("includes Neon project context for non-local-agent prompts", async () => {
     getCachedEmailPasswordConfig.mockResolvedValue({
@@ -44,7 +81,10 @@ describe("buildNeonPromptAdditions", () => {
     expect(additions).toContain("<neon-system-prompt>");
     expect(additions).toContain("# Neon Project Info");
     expect(additions).toContain(
-      filterGuideByFramework(addAuthenticationGuide, "nextjs"),
+      filterGuideByFramework(
+        normalizeGuideNewlines(addAuthenticationGuide),
+        "nextjs",
+      ),
     );
     // Closing tags are never mentioned inline in the prose, so they're a
     // reliable signal that the tag was stripped.
@@ -81,6 +121,26 @@ describe("buildNeonPromptAdditions", () => {
     expect(additions).toContain("<neon-system-prompt>");
     expect(additions).toContain('guide="add-authentication"');
     expect(additions).not.toContain(addAuthenticationGuide);
+  });
+
+  it("treats Build as tool-backed and skips eager Neon context", async () => {
+    getCachedEmailPasswordConfig.mockResolvedValue({
+      require_email_verification: false,
+    });
+    getNeonContext.mockResolvedValue("# Neon Project Info");
+
+    const { buildNeonPromptForApp } = await import("./neon_prompt_context");
+
+    const additions = await buildNeonPromptForApp({
+      appPath: "/test-app",
+      neonProjectId: "project-123",
+      neonActiveBranchId: "branch-123",
+      selectedChatMode: "build",
+    });
+
+    expect(additions).toContain('guide="add-authentication"');
+    expect(additions).not.toContain("# Neon Project Info");
+    expect(getNeonContext).not.toHaveBeenCalled();
   });
 
   it("strips the Vite + Nitro section from the auth guide when frameworkType is nextjs", async () => {
@@ -162,7 +222,32 @@ describe("buildNeonPromptAdditions", () => {
     });
 
     expect(additions).toContain("<neon-system-prompt>");
+    expect(additions).not.toContain("<dyad-execute-sql>");
+    expect(additions).toContain("reconnect or select a Neon branch");
+    expect(additions).toContain("until a Neon branch is selected");
+    expect(additions).not.toContain("inspect the live Neon Auth configuration");
     expect(getCachedEmailPasswordConfig).not.toHaveBeenCalled();
     expect(getNeonContext).not.toHaveBeenCalled();
+  });
+
+  it("preserves unknown email-verification state after a lookup failure", async () => {
+    getCachedEmailPasswordConfig.mockRejectedValue(new Error("unavailable"));
+
+    const { buildNeonPromptAdditions, getNeonEmailVerificationEnabled } =
+      await import("./neon_prompt_context");
+
+    await expect(
+      getNeonEmailVerificationEnabled("project-123", "branch-123"),
+    ).resolves.toBeUndefined();
+
+    const additions = await buildNeonPromptAdditions({
+      projectId: "project-123",
+      branchId: "branch-123",
+      frameworkType: "vite",
+      includeContext: false,
+      isLocalAgentMode: true,
+    });
+    expect(additions).toContain("Email-verification state could not be read");
+    expect(additions).toContain("Do not assume it is disabled");
   });
 });

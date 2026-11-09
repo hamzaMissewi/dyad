@@ -1,5 +1,9 @@
 import { z } from "zod";
-import { isNonGoogleProviderSetup } from "./providerUtils";
+import { PagefileModeSchema } from "../shared/pagefile_telemetry";
+import {
+  isGoogleProviderSetup,
+  isNonGoogleProviderSetup,
+} from "./providerUtils";
 
 export const SecretSchema = z.object({
   value: z.string(),
@@ -16,6 +20,7 @@ export const ChatSummarySchema = z.object({
   title: z.string().nullable(),
   createdAt: z.date(),
   chatMode: z.enum(["build", "ask", "local-agent", "plan"]).nullable(),
+  isFavorite: z.boolean(),
 });
 
 /**
@@ -86,12 +91,22 @@ export const LargeLanguageModelSchema = z.object({
   name: z.string(),
   provider: z.string(),
   customModelId: z.number().optional(),
+  // Absent preserves legacy routing; explicit choices are authoritative per turn.
+  connection: z.enum(["subscription", "pro", "api-key"]).optional(),
 });
 
 /**
  * Type derived from the LargeLanguageModelSchema
  */
 export type LargeLanguageModel = z.infer<typeof LargeLanguageModelSchema>;
+
+export const EffortLevelSchema = z.string().trim().min(1);
+
+export const ModelSelectionSchema = LargeLanguageModelSchema.extend({
+  effortLevel: EffortLevelSchema,
+});
+
+export type ModelSelection = z.infer<typeof ModelSelectionSchema>;
 
 /**
  * Zod schema for provider settings
@@ -164,14 +179,19 @@ export const ChatModeSchema = z.enum(["build", "ask", "local-agent", "plan"]);
 export type ChatMode = z.infer<typeof ChatModeSchema>;
 
 /**
- * Modes that stream through the local agent (tool-calling) path rather than
- * the build-mode path that injects full codebases into the prompt. Keep this
- * in sync with the chat-stream and token-count handlers: whenever a new mode
- * routes through the local agent, add it here so the token estimate matches
- * what's actually sent to the model.
+ * Modes that stream through the native tool-calling path rather than injecting
+ * full codebases into the prompt. Every current ChatMode is tool-backed. The
+ * shared predicate intentionally leaves compatibility branches easy to remove
+ * once stored legacy responses and actions no longer need migration support.
+ * Keep this in sync with the chat-stream and token-count handlers.
  */
 export function isLocalAgentBackedMode(mode: ChatMode | undefined): boolean {
-  return mode === "local-agent" || mode === "ask" || mode === "plan";
+  return (
+    mode === "build" ||
+    mode === "local-agent" ||
+    mode === "ask" ||
+    mode === "plan"
+  );
 }
 
 export const GitHubSecretsSchema = z.object({
@@ -183,6 +203,50 @@ export const GithubUserSchema = z.object({
   email: z.string(),
 });
 export type GithubUser = z.infer<typeof GithubUserSchema>;
+
+export const GitLabUserSchema = z.object({
+  username: z.string(),
+  name: z.string().optional(),
+  email: z.string().nullable().optional(),
+});
+export type GitLabUser = z.infer<typeof GitLabUserSchema>;
+
+/**
+ * The GitLab instance Dyad publishes to, and the token it uses there.
+ *
+ * One object, like Coolify: the address and the token only mean anything
+ * together, and gitlab.com is just the address this defaults to. Which
+ * project an app is linked to lives on the app row, keyed by this host, so
+ * a connection pointed at a different instance later can be told apart from
+ * the one the app was linked on.
+ */
+export const GitLabSchema = z.object({
+  instanceUrl: z.string().optional(),
+  accessToken: SecretSchema.optional(),
+  user: GitLabUserSchema.optional(),
+  /**
+   * ISO date the personal access token stops working, or null when the
+   * instance did not say. Shown so the user is not surprised by a 401 later.
+   */
+  tokenExpiresAt: z.string().nullable().optional(),
+});
+export type GitLab = z.infer<typeof GitLabSchema>;
+
+/**
+ * Every field of a GitLab connection, named and empty. Same reason as
+ * forgottenCoolify below: writeSettings treats an absent key as "could not
+ * decrypt, keep the ciphertext", so only a present-and-undefined key clears.
+ */
+export function forgottenGitLab(): {
+  [K in keyof Required<GitLab>]: undefined;
+} {
+  return {
+    instanceUrl: undefined,
+    accessToken: undefined,
+    user: undefined,
+    tokenExpiresAt: undefined,
+  };
+}
 
 /**
  * Supabase organization credentials.
@@ -197,6 +261,99 @@ export const SupabaseOrganizationCredentialsSchema = z.object({
 export type SupabaseOrganizationCredentials = z.infer<
   typeof SupabaseOrganizationCredentialsSchema
 >;
+
+/**
+ * The admin account on a server Dyad set up itself.
+ *
+ * Its own shape rather than fields on the instance below, because it is a
+ * fact about a machine Dyad built rather than about the Coolify Dyad talks
+ * to. Usually the same server; not always.
+ */
+export const CoolifyAdminSchema = z.object({
+  email: z.string(),
+  /**
+   * Optional only because it can become unreadable, never because it was not
+   * written: a keychain that cannot open it leaves the account behind without
+   * it. Required here instead would make the account itself vanish, and the
+   * ciphertext on disk has nowhere to be put back into once it has.
+   */
+  password: SecretSchema.optional(),
+  /**
+   * The address of the server this account opens.
+   *
+   * There are two addresses stored, and they are usually the same one. This
+   * is the machine Dyad installed Coolify on. `instanceUrl` on the object
+   * below is the Coolify Dyad is currently talking to.
+   *
+   * They come apart in one case. Coolify has no API for making API tokens, so
+   * Dyad mints one through a workaround, and that workaround can fail. The
+   * install still succeeded, so the finished screen hands over this account
+   * and says to make a token by hand — and the next screen offers the token
+   * form with this address already filled in. Someone who instead points that
+   * form at a different Coolify they already had ends up with this account
+   * for one server and a token for another.
+   *
+   * Keeping the address next to the account is what lets the panel put each
+   * secret under the server it actually opens. One address over both would
+   * have to pick, and picking wrong shows this password under the other
+   * server's name, which reads as a way into it and is not one.
+   */
+  instanceUrl: z.string(),
+});
+
+/**
+ * A Coolify instance Dyad can deploy to.
+ *
+ * One object rather than two loose fields: the address and the token are only
+ * useful together, and neither says anything on its own. Which app deploys
+ * where lives in the coolify_app_connections table, not here — this is the
+ * instance, and it is instance-wide.
+ */
+export const CoolifySchema = z.object({
+  instanceUrl: z.string().optional(),
+  accessToken: SecretSchema.optional(),
+  /**
+   * The admin account on a server Dyad set up itself.
+   *
+   * Kept because Dyad invented this password on the user's behalf, for their
+   * own machine — showing it once and forgetting it leaves them locked out of
+   * a server they own. Encrypted like the token, and like the token it
+   * reaches the renderer whenever settings are read, not only when the panel
+   * asks to show it.
+   *
+   * One object rather than three fields, because they are only ever
+   * meaningful together: an account without the address it opens is a
+   * password for nothing, and they are written and forgotten at once.
+   */
+  admin: CoolifyAdminSchema.optional(),
+});
+export type Coolify = z.infer<typeof CoolifySchema>;
+
+/**
+ * Every field of a Coolify, named and empty.
+ *
+ * writeSettings reads an absent key as a field some consumer read could not
+ * decrypt and hands the stored ciphertext back, so forgetting an instance by
+ * writing an empty object returns the token instead of clearing it. Only a
+ * key that is present and undefined reads as a deliberate clear.
+ *
+ * Typed so that a field added to CoolifySchema later fails to compile until
+ * it is named here too, which is what an empty object was reaching for.
+ *
+ * Built fresh each call rather than shared. writeSettings merges one level
+ * deep and then edits what it merged by path, so a single object handed to it
+ * is the object it edits — and one kept at module scope would carry another
+ * write's edits into every sign-out after it.
+ */
+export function forgottenCoolify(): {
+  [K in keyof Required<Coolify>]: undefined;
+} {
+  return {
+    instanceUrl: undefined,
+    accessToken: undefined,
+    admin: undefined,
+  };
+}
 
 export const SupabaseSchema = z.object({
   // Map keyed by organizationSlug -> organization credentials
@@ -283,6 +440,7 @@ export const LanguageSchema = z.enum([
   "fr",
   "de",
   "pt-BR",
+  "tr",
 ]);
 export type Language = z.infer<typeof LanguageSchema>;
 
@@ -299,10 +457,97 @@ export type SmartContextMode = z.infer<typeof SmartContextModeSchema>;
 export const AgentToolConsentSchema = z.enum(["ask", "always", "never"]);
 export type AgentToolConsent = z.infer<typeof AgentToolConsentSchema>;
 
+// The kinds of TypeScript utility process the scheduler can run.
+export const TypeScriptUtilityProcessKindSchema = z.enum([
+  "code-explorer",
+  "supabase-dependency-analysis",
+  "tsc",
+]);
+export type TypeScriptUtilityProcessKind = z.infer<
+  typeof TypeScriptUtilityProcessKindSchema
+>;
+
+// What the main process was doing when a performance snapshot was taken.
+export const PerformanceActivitySchema = z.object({
+  activeStreams: z.number(),
+  runningApps: z.number(),
+  extractCodebase: z.boolean(),
+  tsUtilityProcess: TypeScriptUtilityProcessKindSchema.nullable(),
+});
+
+// Performance snapshot written by the performance monitor every 30s. Also
+// used to parse the snapshot embedded in renderer crash records.
+export const LastKnownPerformanceSchema = z.object({
+  timestamp: z.number(),
+  memoryUsageMB: z.number(),
+  cpuUsagePercent: z.number().optional(),
+  systemMemoryUsageMB: z.number().optional(),
+  systemMemoryTotalMB: z.number().optional(),
+  systemCpuPercent: z.number().optional(),
+  // Capacity of the volume holding the user data directory. diskUsedMB counts
+  // every allocated block; diskAvailableMB excludes space the platform holds
+  // back (root reserve, quota), so the two need not sum to diskTotalMB.
+  diskTotalMB: z.number().optional(),
+  diskUsedMB: z.number().optional(),
+  diskAvailableMB: z.number().optional(),
+  // Main process V8 heap, from v8.getHeapStatistics().
+  heapUsedMB: z.number().optional(),
+  heapLimitMB: z.number().optional(),
+  // Working set per Electron process type (browser, tab, gpu, utility).
+  processWorkingSetsMB: z.record(z.string(), z.number()).optional(),
+  // What was running at this snapshot.
+  activity: PerformanceActivitySchema.optional(),
+  // Session highs. peakRssMB is exact (kernel tracked); the rest are
+  // maxima over 30s samples and can miss short spikes.
+  peakHeapUsedMB: z.number().optional(),
+  peakHeapPct: z.number().optional(),
+  peakRssMB: z.number().optional(),
+  peakProcessWorkingSetsMB: z.record(z.string(), z.number()).optional(),
+  // What was running when a main process peak (heap, RSS) was last set,
+  // and when. The per-type working set peaks above are not stamped; they
+  // can come from different moments than this pair.
+  peakActivity: PerformanceActivitySchema.optional(),
+  peakTimestamp: z.number().optional(),
+  // Windows commit charge, machine-wide: the most memory Windows can promise
+  // (RAM plus the pagefile) and how much of that no program has claimed yet.
+  commitLimitMB: z.number().optional(),
+  commitAvailableMB: z.number().optional(),
+  // Pagefile configuration in effect for this session (Windows), read once
+  // at launch. Says whether the commit limit above can still grow.
+  pagefileMode: PagefileModeSchema.optional(),
+  pagefileMaxMB: z.number().optional(),
+  // Private commit per Electron process type (Windows only), the share of
+  // the machine-wide commit charge that is Dyad's.
+  processCommitMB: z.record(z.string(), z.number()).optional(),
+  // The "tab" working set split by what the renderer process hosts: Dyad's
+  // own UI, or an app preview (iframe or preview view). Commit is Windows
+  // only.
+  uiRendererWorkingSetMB: z.number().optional(),
+  previewRendererWorkingSetMB: z.number().optional(),
+  uiRendererCommitMB: z.number().optional(),
+  previewRendererCommitMB: z.number().optional(),
+  // Main process memory outside the V8 heap but owned by JS objects
+  // (Buffers, ArrayBuffers), from process.memoryUsage().
+  mainExternalMB: z.number().optional(),
+  mainArrayBuffersMB: z.number().optional(),
+  // The Dyad UI renderer's V8 heap, pushed by its preload every 30s.
+  rendererHeapUsedMB: z.number().optional(),
+  rendererHeapLimitMB: z.number().optional(),
+  // Dev servers Dyad launched, measured as whole process trees. Private
+  // commit on Windows, RSS elsewhere. Sampled every few minutes, so
+  // devServerSampledAt can trail the snapshot timestamp.
+  devServerCount: z.number().optional(),
+  devServerTotalMB: z.number().optional(),
+  devServerMaxMB: z.number().optional(),
+  devServerMaxProcessCount: z.number().optional(),
+  devServerSampledAt: z.number().optional(),
+});
+
 /**
  * Base fields shared between StoredUserSettings and UserSettings
  */
 const BaseUserSettingsFields = {
+  showSystemResourceUsage: z.boolean().optional(),
   ////////////////////////////////
   // E2E TESTING ONLY.
   ////////////////////////////////
@@ -323,19 +568,29 @@ const BaseUserSettingsFields = {
   agentToolConsents: z.record(z.string(), AgentToolConsentSchema).optional(),
   githubUser: GithubUserSchema.optional(),
   githubAccessToken: SecretSchema.optional(),
+  gitlab: GitLabSchema.optional(),
   vercelAccessToken: SecretSchema.optional(),
+  // One API token does two jobs: Dyad uses it to set up Workers and deploy
+  // rules, and Cloudflare's build service deploys with it after each push.
+  cloudflareAccessToken: SecretSchema.optional(),
+  coolify: CoolifySchema.optional(),
   supabase: SupabaseSchema.optional(),
   neon: NeonSchema.optional(),
   autoApproveChanges: z.boolean().optional(),
   telemetryConsent: z.enum(["opted_in", "opted_out", "unset"]).optional(),
   telemetryUserId: z.string().optional(),
   hasRunBefore: z.boolean().optional(),
+  // Global across chats. Unset prefers a connected subscription.
+  proModelUsage: z.enum(["subscription", "pro", "api-key"]).optional(),
+  // Applies only to requests routed through the ChatGPT subscription adapter.
+  chatgptFastMode: z.boolean().optional(),
   enableDyadPro: z.boolean().optional(),
   experiments: ExperimentsSchema.optional(),
   lastShownReleaseNotesVersion: z.string().optional(),
   maxChatTurnsInContext: z.number().optional(),
   maxToolCallSteps: z.number().optional(),
-  thinkingBudget: z.enum(["low", "medium", "high"]).optional(),
+  modelEffortPreferences: z.record(z.string(), EffortLevelSchema).optional(),
+  recentModels: z.array(LargeLanguageModelSchema).optional(),
   enableProLazyEditsMode: z.boolean().optional(),
   proLazyEditsMode: z.enum(["off", "v1", "v2"]).optional(),
   enableProSmartFilesContextMode: z.boolean().optional(),
@@ -345,6 +600,7 @@ const BaseUserSettingsFields = {
   selectedThemeId: z.string().optional(),
   enableSupabaseWriteSqlMigration: z.boolean().optional(),
   autoApproveNonSchemaSql: z.boolean().optional(),
+  enableShellTool: z.boolean().optional(),
   autoApproveSafeMcpTools: z.boolean().optional(),
   skipPruneEdgeFunctions: z.boolean().optional(),
   acceptedCommunityCode: z.boolean().optional(),
@@ -352,18 +608,61 @@ const BaseUserSettingsFields = {
   language: LanguageSchema.optional(),
   previewDeviceMode: DeviceModeSchema.optional(),
 
-  enableAutoFixProblems: z.boolean().optional(),
   enableAppBlueprint: z.boolean().optional(),
+  // When enabled, newly created apps opt into the AI E2E testing feature by
+  // default (their `testing_enabled` column is seeded to true at creation).
+  enableTestingForNewApps: z.boolean().optional(),
+  // Test run modes chosen in the Tests panel. Persisted so both the panel's
+  // Run button and the agent's run_tests tool share the same headed/serial/
+  // slow-motion preference. Default (unset) is headless + serial + full speed.
+  testHeaded: z.boolean().optional(),
+  testParallel: z.boolean().optional(),
+  testSlowMo: z.boolean().optional(),
+  // Escape hatch for the sandboxed E2E runtime, which snapshots the app's
+  // source per run and then installs its dependencies from scratch —
+  // `node_modules` is deliberately never copied or linked, so every run pays a
+  // clean `npm ci` / `pnpm install --frozen-lockfile` (budgeted at 15 minutes)
+  // that a warm project would not. That install, not the snapshot, is what
+  // makes a run noticeably slower. Off by default — the sandbox is the
+  // intended path — and turning it on runs the tests against the normal
+  // preview with the missing isolation disclosed. Neon-only apps are refused rather
+  // than run against the real database either way.
+  disableSandboxedE2eTests: z.boolean().optional(),
+  enableParallelTestRuns: z.boolean().optional(),
+  maxConcurrentTestRuns: z.number().int().min(1).max(128).optional(),
   autoExpandPreviewPanel: z.boolean().optional(),
+  // Follow-up prompt chips above the chat input after Build and Agent turns.
+  enableSuggestedPrompts: z.boolean().optional(),
   enableChatEventNotifications: z.boolean().optional(),
   blockUnsafeNpmPackages: z.boolean().optional(),
   enablePnpmMinimumReleaseAgeWarning: z.boolean().optional(),
   hidePnpmMinimumReleaseAgeWarning: z.boolean().optional(),
-  enableNativeGit: z.boolean().optional(),
   enableSandboxScriptExecution: z.boolean().optional(),
-  enableMcpServersForBuildMode: z.boolean().optional(),
   enableMcpToolSearch: z.boolean().optional(),
+  // Catalog slugs the user asked the agent never to suggest again.
+  neverSuggestPluginSlugs: z.array(z.string()).optional(),
   enableCodeExplorer: z.boolean().optional(),
+  runTypeScriptForWholeProject: z.boolean().optional(),
+  enableMultiWindow: z.boolean().optional(),
+  enableNeonBranchProtection: z.boolean().optional(),
+  enableClaudeCodeSubscription: z.boolean().optional(),
+  enableAppPreviewDomains: z.boolean().optional(),
+  enablePreviewCookieIsolation: z.boolean().optional(),
+  enableExplorerSubagent: z.boolean().optional(),
+  enableAutoReview: z.boolean().optional(),
+  enableReviewButton: z.boolean().optional(),
+  enableImplementerSubagent: z.boolean().optional(),
+  enableAdvancedSubagents: z.boolean().optional(),
+  autoFixReviewIssues: z.boolean().optional(),
+  // Deploying to a server the user runs themselves, through Coolify. Off
+  // unless explicitly turned on: the integration is early, undocumented and
+  // still changing, and with it off the Publish panel has no tab for it.
+  enableOwnServerDeployment: z.boolean().optional(),
+  // Publishing to GitLab (gitlab.com or a self-hosted instance). Off unless
+  // explicitly turned on; it gates new GitLab connections only, so an app
+  // already linked to GitLab keeps its GitLab card when this is off again.
+  enableGitlabPublishing: z.boolean().optional(),
+  enableTestRunInPreview: z.boolean().optional(),
   enableAutoUpdate: z.boolean(),
   releaseChannel: ReleaseChannelSchema,
   runtimeMode2: RuntimeMode2Schema.optional(),
@@ -372,20 +671,9 @@ const BaseUserSettingsFields = {
   disablePreviewNodeAutoInstall: z.boolean().optional(),
   customAppsFolder: z.string().optional().nullable(),
   isRunning: z.boolean().optional(),
-  lastKnownPerformance: z
-    .object({
-      timestamp: z.number(),
-      memoryUsageMB: z.number(),
-      cpuUsagePercent: z.number().optional(),
-      systemMemoryUsageMB: z.number().optional(),
-      systemMemoryTotalMB: z.number().optional(),
-      systemCpuPercent: z.number().optional(),
-    })
-    .optional(),
-  hideLocalAgentNewChatToast: z.boolean().optional(),
+  lastKnownPerformance: LastKnownPerformanceSchema.optional(),
   enableContextCompaction: z.boolean().optional(),
   skipNotificationBanner: z.boolean().optional(),
-  enableSelectAppFromHomeChatInput: z.boolean().optional(),
   previewIdleTimeoutPolicy: z.enum(["default", "never"]).optional(),
 };
 
@@ -396,11 +684,22 @@ const BaseUserSettingsFields = {
 export const StoredUserSettingsSchema = z
   .object({
     ...BaseUserSettingsFields,
+    // An out-of-range stored value (hand-edited or from another version) is
+    // dropped instead of failing the whole settings parse. IPC input stays
+    // strict, so an invalid update is still rejected.
+    maxConcurrentTestRuns:
+      BaseUserSettingsFields.maxConcurrentTestRuns.catch(undefined),
+    // Deprecated: effort is now selected per model.
+    thinkingBudget: z.enum(["low", "medium", "high"]).optional(),
     // Use StoredChatModeSchema to allow deprecated "agent" value
     selectedChatMode: StoredChatModeSchema.optional(),
     defaultChatMode: StoredChatModeSchema.optional(),
     // Deprecated: renamed to enableChatEventNotifications
     enableChatCompletionNotifications: z.boolean().optional(),
+    // Deprecated: Dyad always uses the bundled Dugite Git backend.
+    enableNativeGit: z.boolean().optional(),
+    // Deprecated: Problems checks are manual-only.
+    enableAutoFixProblems: z.boolean().optional(),
   })
   // Allow unknown properties to pass through (e.g. future settings
   // that should be preserved if user downgrades to an older version)
@@ -451,8 +750,25 @@ export function migrateStoredChatMode(
 export function migrateStoredSettings(
   stored: StoredUserSettings,
 ): UserSettings {
+  const activeSettings = { ...stored };
+  delete activeSettings.enableNativeGit;
+  delete activeSettings.enableAutoFixProblems;
+  delete activeSettings.thinkingBudget;
+  if (stored.agentToolConsents) {
+    const agentToolConsents = { ...stored.agentToolConsents };
+    if (
+      agentToolConsents.reinstall_and_restart_app === undefined &&
+      agentToolConsents.rebuild_app !== undefined
+    ) {
+      agentToolConsents.reinstall_and_restart_app =
+        agentToolConsents.rebuild_app;
+    }
+    delete agentToolConsents.rebuild_app;
+    activeSettings.agentToolConsents = agentToolConsents;
+  }
+
   return {
-    ...stored,
+    ...activeSettings,
     selectedChatMode: migrateStoredChatMode(stored.selectedChatMode),
     defaultChatMode: migrateStoredChatMode(stored.defaultChatMode),
     enableChatEventNotifications:
@@ -485,43 +801,29 @@ export function shouldShowPnpmMinimumReleaseAgeWarning(
 }
 
 /**
- * Gets the effective default chat mode based on settings, pro status, and free quota availability.
- * - If defaultChatMode is set and valid for the user's Pro status, use it
- * - If defaultChatMode is "local-agent" but user doesn't have Pro:
- *   - If free agent quota available AND a non-Google provider is set up, use "local-agent" (basic agent mode)
- *   - Otherwise, fall back to "build"
- * - If defaultChatMode is NOT set:
- *   - Pro users: use "local-agent"
- *   - Non-Pro users with quota AND a non-Google provider set up: use "local-agent" (basic agent mode)
- *   - Non-Pro users without quota or provider: use "build"
+ * Gets the effective default chat mode based on settings and Pro status.
+ * - Explicit non-Agent defaults are always honored
+ * - Pro users default to Agent
+ * - Non-Pro users default to Basic Agent; quota is enforced when sending
+ * - Google-only users fall back to Build because free Gemini keys commonly
+ *   have limits that are too restrictive for Agent mode
  */
 export function getEffectiveDefaultChatMode(
   settings: UserSettings,
   envVars: Record<string, string | undefined>,
-  freeAgentQuotaAvailable?: boolean,
 ): ChatMode {
   const isPro = isDyadProEnabled(settings);
-  // If user only has a Google/Gemini API key, we don't default to local-agent because
-  // most likely it's a free API key with stringent limits and they'll get
-  // a bad experience with local-agent.
+  const hasGoogleProviderSetup = isGoogleProviderSetup(settings, envVars);
   const hasNonGoogleProviderSetup = isNonGoogleProviderSetup(settings, envVars);
 
-  if (settings.defaultChatMode) {
-    // "local-agent" requires either Pro OR (available free quota AND provider setup)
-    if (settings.defaultChatMode === "local-agent") {
-      if (isPro) return "local-agent";
-      if (freeAgentQuotaAvailable && hasNonGoogleProviderSetup)
-        return "local-agent";
-      return "build";
-    }
+  if (settings.defaultChatMode && settings.defaultChatMode !== "local-agent") {
     return settings.defaultChatMode;
   }
 
-  // No explicit default set
   if (isPro) return "local-agent";
-  if (freeAgentQuotaAvailable && hasNonGoogleProviderSetup)
-    return "local-agent";
-  return "build";
+  if (settings.defaultChatMode === "local-agent") return "local-agent";
+  if (hasGoogleProviderSetup && !hasNonGoogleProviderSetup) return "build";
+  return "local-agent";
 }
 
 /**
@@ -532,7 +834,9 @@ export function getEffectiveDefaultChatMode(
  */
 export function isBasicAgentMode(settings: UserSettings): boolean {
   return (
-    !isDyadProEnabled(settings) && settings.selectedChatMode === "local-agent"
+    settings.selectedModel.provider !== "claude-code" &&
+    !isDyadProEnabled(settings) &&
+    settings.selectedChatMode === "local-agent"
   );
 }
 
@@ -545,6 +849,19 @@ export function isSupabaseConnected(settings: UserSettings | null): boolean {
     (settings.supabase?.organizations &&
       Object.keys(settings.supabase.organizations).length > 0),
   );
+}
+
+export function hasSupabaseCredentialsForOrganization(
+  settings: Pick<UserSettings, "supabase"> | null,
+  organizationSlug?: string | null,
+): boolean {
+  if (!settings) return false;
+  return organizationSlug
+    ? Boolean(
+        settings.supabase?.organizations?.[organizationSlug]?.accessToken
+          ?.value,
+      )
+    : Boolean(settings.supabase?.accessToken?.value);
 }
 
 export function isTurboEditsV2Enabled(settings: UserSettings): boolean {
@@ -587,7 +904,8 @@ export type SuggestedAction =
   | RebuildAction
   | RestartAction
   | RefreshAction
-  | KeepGoingAction;
+  | KeepGoingAction
+  | AddTypeScriptAction;
 
 export interface RestartAppAction {
   id: "restart-app";
@@ -616,6 +934,10 @@ export interface RestartAction {
 
 export interface RefreshAction {
   id: "refresh";
+}
+
+export interface AddTypeScriptAction {
+  id: "add-typescript";
 }
 
 export interface KeepGoingAction {

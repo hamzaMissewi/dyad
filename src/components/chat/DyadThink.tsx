@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { ChevronRight } from "lucide-react";
+import { ANNOTATION_IGNORE_ATTRIBUTE } from "@/lib/annotationDom";
 import { VanillaMarkdownParser } from "./DyadMarkdownParser";
 import { CustomTagState } from "./stateTypes";
 import { DyadTokenSavings } from "./DyadTokenSavings";
@@ -60,12 +61,15 @@ export const DyadThink: React.FC<DyadThinkProps> = ({ children, node }) => {
       : "";
 
   return (
-    <div className="my-1">
+    // Collapsed reasoning is mounted lazily, so its text appears and
+    // disappears without the message changing. Keep it out of the annotation
+    // offset space or expanding it shifts every later annotation.
+    <div className="my-1" {...{ [ANNOTATION_IGNORE_ATTRIBUTE]: true }}>
       {/* Toggle header */}
       <button
         type="button"
         onClick={() => setIsExpanded(!isExpanded)}
-        className="flex items-center gap-1 py-1 group cursor-pointer"
+        className="flex w-full min-w-0 items-center gap-1 py-1 text-left group cursor-pointer"
       >
         <ChevronRight
           size={14}
@@ -73,11 +77,11 @@ export const DyadThink: React.FC<DyadThinkProps> = ({ children, node }) => {
             isExpanded ? "rotate-90" : ""
           }`}
         />
-        <span className="text-[13px] font-medium text-foreground/70 group-hover:text-foreground transition-colors">
+        <span className="shrink-0 text-[13px] font-medium text-foreground/70 group-hover:text-foreground transition-colors">
           {inProgress ? "Thinking…" : "Thought"}
         </span>
         {!isExpanded && firstLine && (
-          <span className="ml-0.5 truncate text-[13px] text-muted-foreground/85 max-w-md">
+          <span className="ml-0.5 min-w-0 truncate text-[13px] text-muted-foreground/85 max-w-md">
             {firstLine}
           </span>
         )}

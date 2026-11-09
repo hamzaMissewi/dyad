@@ -1,33 +1,24 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { Provider, createStore } from "jotai";
 import type React from "react";
 import type { PropsWithChildren } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { selectedAppIdAtom } from "@/atoms/appAtoms";
 import type { Version } from "@/ipc/types";
+import { isPaneVisibleState, type PreviewState } from "@/version_preview/state";
+import { projectVersionPreview } from "@/version_preview/projection";
 import { VersionPane } from "./VersionPane";
 
-const {
-  checkoutVersionMock,
-  listAppScreenshotsMock,
-  refreshAppMock,
-  refreshVersionsMock,
-  restartAppMock,
-  revertVersionMock,
-  setVersionFavoriteMock,
-  setVersionNoteMock,
-  versionsMock,
-} = vi.hoisted(() => ({
-  checkoutVersionMock: vi.fn(),
-  listAppScreenshotsMock: vi.fn(),
-  refreshAppMock: vi.fn(),
-  refreshVersionsMock: vi.fn(),
-  restartAppMock: vi.fn(),
-  revertVersionMock: vi.fn(),
-  setVersionFavoriteMock: vi.fn(),
-  setVersionNoteMock: vi.fn(),
-  versionsMock: [] as Version[],
+const mocks = vi.hoisted(() => ({
+  listAppScreenshots: vi.fn(),
+  refreshVersions: vi.fn(),
+  setVersionFavorite: vi.fn(),
+  setVersionNote: vi.fn(),
+  send: vi.fn(),
+  versions: [] as Version[],
+  state: { type: "closed" } as PreviewState,
+  paneVisible: false,
 }));
 
 vi.mock("react-virtuoso", () => ({
@@ -52,49 +43,33 @@ vi.mock("react-virtuoso", () => ({
 
 vi.mock("@/ipc/types", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/ipc/types")>()),
-  ipc: {
-    app: {
-      listAppScreenshots: listAppScreenshotsMock,
-    },
-  },
+  ipc: { app: { listAppScreenshots: mocks.listAppScreenshots } },
 }));
 
 vi.mock("@/hooks/useVersions", () => ({
   useVersions: () => ({
-    versions: versionsMock,
+    versions: mocks.versions,
     loading: false,
     error: null,
-    refreshVersions: refreshVersionsMock,
-    revertVersion: revertVersionMock,
-    isRevertingVersion: false,
-    setVersionFavorite: setVersionFavoriteMock,
+    refreshVersions: mocks.refreshVersions,
+    setVersionFavorite: mocks.setVersionFavorite,
     isSettingVersionFavorite: false,
-    setVersionNote: setVersionNoteMock,
+    setVersionNote: mocks.setVersionNote,
     isSettingVersionNote: false,
   }),
 }));
 
-vi.mock("@/hooks/useCheckoutVersion", () => ({
-  useCheckoutVersion: () => ({
-    checkoutVersion: checkoutVersionMock,
-    isCheckingOutVersion: false,
+vi.mock("@/hooks/useVersionPreview", () => ({
+  useVersionPreview: () => ({
+    state: mocks.state,
+    projection: projectVersionPreview(mocks.state),
+    isPaneVisible: mocks.paneVisible || isPaneVisibleState(mocks.state),
+    send: mocks.send,
+    sendAndWaitForMutation: vi.fn(),
   }),
 }));
 
-vi.mock("@/hooks/useLoadApp", () => ({
-  useLoadApp: () => ({
-    app: null,
-    loading: false,
-    error: null,
-    refreshApp: refreshAppMock,
-  }),
-}));
-
-vi.mock("@/hooks/useRunApp", () => ({
-  useRunApp: () => ({
-    restartApp: restartAppMock,
-  }),
-}));
+const APP_ID = 1;
 
 function makeVersion(index: number): Version {
   return {
@@ -107,60 +82,104 @@ function makeVersion(index: number): Version {
   };
 }
 
-function makeWrapper() {
-  const store = createStore();
-  store.set(selectedAppIdAtom, 1);
-  const queryClient = new QueryClient({
-    defaultOptions: {
-      queries: { retry: false },
-      mutations: { retry: false },
+function browsingState(): PreviewState {
+  return {
+    type: "browsing",
+    session: {
+      appId: APP_ID,
+      originBranch: null,
+      targetVersionId: null,
+      checkedOutVersionId: null,
+      exitIntent: { type: "none" },
+      selectedDiffFile: null,
+      isDiffVisible: false,
     },
-  });
-
-  return function Wrapper({ children }: PropsWithChildren) {
-    return (
-      <Provider store={store}>
-        <QueryClientProvider client={queryClient}>
-          {children}
-        </QueryClientProvider>
-      </Provider>
-    );
   };
+}
+
+function wrapper({ children }: PropsWithChildren) {
+  const store = createStore();
+  store.set(selectedAppIdAtom, APP_ID);
+  return (
+    <Provider store={store}>
+      <QueryClientProvider client={new QueryClient()}>
+        {children}
+      </QueryClientProvider>
+    </Provider>
+  );
 }
 
 describe("VersionPane", () => {
   beforeEach(() => {
-    checkoutVersionMock.mockReset();
-    listAppScreenshotsMock.mockReset();
-    refreshAppMock.mockReset();
-    refreshVersionsMock.mockReset();
-    restartAppMock.mockReset();
-    revertVersionMock.mockReset();
-    setVersionFavoriteMock.mockReset();
-    setVersionNoteMock.mockReset();
-
-    versionsMock.length = 0;
-    listAppScreenshotsMock.mockResolvedValue({ screenshots: [] });
+    vi.clearAllMocks();
+    mocks.versions.length = 0;
+    mocks.state = { type: "closed" };
+    mocks.paneVisible = false;
+    mocks.listAppScreenshots.mockResolvedValue({ screenshots: [] });
+    mocks.refreshVersions.mockResolvedValue({ data: mocks.versions });
   });
 
-  it("renders a large version list through the virtualizer", async () => {
-    const versionCount = 1_000;
-    versionsMock.push(
-      ...Array.from({ length: versionCount }, (_, index) => makeVersion(index)),
+  it("renders nothing while the window-local pane is closed", () => {
+    mocks.versions.push(makeVersion(1));
+    render(<VersionPane />, { wrapper });
+    expect(screen.queryByText("Version History")).toBeNull();
+  });
+
+  it("virtualizes the list and dispatches a semantic checkout intent", async () => {
+    mocks.state = browsingState();
+    mocks.versions.push(
+      ...Array.from({ length: 100 }, (_, index) => makeVersion(index + 1)),
     );
-    refreshVersionsMock.mockResolvedValue({ data: versionsMock });
+    render(<VersionPane />, { wrapper });
 
-    render(<VersionPane isVisible onClose={vi.fn()} />, {
-      wrapper: makeWrapper(),
+    expect(await screen.findByText("Version History")).toBeDefined();
+    expect(
+      screen
+        .getByTestId("virtualized-version-list")
+        .getAttribute("data-total-count"),
+    ).toBe("100");
+    fireEvent.click(screen.getByTestId("version-row-100"));
+    expect(mocks.send).toHaveBeenCalledWith({
+      type: "SELECT_VERSION",
+      versionId: mocks.versions[0].oid,
     });
+  });
 
-    await waitFor(() => {
-      expect(
-        screen
-          .getByTestId("virtualized-version-list")
-          .getAttribute("data-total-count"),
-      ).toBe(String(versionCount));
-    });
-    expect(screen.getAllByTestId(/^version-row-/)).toHaveLength(20);
+  it("keeps restore disabled in recovery-required projection", async () => {
+    const browsing = browsingState();
+    if (browsing.type !== "browsing") throw new Error("invalid fixture");
+    const session = browsing.session;
+    mocks.state = {
+      type: "recovery-required",
+      session: { ...session, originBranch: "feature/origin" },
+      error: { message: "return failed" },
+    };
+    mocks.versions.push(makeVersion(1));
+    render(<VersionPane />, { wrapper });
+    expect(screen.queryByText("Version History")).toBeNull();
+    expect(projectVersionPreview(mocks.state).capabilities.canRestore).toBe(
+      false,
+    );
+  });
+
+  it("shows an inline blocked state while restore recovery is unresolved", async () => {
+    const browsing = browsingState();
+    if (browsing.type !== "browsing") throw new Error("invalid fixture");
+    mocks.state = {
+      type: "restore-recovery-required",
+      session: browsing.session,
+      error: { message: "restore interrupted" },
+    };
+    mocks.paneVisible = true;
+
+    render(<VersionPane />, { wrapper });
+
+    expect(
+      await screen.findByText("Version History is temporarily unavailable"),
+    ).toBeDefined();
+    expect(
+      screen.getByText("Resolve the version recovery notice to continue."),
+    ).toBeDefined();
+    expect(screen.queryByTestId("virtualized-version-list")).toBeNull();
   });
 });

@@ -1,12 +1,25 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   createExceptionFromTelemetry,
   getExceptionTelemetryContext,
   getInitialLoadTelemetryProperties,
+  getPostHogTelemetryStorage,
+  getSettingsPersonTelemetryProperties,
+  isPostHogCrashTelemetryEvent,
+  isPostHogErrorTelemetryEvent,
+  PostHogErrorDeduper,
   shouldBypassNonProTelemetrySampling,
   shouldFilterPostHogExceptionEvent,
 } from "@/lib/posthogTelemetry";
 import type { UserSettings } from "@/lib/schemas";
+import {
+  DEFAULT_MAX_TOOL_CALL_STEPS,
+  MAX_CHAT_TURNS_IN_CONTEXT,
+} from "@/constants/settings_constants";
+import {
+  DEFAULT_ENABLE_SUGGESTED_PROMPTS,
+  DEFAULT_MAX_CONCURRENT_TEST_RUNS,
+} from "@/shared/settings_defaults";
 
 function makeSettings(overrides: Partial<UserSettings> = {}): UserSettings {
   return {
@@ -18,6 +31,585 @@ function makeSettings(overrides: Partial<UserSettings> = {}): UserSettings {
     ...overrides,
   } as UserSettings;
 }
+
+class MemoryStorage {
+  readonly values = new Map<string, string>();
+
+  getItem(key: string): string | null {
+    return this.values.get(key) ?? null;
+  }
+
+  setItem(key: string, value: string): void {
+    this.values.set(key, value);
+  }
+}
+
+const HOUR_MS = 60 * 60 * 1000;
+
+function exceptionEvent(
+  message = "Failed to load app 123456",
+  filename = "file:///Users/alice/dyad/src/example.ts",
+  lineno = 42,
+  colno = 7,
+) {
+  return {
+    event: "$exception",
+    properties: {
+      $exception_list: [
+        {
+          type: "TypeError",
+          value: message,
+          stacktrace: {
+            type: "raw",
+            frames: [
+              {
+                filename,
+                function: "loadApp",
+                lineno,
+                colno,
+              },
+            ],
+          },
+        },
+      ],
+    },
+  };
+}
+
+describe("PostHogErrorDeduper", () => {
+  it("deduplicates free-user errors for 24 hours", () => {
+    const deduper = new PostHogErrorDeduper();
+    const event = exceptionEvent();
+
+    expect(deduper.process(event, false, 0)).toBe(event);
+    expect(deduper.process(event, false, 23 * HOUR_MS)).toBeNull();
+    expect(deduper.process(event, false, 25 * HOUR_MS)).toMatchObject({
+      properties: {
+        dyad_error_suppressed_count: 1,
+        dyad_error_suppression_duration_ms: 25 * HOUR_MS,
+      },
+    });
+  });
+
+  it("deduplicates Pro errors for 10 minutes", () => {
+    const deduper = new PostHogErrorDeduper();
+    const event = exceptionEvent();
+
+    expect(deduper.process(event, true, 0)).toBe(event);
+    expect(deduper.process(event, true, 10 * 60 * 1000 - 1)).toBeNull();
+    expect(deduper.process(event, true, 10 * 60 * 1000)).toMatchObject({
+      properties: {
+        dyad_error_suppressed_count: 1,
+        dyad_error_suppression_duration_ms: 10 * 60 * 1000,
+      },
+    });
+  });
+
+  it("reports all suppressed repeats on the next admitted event", () => {
+    const deduper = new PostHogErrorDeduper();
+    const event = exceptionEvent();
+
+    deduper.process(event, true, 0);
+    deduper.process(event, true, 1_000);
+    deduper.process(event, true, 2_000);
+
+    expect(deduper.process(event, true, 10 * 60 * 1000)).toMatchObject({
+      properties: {
+        dyad_error_suppressed_count: 2,
+        dyad_error_suppression_duration_ms: 10 * 60 * 1000,
+      },
+    });
+    expect(deduper.process(event, true, 20 * 60 * 1000)).not.toHaveProperty(
+      "properties.dyad_error_suppressed_count",
+    );
+  });
+
+  it("normalizes volatile identifiers and user-specific source prefixes", () => {
+    const deduper = new PostHogErrorDeduper();
+    const first = exceptionEvent(
+      "App 123456 failed for 44d88612-fea8-4a8b-9d71-1cbe1c0187e1",
+      "file:///Users/alice/dyad/src/example.ts",
+    );
+    const repeat = exceptionEvent(
+      "App 987654 failed for 550e8400-e29b-41d4-a716-446655440000",
+      "file:///home/bob/dyad/src/example.ts",
+    );
+
+    expect(deduper.process(first, false, 0)).toBe(first);
+    expect(deduper.process(repeat, false, 1)).toBeNull();
+  });
+
+  it("normalizes realistic small entity identifiers", () => {
+    const deduper = new PostHogErrorDeduper();
+
+    expect(
+      deduper.process(exceptionEvent("App 7 not found"), false, 0),
+    ).toBeTruthy();
+    expect(
+      deduper.process(exceptionEvent("App 42 not found"), false, 1),
+    ).toBeNull();
+    expect(
+      deduper.process(exceptionEvent("Chat not found: 3"), false, 2),
+    ).toBeTruthy();
+    expect(
+      deduper.process(exceptionEvent("Chat not found: 18"), false, 3),
+    ).toBeNull();
+  });
+
+  it("keeps meaningful error codes and throw sites distinct", () => {
+    const deduper = new PostHogErrorDeduper();
+
+    expect(
+      deduper.process(exceptionEvent("Request failed: 400"), false, 0),
+    ).toBeTruthy();
+    expect(
+      deduper.process(exceptionEvent("Request failed: 500"), false, 1),
+    ).toBeTruthy();
+    expect(
+      deduper.process(
+        exceptionEvent("Request failed: 400", "file:///app/src/other.ts"),
+        false,
+        2,
+      ),
+    ).toBeTruthy();
+    expect(
+      deduper.process(
+        exceptionEvent(
+          "Request failed: 400",
+          "file:///app/src/example.ts",
+          43,
+          7,
+        ),
+        false,
+        3,
+      ),
+    ).toBeTruthy();
+  });
+
+  it("deduplicates custom error-shaped events", () => {
+    const deduper = new PostHogErrorDeduper();
+    const event = {
+      event: "extra-files:error",
+      properties: { error: "Git failed for app 123456", appId: 123456 },
+    };
+
+    expect(deduper.process(event, false, 0)).toBe(event);
+    expect(
+      deduper.process(
+        {
+          event: "extra-files:error",
+          properties: { error: "Git failed for app 987654", appId: 987654 },
+        },
+        false,
+        1,
+      ),
+    ).toBeNull();
+  });
+
+  it("keeps stable custom error context distinct", () => {
+    const deduper = new PostHogErrorDeduper();
+    const iterationError = {
+      event: "local_agent:terminated_stream_retry",
+      properties: {
+        error: "terminated",
+        phase: "stream_iteration",
+        chatId: 1,
+      },
+    };
+    const finalizationError = {
+      event: "local_agent:terminated_stream_retry",
+      properties: {
+        error: "terminated",
+        phase: "response_finalization",
+        chatId: 2,
+      },
+    };
+
+    expect(deduper.process(iterationError, false, 0)).toBe(iterationError);
+    expect(deduper.process(finalizationError, false, 1)).toBe(
+      finalizationError,
+    );
+    expect(
+      deduper.process(
+        {
+          ...iterationError,
+          properties: { ...iterationError.properties, chatId: 3 },
+        },
+        false,
+        2,
+      ),
+    ).toBeNull();
+  });
+
+  it("always admits explicit crash telemetry", () => {
+    const deduper = new PostHogErrorDeduper();
+    const crash = {
+      event: "renderer:crash_detected",
+      properties: { error: true, reason: "crashed" },
+    };
+
+    expect(deduper.process(crash, false, 0)).toBe(crash);
+    expect(deduper.process(crash, false, 1)).toBe(crash);
+  });
+
+  it("shares hashed state without persisting raw telemetry", () => {
+    const storage = new MemoryStorage();
+    const event = exceptionEvent("uniquely sensitive error 123456");
+
+    expect(new PostHogErrorDeduper(storage).process(event, false, 0)).toBe(
+      event,
+    );
+    expect(
+      new PostHogErrorDeduper(storage).process(event, false, 1),
+    ).toBeNull();
+
+    const persisted = [...storage.values.values()].join("");
+    expect(persisted).not.toContain("uniquely sensitive");
+    expect(persisted).not.toContain("example.ts");
+    expect(Object.keys(JSON.parse(persisted))).toHaveLength(1);
+  });
+
+  it("recovers from malformed or unavailable storage", () => {
+    const malformedStorage = new MemoryStorage();
+    malformedStorage.setItem("dyadPostHogErrorDedupe:v1", "not-json");
+    const event = exceptionEvent();
+    const malformedDeduper = new PostHogErrorDeduper(malformedStorage);
+
+    expect(malformedDeduper.process(event, false, 0)).toBe(event);
+    expect(malformedDeduper.process(event, false, 1)).toBeNull();
+
+    const throwingStorage = {
+      getItem: () => {
+        throw new Error("storage disabled");
+      },
+      setItem: () => {
+        throw new Error("storage disabled");
+      },
+    };
+    const inMemoryDeduper = new PostHogErrorDeduper(throwingStorage);
+    expect(inMemoryDeduper.process(event, false, 0)).toBe(event);
+    expect(inMemoryDeduper.process(event, false, 1)).toBeNull();
+  });
+
+  it("keeps memory authoritative after a storage write failure", () => {
+    const readOnlyStorage = {
+      getItem: () => "{}",
+      setItem: () => {
+        throw new Error("storage is read-only");
+      },
+    };
+    const deduper = new PostHogErrorDeduper(readOnlyStorage);
+    const event = exceptionEvent();
+
+    expect(deduper.process(event, false, 0)).toBe(event);
+    expect(deduper.process(event, false, 1)).toBeNull();
+  });
+
+  it("guards access to the localStorage property itself", () => {
+    const owner = Object.defineProperty({}, "localStorage", {
+      get: () => {
+        throw new Error("storage access denied");
+      },
+    });
+
+    expect(getPostHogTelemetryStorage(owner as Window)).toBeUndefined();
+  });
+
+  it("bounds persisted fingerprint records", () => {
+    const storage = new MemoryStorage();
+    const deduper = new PostHogErrorDeduper(storage);
+
+    for (let index = 0; index < 550; index += 1) {
+      deduper.process(exceptionEvent(`Distinct error ${index}`), false, index);
+    }
+
+    const persisted = [...storage.values.values()][0];
+    expect(Object.keys(JSON.parse(persisted))).toHaveLength(500);
+  });
+
+  it("retains a hot suppressed fingerprint when bounding storage", () => {
+    const storage = new MemoryStorage();
+    const deduper = new PostHogErrorDeduper(storage);
+    const hotError = exceptionEvent("Hot recurring error");
+
+    deduper.process(hotError, false, 0);
+    for (let index = 1; index < 500; index += 1) {
+      deduper.process(exceptionEvent(`Distinct error ${index}`), false, index);
+    }
+    expect(deduper.process(hotError, false, 500)).toBeNull();
+    deduper.process(exceptionEvent("Overflow error one"), false, 501);
+    deduper.process(exceptionEvent("Overflow error two"), false, 502);
+
+    expect(deduper.process(hotError, false, 503)).toBeNull();
+  });
+
+  it("throttles persistence work for a hot suppressed fingerprint", () => {
+    const values = new Map<string, string>();
+    const storage = {
+      getItem: vi.fn((key: string) => values.get(key) ?? null),
+      setItem: vi.fn((key: string, value: string) => {
+        values.set(key, value);
+      }),
+    };
+    const deduper = new PostHogErrorDeduper(storage);
+    const event = exceptionEvent();
+
+    deduper.process(event, false, 0);
+    const readsAfterAdmission = storage.getItem.mock.calls.length;
+    deduper.process(event, false, 1);
+    deduper.process(event, false, 2);
+    deduper.process(event, false, 3);
+
+    expect(storage.getItem).toHaveBeenCalledTimes(readsAfterAdmission);
+    expect(storage.setItem).toHaveBeenCalledTimes(1);
+
+    deduper.process(event, false, 5_000);
+    expect(storage.getItem).toHaveBeenCalledTimes(readsAfterAdmission + 1);
+    expect(storage.setItem).toHaveBeenCalledTimes(2);
+  });
+
+  it("flushes throttled suppression counters before shutdown", () => {
+    const storage = new MemoryStorage();
+    const event = exceptionEvent();
+    const deduper = new PostHogErrorDeduper(storage, "window-a");
+
+    deduper.process(event, false, 0);
+    deduper.process(event, false, 1);
+    deduper.flush(2);
+
+    expect(
+      new PostHogErrorDeduper(storage, "window-b").process(
+        event,
+        false,
+        24 * HOUR_MS,
+      ),
+    ).toMatchObject({
+      properties: { dyad_error_suppressed_count: 1 },
+    });
+  });
+
+  it("persists throttled suppression counters after the write interval", () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(0);
+      const storage = new MemoryStorage();
+      const event = exceptionEvent();
+      const deduper = new PostHogErrorDeduper(storage, "window-a");
+
+      deduper.process(event, false, 0);
+      vi.setSystemTime(1);
+      deduper.process(event, false, 1);
+      vi.advanceTimersByTime(4_999);
+
+      expect(
+        new PostHogErrorDeduper(storage, "window-b").process(
+          event,
+          false,
+          24 * HOUR_MS,
+        ),
+      ).toMatchObject({
+        properties: { dyad_error_suppressed_count: 1 },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("persists pending counters before another window reaches the boundary", () => {
+    const storage = new MemoryStorage();
+    const event = exceptionEvent();
+    const firstWindow = new PostHogErrorDeduper(storage, "window-a");
+    const freeWindowMs = 24 * HOUR_MS;
+
+    firstWindow.process(event, false, 0);
+    firstWindow.process(event, false, freeWindowMs - 1);
+
+    expect(
+      new PostHogErrorDeduper(storage, "window-b").process(
+        event,
+        false,
+        freeWindowMs,
+      ),
+    ).toMatchObject({
+      properties: { dyad_error_suppressed_count: 1 },
+    });
+  });
+
+  it("throttles forced persistence near the dedupe boundary", () => {
+    vi.useFakeTimers();
+    try {
+      const values = new Map<string, string>();
+      const storage = {
+        getItem: vi.fn((key: string) => values.get(key) ?? null),
+        setItem: vi.fn((key: string, value: string) => {
+          values.set(key, value);
+        }),
+      };
+      const event = exceptionEvent();
+      const deduper = new PostHogErrorDeduper(storage, "window-a");
+      const freeWindowMs = 24 * HOUR_MS;
+
+      deduper.process(event, false, 0);
+      deduper.process(event, false, freeWindowMs - 5_000);
+      for (let offset = 4_999; offset > 4_750; offset -= 1) {
+        deduper.process(event, false, freeWindowMs - offset);
+      }
+
+      expect(storage.setItem).toHaveBeenCalledTimes(2);
+      deduper.process(event, false, freeWindowMs - 4_750);
+      expect(storage.setItem).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("carries a throttled boundary delta into a newer shared epoch", () => {
+    const storage = new MemoryStorage();
+    const event = exceptionEvent();
+    const firstWindow = new PostHogErrorDeduper(storage, "window-a");
+    const secondWindow = new PostHogErrorDeduper(storage, "window-b");
+    const freeWindowMs = 24 * HOUR_MS;
+
+    firstWindow.process(event, false, 0);
+    firstWindow.process(event, false, freeWindowMs - 5_000);
+    firstWindow.process(event, false, freeWindowMs - 4_999);
+    expect(secondWindow.process(event, false, freeWindowMs)).toMatchObject({
+      properties: { dyad_error_suppressed_count: 1 },
+    });
+
+    firstWindow.flush(freeWindowMs + 1);
+    expect(
+      new PostHogErrorDeduper(storage, "window-c").process(
+        event,
+        false,
+        2 * freeWindowMs,
+      ),
+    ).toMatchObject({
+      properties: { dyad_error_suppressed_count: 1 },
+    });
+  });
+
+  it("does not carry a delta already reported by a local epoch rollover", () => {
+    const storage = new MemoryStorage();
+    const event = exceptionEvent();
+    const deduper = new PostHogErrorDeduper(storage, "window-a");
+    const freeWindowMs = 24 * HOUR_MS;
+
+    deduper.process(event, false, 0);
+    deduper.process(event, false, freeWindowMs - 5_000);
+    deduper.process(event, false, freeWindowMs - 4_999);
+    expect(deduper.process(event, false, freeWindowMs)).toMatchObject({
+      properties: { dyad_error_suppressed_count: 2 },
+    });
+    expect(deduper.process(event, false, 2 * freeWindowMs)).not.toHaveProperty(
+      "properties.dyad_error_suppressed_count",
+    );
+  });
+
+  it("resets future records after the system clock moves backward", () => {
+    const storage = new MemoryStorage();
+    const event = exceptionEvent();
+    const deduper = new PostHogErrorDeduper(storage, "window-a");
+
+    deduper.process(event, false, 10_000);
+    expect(deduper.process(event, false, 1_000)).toBeTruthy();
+    expect(deduper.process(event, false, 1_001)).toBeNull();
+  });
+
+  it("merges suppression counts from multiple renderer windows", () => {
+    const storage = new MemoryStorage();
+    const firstWindow = new PostHogErrorDeduper(storage, "window-a");
+    const secondWindow = new PostHogErrorDeduper(storage, "window-b");
+    const event = exceptionEvent();
+
+    firstWindow.process(event, true, 0);
+    secondWindow.process(event, true, 1);
+    firstWindow.process(event, true, 2);
+    firstWindow.process(event, true, 5_000);
+    secondWindow.process(event, true, 5_001);
+
+    const nextWindow = new PostHogErrorDeduper(storage, "window-c");
+    expect(nextWindow.process(event, true, 10 * 60 * 1000)).toMatchObject({
+      properties: {
+        dyad_error_suppressed_count: 4,
+      },
+    });
+  });
+
+  it("merges shared fingerprints before forced writes", () => {
+    const storage = new MemoryStorage();
+    const firstWindow = new PostHogErrorDeduper(storage, "window-a");
+    const secondWindow = new PostHogErrorDeduper(storage, "window-b");
+
+    firstWindow.process(exceptionEvent("Error X"), false, 0);
+    secondWindow.process(exceptionEvent("Error Y"), false, 1);
+    firstWindow.process(exceptionEvent("Error Z"), false, 2);
+
+    const nextWindow = new PostHogErrorDeduper(storage, "window-c");
+    expect(nextWindow.process(exceptionEvent("Error Y"), false, 3)).toBeNull();
+  });
+
+  it("refreshes shared state before admitting at the dedupe boundary", () => {
+    const storage = new MemoryStorage();
+    const firstWindow = new PostHogErrorDeduper(storage, "window-a");
+    const secondWindow = new PostHogErrorDeduper(storage, "window-b");
+    const event = exceptionEvent();
+    const proWindowMs = 10 * 60 * 1000;
+
+    firstWindow.process(event, true, 0);
+    firstWindow.process(event, true, proWindowMs - 1);
+    expect(secondWindow.process(event, true, proWindowMs)).toBeTruthy();
+    expect(firstWindow.process(event, true, proWindowMs + 1)).toBeNull();
+  });
+
+  it("honors forced shared reads within the same millisecond", () => {
+    const storage = new MemoryStorage();
+    const firstWindow = new PostHogErrorDeduper(storage, "window-a");
+    const secondWindow = new PostHogErrorDeduper(storage, "window-b");
+
+    firstWindow.process(exceptionEvent("Error X"), false, 0);
+    secondWindow.process(exceptionEvent("Error Y"), false, 0);
+
+    expect(firstWindow.process(exceptionEvent("Error Y"), false, 0)).toBeNull();
+  });
+});
+
+describe("PostHog error telemetry classification", () => {
+  it("recognizes exception and custom error shapes", () => {
+    expect(isPostHogErrorTelemetryEvent(exceptionEvent())).toBe(true);
+    expect(
+      isPostHogErrorTelemetryEvent({
+        event: "custom-event",
+        properties: { $exception_type: "TypeError" },
+      }),
+    ).toBe(true);
+    expect(
+      isPostHogErrorTelemetryEvent({
+        event: "custom-event",
+        properties: { error: true },
+      }),
+    ).toBe(true);
+    expect(
+      isPostHogErrorTelemetryEvent({
+        event: "custom-event",
+        properties: { error: false },
+      }),
+    ).toBe(false);
+    expect(isPostHogErrorTelemetryEvent({ event: "chat:submit" })).toBe(false);
+  });
+
+  it("recognizes all current explicit crash event names", () => {
+    for (const event of [
+      "app:crash_detected",
+      "renderer:crash_detected",
+      "utility_process:crash_detected",
+      "code_explorer:host_crash",
+    ]) {
+      expect(isPostHogCrashTelemetryEvent({ event })).toBe(true);
+    }
+    expect(isPostHogCrashTelemetryEvent(exceptionEvent())).toBe(false);
+  });
+});
 
 describe("createExceptionFromTelemetry", () => {
   it("uses exception telemetry fields when present", () => {
@@ -79,7 +671,94 @@ describe("shouldFilterPostHogExceptionEvent", () => {
   });
 });
 
+// A change to either list adds or removes data sent to PostHog, so it should
+// be a deliberate, reviewed edit.
+const PERSON_PROPERTY_NAMES = [
+  "agentToolsAlwaysCount",
+  "agentToolsNeverCount",
+  "autoApproveChanges",
+  "autoApproveNonSchemaSql",
+  "autoApproveSafeMcpTools",
+  "autoFixReviewIssues",
+  "blockUnsafeNpmPackages",
+  "chatgptFastMode",
+  "cloudflareConnected",
+  "coolifyConnected",
+  "disablePreviewNodeAutoInstall",
+  "disableSandboxedE2eTests",
+  "enableAdvancedSubagents",
+  "enableAppBlueprint",
+  "enableAppPreviewDomains",
+  "enableAutoReview",
+  "enableAutoUpdate",
+  "enableCloudSandbox",
+  "enableCodeExplorer",
+  "enableContextCompaction",
+  "enableExplorerSubagent",
+  "enableGitlabPublishing",
+  "enableImplementerSubagent",
+  "enableMcpToolSearch",
+  "enableMultiWindow",
+  "enableOwnServerDeployment",
+  "enableParallelTestRuns",
+  "enablePreviewCookieIsolation",
+  "enableProWebSearch",
+  "enableReviewButton",
+  "enableSandboxScriptExecution",
+  "enableShellTool",
+  "enableSuggestedPrompts",
+  "enableSupabaseWriteSqlMigration",
+  "enableTestRunInPreview",
+  "enableTestingForNewApps",
+  "githubConnected",
+  "gitlabConnected",
+  "isPro",
+  "language",
+  "maxChatTurnsInContext",
+  "maxConcurrentTestRuns",
+  "maxToolCallSteps",
+  "neonConnected",
+  "nodeRuntimePreference",
+  "previewIdleTimeoutPolicy",
+  "proLazyEditsMode",
+  "proModelUsage",
+  "proSmartContextOption",
+  "selectedChatMode",
+  "selectedTemplateId",
+  "selectedThemeId",
+  "supabaseConnected",
+  "vercelConnected",
+];
+
+const INITIAL_LOAD_ONLY_PROPERTY_NAMES = [
+  "appVersion",
+  "claudeSubscriptionEnabled",
+  "codexSubscriptionEnabled",
+  "defaultChatMode",
+  "isFirstSession",
+  "modelProvider",
+  "platform",
+  "releaseChannel",
+  "runtimeMode2",
+];
+
 describe("getInitialLoadTelemetryProperties", () => {
+  it("sends exactly the approved properties", () => {
+    expect(
+      Object.keys(
+        getInitialLoadTelemetryProperties({
+          settings: makeSettings(),
+          codexSubscriptionEnabled: null,
+          appVersion: "1.1.0",
+          platform: null,
+          isFirstSession: false,
+        }),
+      ).sort(),
+    ).toEqual(
+      [...PERSON_PROPERTY_NAMES, ...INITIAL_LOAD_ONLY_PROPERTY_NAMES].sort(),
+    );
+  });
+
   it("includes high-value launch properties from settings", () => {
     expect(
       getInitialLoadTelemetryProperties({
@@ -91,17 +770,25 @@ describe("getInitialLoadTelemetryProperties", () => {
           providerSettings: {
             auto: { apiKey: { value: "secret" } },
           },
+          enableAppBlueprint: false,
+          enableTestingForNewApps: true,
+          enableClaudeCodeSubscription: true,
         }),
+        codexSubscriptionEnabled: true,
         appVersion: "1.1.0",
         platform: "darwin",
         isFirstSession: false,
       }),
-    ).toEqual({
+    ).toMatchObject({
       isPro: true,
       appVersion: "1.1.0",
       platform: "darwin",
       releaseChannel: "beta",
       isFirstSession: false,
+      enableAppBlueprint: false,
+      enableTestingForNewApps: true,
+      codexSubscriptionEnabled: true,
+      claudeSubscriptionEnabled: true,
       modelProvider: "auto",
       defaultChatMode: "ask",
       runtimeMode2: "docker",
@@ -114,24 +801,203 @@ describe("getInitialLoadTelemetryProperties", () => {
         settings: makeSettings({
           selectedChatMode: "plan",
         }),
+        codexSubscriptionEnabled: false,
         appVersion: "1.1.0",
         platform: null,
         isFirstSession: true,
       }),
-    ).toEqual({
+    ).toMatchObject({
       isPro: false,
       appVersion: "1.1.0",
       platform: null,
       releaseChannel: "stable",
       isFirstSession: true,
+      enableAppBlueprint: true,
+      enableTestingForNewApps: false,
+      codexSubscriptionEnabled: false,
+      claudeSubscriptionEnabled: false,
       modelProvider: "auto",
       defaultChatMode: null,
       runtimeMode2: "host",
     });
   });
+
+  function getSettingsProperties(overrides: Partial<UserSettings>) {
+    return getInitialLoadTelemetryProperties({
+      settings: makeSettings(overrides),
+      codexSubscriptionEnabled: null,
+      appVersion: "1.1.0",
+      platform: null,
+      isFirstSession: false,
+    });
+  }
+
+  it("reports official template and built-in theme IDs as themselves", () => {
+    expect(
+      getSettingsProperties({
+        selectedTemplateId: "react",
+        selectedThemeId: "default",
+      }),
+    ).toMatchObject({
+      selectedTemplateId: "react",
+      selectedThemeId: "default",
+    });
+  });
+
+  it("hides community template and custom theme IDs", () => {
+    const properties = getSettingsProperties({
+      selectedTemplateId: "some-org/private-repo",
+      selectedThemeId: "custom:12",
+    });
+
+    expect(properties).toMatchObject({
+      selectedTemplateId: "community",
+      selectedThemeId: "custom",
+    });
+    expect(JSON.stringify(properties)).not.toContain("private-repo");
+  });
+
+  it("reports no theme as null rather than custom", () => {
+    expect(getSettingsProperties({ selectedThemeId: "" })).toMatchObject({
+      selectedThemeId: null,
+    });
+  });
+
+  it("reports agent tool consents as counts, not tool names", () => {
+    const properties = getSettingsProperties({
+      agentToolConsents: { run_shell: "never", read_guide: "always", a: "ask" },
+    });
+
+    expect(properties).toMatchObject({
+      agentToolsAlwaysCount: 1,
+      agentToolsNeverCount: 1,
+    });
+    expect(JSON.stringify(properties)).not.toContain("run_shell");
+  });
+
+  it("reports connections without sending credentials", () => {
+    const properties = getSettingsProperties({
+      vercelAccessToken: { value: "vercel-secret" },
+      customNodePath: "/home/person/node",
+      experiments: { enableCloudSandbox: true },
+    });
+
+    expect(properties).toMatchObject({
+      vercelConnected: true,
+      enableCloudSandbox: true,
+    });
+    const serialized = JSON.stringify(properties);
+    expect(serialized).not.toContain("vercel-secret");
+    expect(serialized).not.toContain("/home/person/node");
+  });
+
+  it("carries the previous session's app size as the crash-rate denominator", () => {
+    const properties = getInitialLoadTelemetryProperties({
+      settings: makeSettings({}),
+      codexSubscriptionEnabled: null,
+      appVersion: "1.1.0",
+      platform: null,
+      isFirstSession: false,
+      previousSessionAppSize: {
+        fileCount: 310,
+        totalBytes: 2_000_000,
+        maxFileCount: 310,
+        maxTotalBytes: 2_000_000,
+        distinctApps: 1,
+      },
+    });
+
+    expect(properties).toMatchObject({
+      codexSubscriptionEnabled: null,
+      prev_session_app_file_count: 310,
+      prev_session_app_bytes: 2_000_000,
+      prev_session_max_app_file_count: 310,
+      prev_session_max_app_bytes: 2_000_000,
+      prev_session_distinct_apps: 1,
+    });
+  });
+});
+
+describe("getSettingsPersonTelemetryProperties", () => {
+  it("includes pro and settings toggles for PostHog people properties", () => {
+    expect(
+      getSettingsPersonTelemetryProperties(
+        makeSettings({
+          providerSettings: {
+            auto: { apiKey: { value: "secret" } },
+          },
+          enableAppBlueprint: false,
+          enableTestingForNewApps: true,
+        }),
+      ),
+    ).toMatchObject({
+      isPro: true,
+      enableAppBlueprint: false,
+      enableTestingForNewApps: true,
+    });
+  });
+
+  it("sends exactly the approved properties", () => {
+    expect(
+      Object.keys(getSettingsPersonTelemetryProperties(makeSettings())).sort(),
+    ).toEqual(PERSON_PROPERTY_NAMES);
+  });
+
+  it("reports the real default for unset settings", () => {
+    expect(getSettingsPersonTelemetryProperties(makeSettings())).toMatchObject({
+      enableShellTool: false,
+      enableCloudSandbox: false,
+      enableSuggestedPrompts: DEFAULT_ENABLE_SUGGESTED_PROMPTS,
+      enableParallelTestRuns: false,
+      blockUnsafeNpmPackages: true,
+      maxToolCallSteps: DEFAULT_MAX_TOOL_CALL_STEPS,
+      maxConcurrentTestRuns: DEFAULT_MAX_CONCURRENT_TEST_RUNS,
+      maxChatTurnsInContext: MAX_CHAT_TURNS_IN_CONTEXT,
+      proSmartContextOption: null,
+    });
+  });
+
+  it("reports stored values over defaults", () => {
+    expect(
+      getSettingsPersonTelemetryProperties(
+        makeSettings({
+          enableShellTool: true,
+          blockUnsafeNpmPackages: false,
+          enableParallelTestRuns: true,
+          maxToolCallSteps: 7,
+          maxChatTurnsInContext: 9,
+          maxConcurrentTestRuns: 4,
+        }),
+      ),
+    ).toMatchObject({
+      enableShellTool: true,
+      blockUnsafeNpmPackages: false,
+      enableParallelTestRuns: true,
+      maxToolCallSteps: 7,
+      maxChatTurnsInContext: 9,
+      maxConcurrentTestRuns: 4,
+    });
+  });
 });
 
 describe("shouldBypassNonProTelemetrySampling", () => {
+  it.each([
+    "neon:leaked-backups-at-branch-limit",
+    "neon:migration",
+    "neon:project-created",
+    "neon:backup-cleanup",
+  ])("always sends the Neon migration event %s", (event) => {
+    expect(shouldBypassNonProTelemetrySampling({ event })).toBe(true);
+  });
+
+  it("always sends concurrent chat starts", () => {
+    expect(
+      shouldBypassNonProTelemetrySampling({
+        event: "chat:concurrent-stream-started",
+      }),
+    ).toBe(true);
+  });
+
   it("always sends sandbox.script.* events for non-Pro sampling", () => {
     expect(
       shouldBypassNonProTelemetrySampling({
@@ -159,11 +1025,102 @@ describe("shouldBypassNonProTelemetrySampling", () => {
     ).toBe(true);
   });
 
+  it("always sends the screenshot prompt funnel for non-Pro sampling", () => {
+    for (const event of [
+      "screenshot-prompt:bar-opened",
+      "screenshot-prompt:bar-cancelled",
+      "screenshot-prompt:capture-attempt",
+      "screenshot-prompt:captured",
+      "screenshot-prompt:capture-failed",
+      "screenshot-prompt:removed",
+      "issue-form:opened",
+      "issue-form:blocked",
+    ]) {
+      expect(
+        shouldBypassNonProTelemetrySampling({
+          event,
+          properties: { source: "upload-session" },
+        }),
+      ).toBe(true);
+    }
+  });
+
   it("always sends app:initial-load for non-Pro sampling", () => {
     expect(
       shouldBypassNonProTelemetrySampling({
         event: "app:initial-load",
         properties: { isPro: false, appVersion: "1.0.0" },
+      }),
+    ).toBe(true);
+  });
+
+  it("always sends PostHog person-property updates for non-Pro sampling", () => {
+    expect(
+      shouldBypassNonProTelemetrySampling({
+        event: "$set",
+        properties: {
+          $set: { enableTestingForNewApps: true },
+        },
+      }),
+    ).toBe(true);
+  });
+
+  it("always sends ChatGPT setup clicks for non-Pro sampling", () => {
+    expect(
+      shouldBypassNonProTelemetrySampling({
+        event: "setup-flow:ai-provider-setup:chatgpt:click",
+      }),
+    ).toBe(true);
+  });
+  it("always sends promo_click for non-Pro sampling", () => {
+    expect(
+      shouldBypassNonProTelemetrySampling({
+        event: "promo_click",
+        properties: { messageId: "pro-trial" },
+      }),
+    ).toBe(true);
+  });
+
+  it("always sends the integration setup funnel for non-Pro sampling", () => {
+    for (const event of [
+      "integration-setup:start",
+      "integration-setup:complete",
+    ]) {
+      expect(
+        shouldBypassNonProTelemetrySampling({
+          event,
+          properties: { provider: "neon", requestId: "integration-1" },
+        }),
+      ).toBe(true);
+    }
+  });
+
+  it.each(["e2e_test_run_completed"])(
+    "keeps %s for non-Pro run correlation",
+    (event) => {
+      expect(
+        shouldBypassNonProTelemetrySampling({
+          event,
+          properties: { timing_id: "test-run-1", status: "completed" },
+        }),
+      ).toBe(true);
+    },
+  );
+
+  it.each([
+    "e2e_test_step_started",
+    "e2e_test_step_completed",
+    "e2e_test_case_completed",
+    "e2e_test_future_event",
+  ])("does not extend the timing exemption to %s", (event) => {
+    expect(shouldBypassNonProTelemetrySampling({ event })).toBe(false);
+  });
+
+  it("always sends pnpm build policy telemetry for non-Pro sampling", () => {
+    expect(
+      shouldBypassNonProTelemetrySampling({
+        event: "pnpm:build-auto-denied",
+        properties: { packages: ["core-js@3.49.0"] },
       }),
     ).toBe(true);
   });
@@ -229,5 +1186,47 @@ describe("getExceptionTelemetryContext", () => {
         exception_message: "Boom",
       }),
     ).toBeUndefined();
+  });
+});
+
+describe("getInitialLoadTelemetryProperties pagefile", () => {
+  it("flattens the Windows pagefile configuration", () => {
+    const properties = getInitialLoadTelemetryProperties({
+      settings: makeSettings(),
+      codexSubscriptionEnabled: false,
+      appVersion: "1.1.0",
+      platform: "win32",
+      isFirstSession: false,
+      pagefile: { mode: "fixed", maxMB: 4096 },
+    });
+    expect(properties).toMatchObject({
+      pagefile_mode: "fixed",
+      pagefile_max_mb: 4096,
+    });
+  });
+
+  it("omits the maximum for a system-managed pagefile", () => {
+    const properties = getInitialLoadTelemetryProperties({
+      settings: makeSettings(),
+      codexSubscriptionEnabled: false,
+      appVersion: "1.1.0",
+      platform: "win32",
+      isFirstSession: false,
+      pagefile: { mode: "auto" },
+    });
+    expect(properties).toMatchObject({ pagefile_mode: "auto" });
+    expect(properties).not.toHaveProperty("pagefile_max_mb");
+  });
+
+  it("omits the pagefile fields off Windows", () => {
+    const properties = getInitialLoadTelemetryProperties({
+      settings: makeSettings(),
+      codexSubscriptionEnabled: false,
+      appVersion: "1.1.0",
+      platform: "darwin",
+      isFirstSession: false,
+      pagefile: null,
+    });
+    expect(properties).not.toHaveProperty("pagefile_mode");
   });
 });

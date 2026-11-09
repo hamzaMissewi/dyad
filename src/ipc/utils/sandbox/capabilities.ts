@@ -1,13 +1,20 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { safeJoin } from "@/ipc/utils/path_utils";
+import { assertMutationPathAllowed, safeJoin } from "@/ipc/utils/path_utils";
 import {
   getDyadMediaDir,
+  listAttachmentLogicalPaths,
   listStoredAttachments,
   resolveAttachmentLogicalPath,
   toAttachmentLogicalPath,
 } from "@/ipc/utils/media_path_utils";
 import { DyadError, DyadErrorKind } from "@/errors/dyad_error";
+import { readContainedTextFile } from "@/ipc/utils/bounded_text_file";
+import {
+  isDotenvAttachment,
+  isDotenvFilePath,
+  redactDotenvValues,
+} from "@/utils/dotenv_redaction";
 import { SANDBOX_READ_FILE_LIMIT_BYTES } from "./limits";
 
 type StructuredObject = { [key: string]: unknown };
@@ -43,7 +50,6 @@ export type SandboxHostCallObserver = (params: {
 }) => void;
 
 const DENIED_PATH_PATTERNS = [
-  /(^|[/\\])(?:\.env(?:\.[^/\\]+)*|\.envrc)(?:[/\\]|$)/i,
   /(^|[/\\])\.git([/\\]|$)/i,
   /(^|[/\\])\.npmrc$/i,
   /(^|[/\\])\.yarnrc(?:\.yml)?$/i,
@@ -57,6 +63,21 @@ const DENIED_PATH_PATTERNS = [
   /\.key$/i,
   /\.pem$/i,
 ];
+const DOTENV_DENIED_PATH_PATTERN =
+  /(^|[/\\])(?:\.env(?:\.[^/\\]+)*|\.envrc)(?:[/\\]|$)/i;
+
+function isDeniedSandboxPath(
+  filePath: string,
+  options?: { allowDotenvFile?: boolean },
+): boolean {
+  if (DENIED_PATH_PATTERNS.some((pattern) => pattern.test(filePath))) {
+    return true;
+  }
+  if (!DOTENV_DENIED_PATH_PATTERN.test(filePath)) {
+    return false;
+  }
+  return !(options?.allowDotenvFile && isDotenvFilePath(filePath));
+}
 
 const TEXT_EXTENSIONS = new Set([
   ".css",
@@ -140,7 +161,10 @@ function parseReadOptions(value: unknown): SandboxReadFileOptions {
   };
 }
 
-export function assertAllowedGuestPath(guestPath: string): void {
+function assertSandboxGuestPath(
+  guestPath: string,
+  options?: { allowDotenvFile?: boolean },
+): void {
   if (!guestPath || typeof guestPath !== "string") {
     throw new DyadError("File path is required.", DyadErrorKind.Validation);
   }
@@ -162,7 +186,7 @@ export function assertAllowedGuestPath(guestPath: string): void {
       DyadErrorKind.Validation,
     );
   }
-  if (DENIED_PATH_PATTERNS.some((pattern) => pattern.test(guestPath))) {
+  if (isDeniedSandboxPath(guestPath, options)) {
     throw new DyadError(
       `Sandbox scripts cannot access protected path: ${guestPath}`,
       DyadErrorKind.Precondition,
@@ -170,58 +194,24 @@ export function assertAllowedGuestPath(guestPath: string): void {
   }
 }
 
+export function assertAllowedGuestPath(guestPath: string): void {
+  assertSandboxGuestPath(guestPath);
+}
+
 function isTextPath(filePath: string): boolean {
   return TEXT_EXTENSIONS.has(path.extname(filePath).toLowerCase());
 }
 
-/**
- * Realpath containment for sandbox writes, mirroring the check reads run in
- * `assertResolvedPathAllowed`. That check requires the target to exist;
- * writes may create new files, so this resolves the deepest existing
- * ancestor (and the target itself when it exists, catching file symlinks)
- * and rejects anything that escapes the app directory through a symlink.
- * Missing intermediate directories are created as real directories by the
- * writer, so composing the resolved ancestor with the remaining segments is
- * the true final location.
- */
 export async function assertSandboxWritePathAllowed(params: {
   appPath: string;
   guestPath: string;
 }): Promise<void> {
   assertAllowedGuestPath(params.guestPath);
-  const realAppPath = await fs.realpath(params.appPath);
-
-  let existing = safeJoin(params.appPath, params.guestPath);
-  const missingSegments: string[] = [];
-  let realExisting: string;
-  for (;;) {
-    try {
-      realExisting = await fs.realpath(existing);
-      break;
-    } catch (error) {
-      if (!isNodeErrorWithCode(error, "ENOENT")) {
-        throw error;
-      }
-      const parent = path.dirname(existing);
-      if (parent === existing) {
-        // Hit the filesystem root without finding an existing directory.
-        throw error;
-      }
-      missingSegments.unshift(path.basename(existing));
-      existing = parent;
-    }
-  }
-
-  const resolvedTarget = path.join(realExisting, ...missingSegments);
-  const relative = path.relative(realAppPath, resolvedTarget);
-  if (relative.startsWith("..") || path.isAbsolute(relative)) {
-    throw new DyadError(
-      `Sandbox scripts cannot write files outside the app: ${params.guestPath}`,
-      DyadErrorKind.Precondition,
-    );
-  }
-  const normalized = relative.split(path.sep).join("/");
-  if (DENIED_PATH_PATTERNS.some((pattern) => pattern.test(normalized))) {
+  const normalized = await assertMutationPathAllowed({
+    appPath: params.appPath,
+    relativePath: params.guestPath,
+  });
+  if (isDeniedSandboxPath(normalized)) {
     throw new DyadError(
       `Sandbox scripts cannot access protected path: ${params.guestPath}`,
       DyadErrorKind.Precondition,
@@ -232,7 +222,12 @@ export async function assertSandboxWritePathAllowed(params: {
 async function resolveSandboxPath(params: {
   appPath: string;
   guestPath: string;
-}): Promise<{ filePath: string; displayPath: string }> {
+  allowDotenvRead?: boolean;
+}): Promise<{
+  filePath: string;
+  displayPath: string;
+  isDotenvAttachment?: boolean;
+}> {
   if (params.guestPath.startsWith("attachments:")) {
     const attachment = await resolveAttachmentLogicalPath(
       params.appPath,
@@ -247,10 +242,15 @@ async function resolveSandboxPath(params: {
     return {
       filePath: attachment.filePath,
       displayPath: toAttachmentLogicalPath(attachment.logicalName),
+      isDotenvAttachment: isDotenvAttachment(attachment),
     };
   }
 
-  assertAllowedGuestPath(params.guestPath);
+  if (params.allowDotenvRead) {
+    assertSandboxGuestPath(params.guestPath, { allowDotenvFile: true });
+  } else {
+    assertAllowedGuestPath(params.guestPath);
+  }
   return {
     filePath: safeJoin(params.appPath, params.guestPath),
     displayPath: params.guestPath,
@@ -261,7 +261,9 @@ async function assertResolvedPathAllowed(params: {
   appPath: string;
   filePath: string;
   displayPath: string;
-}): Promise<void> {
+  isDotenvAttachment?: boolean;
+  allowDotenvRead?: boolean;
+}): Promise<{ realFilePath: string; isDotenv: boolean }> {
   const realAppPath = await fs.realpath(params.appPath);
   let realFilePath: string;
   try {
@@ -291,15 +293,28 @@ async function assertResolvedPathAllowed(params: {
         DyadErrorKind.Precondition,
       );
     }
-    return;
+    return {
+      realFilePath,
+      isDotenv:
+        params.isDotenvAttachment === true ||
+        isDotenvFilePath(params.displayPath) ||
+        isDotenvFilePath(realFilePath),
+    };
   }
   const normalized = relative.split(path.sep).join("/");
-  if (DENIED_PATH_PATTERNS.some((pattern) => pattern.test(normalized))) {
+  if (
+    isDeniedSandboxPath(normalized, {
+      allowDotenvFile: params.allowDotenvRead,
+    })
+  ) {
     throw new DyadError(
       `Sandbox scripts cannot access protected path: ${params.displayPath}`,
       DyadErrorKind.Precondition,
     );
   }
+  const isDotenv =
+    isDotenvFilePath(params.displayPath) || isDotenvFilePath(normalized);
+  return { realFilePath, isDotenv };
 }
 
 export async function sandboxReadFile(
@@ -308,18 +323,17 @@ export async function sandboxReadFile(
   rawOptions?: unknown,
 ): Promise<string> {
   const options = parseReadOptions(rawOptions);
-  const resolved = await resolveSandboxPath({ appPath, guestPath });
-  await assertResolvedPathAllowed({ appPath, ...resolved });
+  const resolved = await resolveSandboxPath({
+    appPath,
+    guestPath,
+    allowDotenvRead: true,
+  });
+  const { realFilePath, isDotenv } = await assertResolvedPathAllowed({
+    appPath,
+    ...resolved,
+    allowDotenvRead: true,
+  });
 
-  const stat = await fs.stat(resolved.filePath);
-  if (!stat.isFile()) {
-    throw new DyadError(
-      `Path is not a file: ${resolved.displayPath}`,
-      DyadErrorKind.Validation,
-    );
-  }
-
-  const start = options.start ?? 0;
   if (
     options.length !== undefined &&
     options.length > SANDBOX_READ_FILE_LIMIT_BYTES
@@ -329,6 +343,45 @@ export async function sandboxReadFile(
       DyadErrorKind.Validation,
     );
   }
+
+  if (isDotenv) {
+    const sanitized = Buffer.from(
+      redactDotenvValues(
+        await readContainedTextFile({
+          rootPath: appPath,
+          filePath: realFilePath,
+          displayPath: resolved.displayPath,
+          maxBytes: SANDBOX_READ_FILE_LIMIT_BYTES,
+        }),
+      ),
+      "utf8",
+    );
+    const start = options.start ?? 0;
+    if (start > sanitized.length) {
+      return "";
+    }
+    const remainingBytes = sanitized.length - start;
+    const length = options.length ?? remainingBytes;
+    if (length > SANDBOX_READ_FILE_LIMIT_BYTES) {
+      throw new DyadError(
+        `read_file would read ${length} sanitized bytes from ${resolved.displayPath}, exceeding the ${SANDBOX_READ_FILE_LIMIT_BYTES} byte limit. Use file_stats to get the source size, then read bounded chunks with start and length.`,
+        DyadErrorKind.Validation,
+      );
+    }
+    const bytes = sanitized.subarray(start, start + length);
+    return (options.encoding ?? "utf8") === "base64"
+      ? bytes.toString("base64")
+      : bytes.toString("utf8");
+  }
+
+  const stat = await fs.stat(realFilePath);
+  if (!stat.isFile()) {
+    throw new DyadError(
+      `Path is not a file: ${resolved.displayPath}`,
+      DyadErrorKind.Validation,
+    );
+  }
+  const start = options.start ?? 0;
   if (start > stat.size) {
     return "";
   }
@@ -341,7 +394,7 @@ export async function sandboxReadFile(
     );
   }
 
-  const handle = await fs.open(resolved.filePath, "r");
+  const handle = await fs.open(realFilePath, "r");
   try {
     const bytesToRead = Math.min(length, remainingBytes);
     const buffer = Buffer.alloc(bytesToRead);
@@ -359,9 +412,17 @@ export async function sandboxFileStats(
   appPath: string,
   guestPath: string,
 ): Promise<SandboxFileStats> {
-  const resolved = await resolveSandboxPath({ appPath, guestPath });
-  await assertResolvedPathAllowed({ appPath, ...resolved });
-  const stat = await fs.stat(resolved.filePath);
+  const resolved = await resolveSandboxPath({
+    appPath,
+    guestPath,
+    allowDotenvRead: true,
+  });
+  const { realFilePath, isDotenv } = await assertResolvedPathAllowed({
+    appPath,
+    ...resolved,
+    allowDotenvRead: true,
+  });
+  const stat = await fs.stat(realFilePath);
   if (!stat.isFile()) {
     throw new DyadError(
       `Path is not a file: ${resolved.displayPath}`,
@@ -370,7 +431,7 @@ export async function sandboxFileStats(
   }
   return {
     size: stat.size,
-    isText: isTextPath(resolved.filePath),
+    isText: isDotenv || isTextPath(realFilePath),
     mtime: stat.mtime.toISOString(),
   };
 }
@@ -381,10 +442,17 @@ export async function sandboxListFiles(
 ): Promise<string[]> {
   const dir = guestDir ?? ".";
   if (dir === "attachments:" || dir === "attachments") {
-    const attachments = await listStoredAttachments(appPath);
+    // Archive entries are listed with attachments:<archive>.
+    const attachments = await listStoredAttachments(appPath, {
+      topLevelOnly: true,
+    });
     return attachments.map((attachment) =>
       toAttachmentLogicalPath(attachment.logicalName),
     );
+  }
+  if (dir.startsWith("attachments:")) {
+    // attachments:<archive> lists the entries unpacked from that archive.
+    return listAttachmentLogicalPaths(appPath, dir);
   }
 
   assertAllowedGuestPath(dir);
@@ -411,7 +479,7 @@ export async function sandboxListFiles(
   }
   const entries = await fs.readdir(realDirPath, { withFileTypes: true });
   return entries
-    .filter((entry) => !DENIED_PATH_PATTERNS.some((p) => p.test(entry.name)))
+    .filter((entry) => !isDeniedSandboxPath(entry.name))
     .map((entry) => {
       const relativePath = path
         .join(relative, entry.name)
@@ -420,10 +488,6 @@ export async function sandboxListFiles(
       return entry.isDirectory() ? `${relativePath}/` : relativePath;
     })
     .sort();
-}
-
-export function buildSandboxCapabilities(appPath: string) {
-  return buildSandboxCapabilitiesWithObserver(appPath);
 }
 
 export function buildSandboxCapabilitiesWithObserver(

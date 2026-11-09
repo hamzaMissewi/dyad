@@ -2,6 +2,10 @@
 
 ## Always Use Base UI, Never Radix UI
 
+When a ToggleGroup displays a fallback that differs from the saved preference,
+clicking its selected item can emit an empty selection. Handle explicit activation
+so users can persist that fallback, and cover both mouse and keyboard recovery.
+
 This project uses **Base UI** (`@base-ui/react`) for all headless UI primitives. **Do not use Radix UI** (`@radix-ui/*`) for any new components. This ensures:
 
 - Consistent animation/transition behavior across all menus and popups
@@ -37,6 +41,18 @@ The `ContextMenu` in `src/components/ui/context-menu.tsx` uses Base UI's native 
 Guard `null` before parsing or casting values, especially when writing settings
 selectors.
 
+### Tabs keyboard behavior
+
+`TabsList` defaults to manual activation; set `activateOnFocus` when arrow keys should also select the focused tab.
+Base UI moves arrow-key focus in a microtask, so wrap keyboard events in `await act(async () => { ... })` before asserting selection in renderer tests.
+
+## Focus restoration while an action is pending
+
+Native `disabled` controls reject programmatic focus. When optimistic UI moves
+a control and focus must follow it while persistence is pending, keep it
+focusable with `aria-disabled`, guard repeat activation synchronously, and
+restore focus with `{ preventScroll: true }`.
+
 ## TooltipTrigger render prop
 
 `TooltipTrigger` from `@base-ui/react/tooltip` (wrapped in `src/components/ui/tooltip.tsx`) renders a `<button>` by default. Wrapping another button-like element (`<button>`, `<Button>`, `<DropdownMenuTrigger>`, `<PopoverTrigger>`, `<MiniSelectTrigger>`, `<ToggleGroupItem>`) inside it creates invalid nested `<button>` HTML. Use the `render` prop instead:
@@ -51,6 +67,36 @@ selectors.
 
 - Wrapping `ToggleGroupItem` in `TooltipTrigger` without `render` also breaks `:first-child`/`:last-child` CSS selectors for rounded corners on the group.
 - For drag handles and resize rails, prefer the native `title` attribute over `Tooltip` — tooltips appear immediately on hover and interfere with drag interactions, while `title` has a built-in delay.
+
+## Submenu trigger accessible names
+
+Base UI derives a `SubmenuTrigger`'s accessible name from all descendant text and
+labels. If a menu row contains badges, secondary text, or a separately labeled
+chevron, give the trigger an explicit `aria-label` that describes both the row's
+primary action and how to open its submenu. Do not put a separate `aria-label` on
+a non-interactive chevron nested inside the trigger; it is not independently
+focusable or exposed as a separate control to assistive technology. Because an
+explicit name replaces descendant text, include meaningful visible state such
+as quota, selection, and disclosure badges in that name.
+
+## Submenu trigger event cancellation
+
+With `openOnHover={false}`, Base UI opens a submenu on `mousedown`, before a
+consumer `onClick` runs. When only part of a submenu trigger should open the
+submenu, cancel Base UI's handler with `event.preventBaseUIHandler()` from both
+`onMouseDown` and `onClick` for the trigger's primary action.
+
+## Hover-open navigation submenus
+
+For navigation-only submenus, set `openOnHover`, `delay`, and `closeDelay` on
+`DropdownMenuSubTrigger`. Base UI enables its safe pointer corridor when
+`openOnHover` is true, so diagonal travel into the submenu does not close it.
+Keep hybrid rows click-only when the row selects an item and only its chevron
+opens configuration; hover-opening those rows makes selection ambiguous.
+
+Keep hover-open triggers stationary while async menu content loads. Render the
+trigger before dynamic rows or reserve its exact space so newly inserted rows
+cannot move the trigger beneath a stationary pointer and open it accidentally.
 
 ## Accordion (Base UI vs Radix/shadcn)
 

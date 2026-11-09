@@ -1,5 +1,11 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import type { ReactNode } from "react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
+import { useEffect, type ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   PreviewPanel,
@@ -7,41 +13,62 @@ import {
 } from "./PreviewPanel";
 
 const mocks = vi.hoisted(() => ({
-  currentConsoleEntriesAtom: Symbol("currentConsoleEntriesAtom"),
-  currentPreviewReloadTokenAtom: Symbol("currentPreviewReloadTokenAtom"),
   cancelManagedNodeInstall: vi.fn(),
   installManagedNode: vi.fn(),
   nodeCheckFailed: false,
   managedNodeSupported: true,
   nodeVersion: "v22.14.0",
   openExternalUrl: vi.fn(),
+  previewMode: "preview" as string,
   previewModeAtom: Symbol("previewModeAtom"),
+  previewReloadToken: 0,
+  recorderMountCount: 0,
+  reloadRecorderPreview: null as (() => void) | null,
+  previewNativeViewAppIdAtom: Symbol("previewNativeViewAppIdAtom"),
+  previewNativeViewAppId: null as number | null,
+  currentTestRunStateAtom: Symbol("currentTestRunStateAtom"),
+  testRunPhase: "idle" as "idle" | "setup" | "running",
+  setPreviewMode: vi.fn(),
+  setPreviewNativeViewAppId: vi.fn(),
   refetchNodeStatus: vi.fn(),
   reloadEnvPath: vi.fn(),
   runApp: vi.fn(),
+  previewIframeMounted: vi.fn(),
+  previewIframeUnmounted: vi.fn(),
   selectAppForPreview: vi.fn(),
   selectedAppIdAtom: Symbol("selectedAppIdAtom"),
+  selectedAppId: 1,
   settings: {
     disablePreviewNodeAutoInstall: false,
   } as Record<string, unknown>,
   updateSettings: vi.fn(),
 }));
 
-vi.mock("jotai", () => ({
+vi.mock("jotai", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("jotai")>()),
   useAtomValue: (atom: symbol) => {
     if (atom === mocks.previewModeAtom) {
-      return "preview";
+      return mocks.previewMode;
     }
     if (atom === mocks.selectedAppIdAtom) {
-      return 1;
+      return mocks.selectedAppId;
     }
-    if (atom === mocks.currentPreviewReloadTokenAtom) {
-      return 0;
+    if (atom === mocks.previewNativeViewAppIdAtom) {
+      return mocks.previewNativeViewAppId;
     }
-    if (atom === mocks.currentConsoleEntriesAtom) {
-      return [];
+    if (atom === mocks.currentTestRunStateAtom) {
+      return { phase: mocks.testRunPhase };
     }
     return undefined;
+  },
+  useSetAtom: (atom: symbol) => {
+    if (atom === mocks.previewModeAtom) {
+      return mocks.setPreviewMode;
+    }
+    if (atom === mocks.previewNativeViewAppIdAtom) {
+      return mocks.setPreviewNativeViewAppId;
+    }
+    return vi.fn();
   },
 }));
 
@@ -50,9 +77,24 @@ vi.mock("../../atoms/appAtoms", () => ({
   selectedAppIdAtom: mocks.selectedAppIdAtom,
 }));
 
-vi.mock("@/atoms/previewRuntimeAtoms", () => ({
-  currentConsoleEntriesAtom: mocks.currentConsoleEntriesAtom,
-  currentPreviewReloadTokenAtom: mocks.currentPreviewReloadTokenAtom,
+vi.mock("@/atoms/previewAtoms", () => ({
+  previewNativeViewAppIdAtom: mocks.previewNativeViewAppIdAtom,
+}));
+
+vi.mock("@/atoms/testRuntimeAtoms", () => ({
+  currentTestRunStateAtom: mocks.currentTestRunStateAtom,
+}));
+
+vi.mock("@/preview_console/hooks", () => ({
+  useLatestConsoleEntry: () => undefined,
+}));
+
+vi.mock("@/hooks/useAppRun", () => ({
+  // Reads the hoisted value rather than returning a constant: a test that bumps
+  // the token needs the iframe key to actually change, or the remount it means
+  // to exercise never happens and everything it asserts afterwards passes on a
+  // component that was never re-created.
+  usePreviewReloadToken: () => mocks.previewReloadToken,
 }));
 
 vi.mock("@tanstack/react-query", () => ({
@@ -98,16 +140,28 @@ vi.mock("@/ipc/types", () => ({
   },
 }));
 
-vi.mock("@/hooks/useRunApp", () => ({
+vi.mock("@/hooks/useRunApp", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/hooks/useRunApp")>()),
   useRunApp: () => ({
     loading: false,
     runApp: mocks.runApp,
   }),
 }));
 
+vi.mock("@/hooks/useTestRecorder", async () => {
+  const React = await vi.importActual<typeof import("react")>("react");
+  return {
+    useTestRecorder: ({ reloadPreview }: { reloadPreview: () => void }) => {
+      mocks.reloadRecorderPreview = reloadPreview;
+      const [instanceId] = React.useState(() => ++mocks.recorderMountCount);
+      return { instanceId };
+    },
+  };
+});
+
 vi.mock("@/hooks/useLoadApp", () => ({
   useLoadApp: () => ({
-    app: { id: 1 },
+    app: { id: mocks.selectedAppId },
   }),
 }));
 
@@ -135,15 +189,56 @@ vi.mock("react-resizable-panels", () => ({
 }));
 
 vi.mock("./PreviewIframe", () => ({
-  PreviewIframe: () => <div>Preview iframe</div>,
+  PreviewIframe: ({ recorder }: { recorder: { instanceId: number } }) => {
+    useEffect(() => {
+      mocks.previewIframeMounted();
+      return () => mocks.previewIframeUnmounted();
+    }, []);
+    return (
+      <div data-testid="preview-iframe" data-recorder={recorder.instanceId}>
+        Preview iframe
+      </div>
+    );
+  },
+}));
+
+vi.mock("./PreviewWebContentsView", () => ({
+  PreviewWebContentsView: () => <div>Preview native view</div>,
 }));
 
 vi.mock("./PreviewToolbar", () => ({
   PreviewToolbar: () => null,
 }));
 
+// The panel only reaches the manager to put the preview back on the app root
+// before a recording; standing it up needs the whole provider stack, and this
+// suite is about the Node.js setup path and the iframe's remount identity.
+vi.mock("@/preview_iframe/PreviewIframeProvider", () => ({
+  usePreviewIframeManager: () => ({
+    getSnapshot: () => ({ currentUrl: null }),
+    send: () => {},
+  }),
+}));
+
+// The real host reaches for the chat stream to send the assertion request; this
+// suite is about the Node.js setup path and the iframe's remount identity.
+vi.mock("./RecordingBannerHost", () => ({
+  RecordingBannerHost: ({ recorder }: { recorder: { instanceId: number } }) => (
+    <div
+      data-testid="recording-banner-host"
+      data-recorder={recorder.instanceId}
+    >
+      Recording banner host
+    </div>
+  ),
+}));
+
 vi.mock("./PackageManagerWarningBanner", () => ({
   PackageManagerWarningBanner: () => null,
+}));
+
+vi.mock("./NeonMigrationBanner", () => ({
+  NeonMigrationBanner: () => null,
 }));
 
 vi.mock("./CodeView", () => ({
@@ -183,9 +278,21 @@ describe("PreviewPanel", () => {
     mocks.managedNodeSupported = true;
     mocks.nodeVersion = "v22.14.0";
     mocks.openExternalUrl.mockReset();
+    mocks.previewReloadToken = 0;
+    mocks.recorderMountCount = 0;
+    mocks.reloadRecorderPreview = null;
     mocks.refetchNodeStatus.mockReset();
     mocks.reloadEnvPath.mockReset();
     mocks.runApp.mockReset();
+    mocks.runApp.mockResolvedValue(undefined);
+    mocks.previewIframeMounted.mockReset();
+    mocks.previewIframeUnmounted.mockReset();
+    mocks.previewMode = "preview";
+    mocks.previewNativeViewAppId = null;
+    mocks.testRunPhase = "idle";
+    mocks.setPreviewMode.mockReset();
+    mocks.setPreviewNativeViewAppId.mockReset();
+    mocks.selectedAppId = 1;
     mocks.selectAppForPreview.mockReset();
     mocks.settings = {
       disablePreviewNodeAutoInstall: false,
@@ -205,6 +312,143 @@ describe("PreviewPanel", () => {
     expect(
       screen.queryByText("Install Node.js to see your preview"),
     ).toBeNull();
+  });
+
+  it("remounts the iframe when switching apps with the same reload token", () => {
+    const { rerender } = render(<PreviewPanel />);
+    expect(mocks.previewIframeMounted).toHaveBeenCalledTimes(1);
+
+    mocks.selectedAppId = 2;
+    rerender(<PreviewPanel />);
+
+    expect(mocks.previewIframeUnmounted).toHaveBeenCalledTimes(1);
+    expect(mocks.previewIframeMounted).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps the recorder coordinator mounted when the preview reloads", () => {
+    const { rerender } = render(<PreviewPanel />);
+
+    expect(screen.getByTestId("preview-iframe").dataset.recorder).toBe("1");
+    expect(mocks.previewIframeMounted).toHaveBeenCalledTimes(1);
+
+    // A token-driven reload: the iframe is re-created, and the recorder that
+    // owns the live session must not go with it.
+    mocks.previewReloadToken = 1;
+    rerender(<PreviewPanel />);
+
+    expect(mocks.previewIframeUnmounted).toHaveBeenCalledTimes(1);
+    expect(mocks.previewIframeMounted).toHaveBeenCalledTimes(2);
+    expect(screen.getByTestId("preview-iframe").dataset.recorder).toBe("1");
+    expect(mocks.recorderMountCount).toBe(1);
+
+    // And the recorder's own reload, which is the other way the iframe is
+    // re-created — teardown reloads the preview to drop the test user's
+    // in-memory session.
+    act(() => mocks.reloadRecorderPreview?.());
+
+    expect(mocks.previewIframeMounted).toHaveBeenCalledTimes(3);
+    expect(screen.getByTestId("preview-iframe").dataset.recorder).toBe("1");
+    expect(mocks.recorderMountCount).toBe(1);
+  });
+
+  it("renders the native view while a test run drives it", () => {
+    mocks.previewNativeViewAppId = 1;
+    mocks.testRunPhase = "running";
+
+    render(<PreviewPanel />);
+
+    expect(screen.getByText("Preview native view")).toBeTruthy();
+    expect(screen.queryByText("Preview iframe")).toBeNull();
+    expect(mocks.setPreviewNativeViewAppId).not.toHaveBeenCalled();
+  });
+
+  it("keeps the iframe when no test run has requested the native view", () => {
+    render(<PreviewPanel />);
+
+    expect(screen.getByText("Preview iframe")).toBeTruthy();
+    expect(screen.queryByText("Preview native view")).toBeNull();
+  });
+
+  it("closes the native view and shows the Tests panel once the run finishes", () => {
+    mocks.previewNativeViewAppId = 1;
+    mocks.testRunPhase = "running";
+
+    const { rerender } = render(<PreviewPanel />);
+    expect(mocks.setPreviewNativeViewAppId).not.toHaveBeenCalled();
+
+    mocks.testRunPhase = "idle";
+    rerender(<PreviewPanel />);
+
+    expect(mocks.setPreviewNativeViewAppId).toHaveBeenCalledWith(null);
+    expect(mocks.setPreviewMode).toHaveBeenCalledWith("tests");
+  });
+
+  it("closes the native view without stealing the user's place when they left the preview", () => {
+    mocks.previewNativeViewAppId = 1;
+    mocks.previewMode = "code";
+
+    render(<PreviewPanel />);
+
+    expect(mocks.setPreviewNativeViewAppId).toHaveBeenCalledWith(null);
+    expect(mocks.setPreviewMode).not.toHaveBeenCalled();
+  });
+
+  it("keeps the iframe when another app's run owns the native view", () => {
+    // The window holds one native view and it belongs to the app whose run
+    // opened it. Without the owner check, selecting a second app mid-run would
+    // show that app the *other* app's live test page.
+    mocks.previewNativeViewAppId = 2;
+    mocks.selectedAppId = 1;
+    mocks.testRunPhase = "running";
+
+    render(<PreviewPanel />);
+
+    expect(screen.getByText("Preview iframe")).toBeTruthy();
+    expect(screen.queryByText("Preview native view")).toBeNull();
+  });
+
+  it("leaves another app's native view alone when this app's run state goes idle", () => {
+    // `testRunPhase` is the *selected* app's. Acting on it here would tear down
+    // a view a different app's run is still driving, and drag that app's
+    // preview to the Tests panel.
+    mocks.previewNativeViewAppId = 2;
+    mocks.selectedAppId = 1;
+    mocks.testRunPhase = "running";
+
+    const { rerender } = render(<PreviewPanel />);
+
+    mocks.testRunPhase = "idle";
+    rerender(<PreviewPanel />);
+
+    expect(mocks.setPreviewNativeViewAppId).not.toHaveBeenCalled();
+    expect(mocks.setPreviewMode).not.toHaveBeenCalled();
+  });
+
+  it("leaves an ordinary preview alone when a background test run finishes", () => {
+    mocks.testRunPhase = "running";
+
+    const { rerender } = render(<PreviewPanel />);
+    mocks.testRunPhase = "idle";
+    rerender(<PreviewPanel />);
+
+    expect(mocks.setPreviewNativeViewAppId).not.toHaveBeenCalled();
+    expect(mocks.setPreviewMode).not.toHaveBeenCalled();
+  });
+
+  it("still gates the native view behind the Node.js requirement", () => {
+    mocks.settings = {
+      disablePreviewNodeAutoInstall: true,
+    };
+    mocks.previewNativeViewAppId = 1;
+    mocks.testRunPhase = "running";
+    mocks.nodeVersion = "";
+
+    render(<PreviewPanel />);
+
+    expect(
+      screen.getByText("Install Node.js to see your preview"),
+    ).toBeTruthy();
+    expect(screen.queryByText("Preview native view")).toBeNull();
   });
 
   it("auto-starts managed Node install and skips running the app when Node.js is missing", async () => {

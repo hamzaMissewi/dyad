@@ -1,0 +1,1391 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ActorHost } from "@/distributed_machines/actor_host";
+import { RemoteMachineClient } from "@/distributed_machines/remote_client";
+import { createRemoteMachineManifest } from "@/distributed_machines/remote_manifest";
+import { RemoteMachineTransport } from "@/distributed_machines/remote_transport";
+import { FakeDuplexRemoteTransport } from "@/distributed_machines/testing";
+import {
+  createFakeClock,
+  createSequentialIdSource,
+} from "@/state_machines/testing";
+import { TwoWindowHarness } from "@/testing/two_window_harness";
+import { versionPreviewDefinition } from "@/ipc/services/version_preview_definition";
+import { chatExecutionHold } from "@/ipc/services/chat_execution_hold";
+import { versionPreviewClientDefinition } from "./client_definition";
+import { versionPreviewKey } from "./transport";
+import { isMutatingState, type RestoreRecovery } from "./state";
+
+const service = vi.hoisted(() => ({
+  resolveOriginBranch: vi.fn(),
+  run: vi.fn(),
+  reconcile: vi.fn(),
+  validateCurrentRepository: vi.fn(),
+  checkpointCurrentRepository: vi.fn(),
+  settle: vi.fn(async () => undefined),
+  assertAcceptingOperations: vi.fn(),
+  assertReadyForIntent: vi.fn(),
+  beginReconciliation: vi.fn(),
+  endReconciliation: vi.fn(),
+  trackLifecycle: vi.fn((_appId: number, promise: Promise<unknown>) => promise),
+}));
+const presentation = vi.hoisted(() => ({
+  recordInitiator: vi.fn(),
+  publishResult: vi.fn(),
+  publishError: vi.fn(),
+  originEndpointFor: vi.fn(),
+  forget: vi.fn(),
+  confirm: vi.fn(),
+}));
+const invalidations = vi.hoisted(() => ({ publish: vi.fn() }));
+const appRun = vi.hoisted(() => ({
+  executeExternalLifecycle: vi.fn(async () => undefined),
+}));
+const database = vi.hoisted(() => ({
+  findFirst: vi.fn(async () => ({ id: 7 })),
+}));
+const persistence = vi.hoisted(() => ({
+  load: vi.fn((): any => ({ type: "closed" })),
+  schedule: vi.fn(),
+  checkpoint: vi.fn(),
+  checkpointRestore: vi.fn(),
+  flush: vi.fn(),
+  remove: vi.fn(),
+  removeAll: vi.fn(),
+}));
+
+vi.mock("@/ipc/services/version_preview_service", () => ({
+  versionPreviewService: service,
+}));
+vi.mock("@/ipc/services/version_preview_persistence", () => ({
+  versionPreviewPersistence: persistence,
+}));
+vi.mock("@/ipc/services/version_preview_presentation_service", () => ({
+  versionPreviewPresentationService: presentation,
+}));
+vi.mock("@/ipc/services/app_run_actor_service", () => ({
+  appRunActorService: appRun,
+}));
+vi.mock(
+  "@/window_infrastructure/main/query_invalidation_bus",
+  async (importOriginal) => ({
+    ...(await importOriginal<
+      typeof import("@/window_infrastructure/main/query_invalidation_bus")
+    >()),
+    queryInvalidationBus: invalidations,
+  }),
+);
+vi.mock("@/db", () => ({
+  db: { query: { apps: { findFirst: database.findFirst } } },
+}));
+vi.mock("@/db/schema", () => ({ apps: { id: "id" } }));
+vi.mock("drizzle-orm", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("drizzle-orm")>()),
+  eq: vi.fn(() => true),
+}));
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+async function flush() {
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+}
+
+const harnessHosts = new Set<ActorHost>();
+
+function createHarness() {
+  const clock = createFakeClock();
+  const host = new ActorHost({
+    placement: "main",
+    clock,
+    ids: createSequentialIdSource(),
+  });
+  harnessHosts.add(host);
+  const manifest = createRemoteMachineManifest([versionPreviewDefinition]);
+  const windows = new TwoWindowHarness();
+  const transportErrors: unknown[] = [];
+  const transport = new RemoteMachineTransport({
+    host,
+    manifest,
+    windows: windows.registry,
+    clock,
+    onError: (error) => transportErrors.push(error),
+  });
+  const duplex = new FakeDuplexRemoteTransport(transport, manifest, windows);
+  const connectionA = duplex.connect();
+  const connectionB = duplex.connect();
+  const errors: unknown[] = [];
+  const clientA = new RemoteMachineClient(
+    connectionA,
+    createSequentialIdSource(),
+    (error) => errors.push(error),
+  );
+  const clientB = new RemoteMachineClient(
+    connectionB,
+    createSequentialIdSource(),
+    (error) => errors.push(error),
+  );
+  clientA.start();
+  clientB.start();
+  const actorA = clientA.actor(
+    versionPreviewClientDefinition,
+    versionPreviewKey(7),
+  );
+  const actorB = clientB.actor(
+    versionPreviewClientDefinition,
+    versionPreviewKey(7),
+  );
+  const releaseA = actorA.subscribe(() => undefined);
+  const releaseB = actorB.subscribe(() => undefined);
+  return {
+    actorA,
+    actorB,
+    clientA,
+    clientB,
+    connectionA,
+    errors,
+    host,
+    releaseA,
+    releaseB,
+    transport,
+    transportErrors,
+  };
+}
+
+describe("version_preview main actor", () => {
+  afterEach(async () => {
+    for (const host of harnessHosts) await host.dispose();
+    harnessHosts.clear();
+    expect(chatExecutionHold.isHeld(7)).toBe(false);
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    database.findFirst.mockResolvedValue({ id: 7 });
+    persistence.load.mockReturnValue({ type: "closed" });
+    persistence.checkpoint.mockImplementation(() => undefined);
+    persistence.checkpointRestore.mockImplementation(() => undefined);
+    invalidations.publish.mockImplementation(() => undefined);
+  });
+
+  it("settles dirty repository acceptance as failed while keeping recovery actionable", async () => {
+    persistence.load.mockReturnValue({
+      type: "restore-recovery-required",
+      session: {
+        appId: 7,
+        originBranch: "main",
+        targetVersionId: "abc123",
+        checkedOutVersionId: null,
+        exitIntent: { type: "none" },
+        selectedDiffFile: null,
+        isDiffVisible: false,
+      },
+      error: { message: "restore interrupted" },
+    });
+    service.reconcile.mockResolvedValue({
+      branch: null,
+      headOid: "preview-head",
+      isClean: true,
+    });
+    service.validateCurrentRepository.mockResolvedValue({ kind: "dirty" });
+    const harness = createHarness();
+    await harness.actorA.resync();
+    await flush();
+
+    expect(chatExecutionHold.isHeld(7)).toBe(true);
+    await harness.actorA.dispatch({
+      type: "ACCEPT_CURRENT_REPOSITORY",
+      operationId: "accept-dirty",
+    });
+    await flush();
+
+    expect(harness.actorA.getSnapshot().state).toMatchObject({
+      type: "restore-recovery-required",
+      currentRepositoryAssessment: { type: "dirty" },
+    });
+    expect(harness.actorA.getSnapshot().lastSettlement).toMatchObject({
+      operationId: "accept-dirty",
+      outcome: "failed",
+    });
+    expect(chatExecutionHold.isHeld(7)).toBe(true);
+
+    service.checkpointCurrentRepository.mockRejectedValueOnce(
+      new Error("checkpoint failed"),
+    );
+    await harness.actorA.dispatch({
+      type: "CHECKPOINT_AND_ACCEPT_CURRENT_REPOSITORY",
+      operationId: "checkpoint-failed",
+    });
+    await flush();
+    expect(harness.actorA.getSnapshot().state.type).toBe(
+      "restore-recovery-required",
+    );
+    expect(chatExecutionHold.isHeld(7)).toBe(true);
+
+    harness.releaseA();
+    harness.releaseB();
+    harness.clientA.dispose();
+    harness.clientB.dispose();
+    harness.transport.dispose();
+  });
+
+  it("settles repository acceptance even when result presentation throws", async () => {
+    persistence.load.mockReturnValue({
+      type: "restore-recovery-required",
+      session: {
+        appId: 7,
+        originBranch: "main",
+        targetVersionId: "abc123",
+        checkedOutVersionId: null,
+        exitIntent: { type: "none" },
+        selectedDiffFile: null,
+        isDiffVisible: false,
+      },
+      error: { message: "restore interrupted" },
+      restoreRecovery: {
+        repositoryOutcome: "target-applied",
+        nextStep: "chat-mutation",
+        preRestoreHead: "old-head",
+        preRestoreBranch: "main",
+        targetHead: "target-head",
+        completedHead: "target-head",
+        affectedChatId: 23,
+      },
+    });
+    service.reconcile.mockResolvedValue({
+      branch: null,
+      headOid: "preview-head",
+      isClean: true,
+    });
+    service.validateCurrentRepository.mockResolvedValue({
+      kind: "healthy",
+      branch: "main",
+      headOid: "live-head",
+    });
+    presentation.publishResult.mockImplementationOnce(() => {
+      throw new Error("presentation failed");
+    });
+    const harness = createHarness();
+    await harness.actorA.resync();
+    await flush();
+
+    await harness.actorA.dispatch({
+      type: "ACCEPT_CURRENT_REPOSITORY",
+      operationId: "accept-presentation-failure",
+    });
+    await flush();
+
+    expect(harness.actorA.getSnapshot().state.type).toBe("closed");
+    expect(harness.actorA.getSnapshot().lastSettlement).toMatchObject({
+      operationId: "accept-presentation-failure",
+      outcome: "succeeded",
+    });
+    expect(chatExecutionHold.isHeld(7)).toBe(false);
+    expect(presentation.publishResult).toHaveBeenCalledWith(
+      7,
+      "accept-presentation-failure",
+      expect.objectContaining({ affectedChatId: 23 }),
+    );
+    expect(presentation.publishError).toHaveBeenCalledWith(
+      7,
+      "accept-presentation-failure",
+      expect.stringContaining("presentation failed"),
+    );
+
+    harness.releaseA();
+    harness.releaseB();
+    harness.clientA.dispose();
+    harness.clientB.dispose();
+    harness.transport.dispose();
+  });
+
+  it("continues checkout after the initiating window closes and reattaches", async () => {
+    const origin = deferred<{ branch: string | null }>();
+    const checkout = deferred<{
+      repositoryOutcome: "target-applied";
+      notification: null;
+      runtimeAction: "none";
+      affectedChatId: null;
+      createdChatId: null;
+    }>();
+    service.resolveOriginBranch.mockReturnValue(origin.promise);
+    service.run.mockReturnValue(checkout.promise);
+    const harness = createHarness();
+    await harness.actorA.resync();
+    await harness.actorB.resync();
+    expect(harness.transport.inspectSubscriptions()).toEqual([
+      expect.objectContaining({ totalReferences: 2 }),
+    ]);
+
+    const receipt = await harness.actorA.dispatch({
+      type: "SELECT_VERSION",
+      versionId: "abc123",
+      operationId: "preview-1",
+    });
+    expect(receipt.kind).toBe("applied");
+    await flush();
+    expect(
+      (
+        harness.host.peek(
+          versionPreviewDefinition.id,
+          versionPreviewKey(7),
+        ) as any
+      ).getSnapshot().state.type,
+    ).toBe("resolving-origin");
+    expect(harness.errors).toEqual([]);
+    expect(harness.transportErrors).toEqual([]);
+    expect(harness.actorA.getSnapshot().state.type).toBe("resolving-origin");
+    origin.resolve({ branch: "feature/origin" });
+    await flush();
+    expect(harness.actorB.getSnapshot().state.type).toBe("checking-out");
+    // ChatHeader's A2 mutation indicator consumes this exact remote state.
+    expect(isMutatingState(harness.actorB.getSnapshot().state)).toBe(true);
+
+    harness.releaseA();
+    harness.clientA.dispose();
+    checkout.resolve({
+      repositoryOutcome: "target-applied",
+      notification: null,
+      runtimeAction: "none",
+      affectedChatId: null,
+      createdChatId: null,
+    });
+    await flush();
+    expect(harness.actorB.getSnapshot().state).toMatchObject({
+      type: "previewing",
+      session: {
+        originBranch: "feature/origin",
+        checkedOutVersionId: "abc123",
+      },
+    });
+    expect(presentation.forget).toHaveBeenCalledWith("preview-1");
+
+    harness.releaseB();
+    harness.clientB.dispose();
+    harness.transport.dispose();
+  });
+
+  it("preserves the return branch until a close during checkout settles", async () => {
+    service.resolveOriginBranch.mockResolvedValue({
+      branch: "feature/origin",
+    });
+    const checkout = deferred<any>();
+    const returned = deferred<any>();
+    service.run
+      .mockReturnValueOnce(checkout.promise)
+      .mockReturnValueOnce(returned.promise);
+    const harness = createHarness();
+    await harness.actorA.resync();
+    await harness.actorB.resync();
+
+    await harness.actorA.dispatch({
+      type: "SELECT_VERSION",
+      versionId: "abc123",
+      operationId: "preview-1",
+    });
+    await flush();
+    expect(harness.actorB.getSnapshot().state.type).toBe("checking-out");
+    const closeReceipt = await harness.actorB.dispatch({
+      type: "CLOSE",
+      operationId: "close-1",
+    });
+    expect(closeReceipt.kind).toBe("applied");
+    expect(presentation.forget).toHaveBeenCalledWith("close-1");
+    expect(presentation.forget).not.toHaveBeenCalledWith("preview-1");
+    await flush();
+    checkout.resolve({
+      repositoryOutcome: "target-applied",
+      notification: null,
+      runtimeAction: "none",
+      affectedChatId: null,
+      createdChatId: null,
+    });
+    await flush();
+
+    expect(service.run).toHaveBeenLastCalledWith(
+      {
+        type: "return",
+        appId: 7,
+        branch: "feature/origin",
+      },
+      "preview-1",
+    );
+    returned.resolve({
+      repositoryOutcome: "target-applied",
+      notification: null,
+      runtimeAction: "none",
+      affectedChatId: null,
+      createdChatId: null,
+    });
+    await flush();
+    expect(harness.actorA.getSnapshot().state.type).toBe("closed");
+    expect(presentation.forget).toHaveBeenCalledWith("preview-1");
+
+    harness.releaseA();
+    harness.releaseB();
+    harness.clientA.dispose();
+    harness.clientB.dispose();
+    harness.transport.dispose();
+  });
+
+  it("retires select and exit routing when close wins during origin resolution", async () => {
+    const origin = deferred<{ branch: string | null }>();
+    service.resolveOriginBranch.mockReturnValue(origin.promise);
+    const harness = createHarness();
+    await harness.actorA.resync();
+
+    await harness.actorA.dispatch({
+      type: "SELECT_VERSION",
+      versionId: "abc123",
+      operationId: "preview-1",
+    });
+    expect(harness.actorA.getSnapshot().state.type).toBe("resolving-origin");
+
+    await harness.actorA.dispatch({
+      type: "CLOSE",
+      operationId: "close-1",
+    });
+    expect(harness.actorA.getSnapshot()).toMatchObject({
+      state: { type: "closed" },
+      activeInvocationRef: null,
+    });
+    expect(presentation.forget).toHaveBeenCalledWith("preview-1");
+    expect(presentation.forget).toHaveBeenCalledWith("close-1");
+
+    origin.resolve({ branch: "feature/origin" });
+    await flush();
+    expect(harness.actorA.getSnapshot().state.type).toBe("closed");
+    expect(service.run).not.toHaveBeenCalled();
+
+    harness.releaseA();
+    harness.releaseB();
+    harness.clientA.dispose();
+    harness.clientB.dispose();
+    harness.transport.dispose();
+  });
+
+  it("does not exhaust routing capacity across repeated early exits", async () => {
+    service.resolveOriginBranch.mockImplementation(
+      () => new Promise(() => undefined),
+    );
+    const routes = new Set<string>();
+    presentation.recordInitiator.mockImplementation((operationId: string) => {
+      if (routes.size >= 256) throw new Error("routing capacity exhausted");
+      routes.add(operationId);
+    });
+    presentation.forget.mockImplementation((operationId: string) => {
+      routes.delete(operationId);
+    });
+    const harness = createHarness();
+    await harness.actorA.resync();
+
+    try {
+      for (let index = 0; index < 300; index += 1) {
+        await harness.actorA.dispatch({
+          type: "SELECT_VERSION",
+          versionId: `version-${index}`,
+          operationId: `preview-${index}`,
+        });
+        await harness.actorA.dispatch({
+          type: "CLOSE",
+          operationId: `close-${index}`,
+        });
+      }
+      expect(routes).toEqual(new Set());
+      expect(harness.actorA.getSnapshot().state.type).toBe("closed");
+    } finally {
+      presentation.recordInitiator.mockImplementation(() => undefined);
+      presentation.forget.mockImplementation(() => undefined);
+      harness.releaseA();
+      harness.releaseB();
+      harness.clientA.dispose();
+      harness.clientB.dispose();
+      harness.transport.dispose();
+    }
+  });
+
+  it("publishes an origin-resolution error before releasing its initiator", async () => {
+    service.resolveOriginBranch.mockResolvedValue({ branch: null });
+    const presentationOrder: string[] = [];
+    presentation.publishError.mockImplementationOnce(() => {
+      presentationOrder.push("publish-error");
+    });
+    presentation.forget.mockImplementation((operationId: string) => {
+      if (operationId === "preview-1") presentationOrder.push("forget");
+    });
+    const harness = createHarness();
+    await harness.actorA.resync();
+
+    try {
+      await harness.actorA.dispatch({
+        type: "SELECT_VERSION",
+        versionId: "abc123",
+        operationId: "preview-1",
+      });
+      await flush();
+
+      expect(presentation.publishError).toHaveBeenCalledWith(
+        7,
+        "preview-1",
+        expect.stringMatching(/current Git branch/i),
+      );
+      expect(presentationOrder).toEqual(["publish-error", "forget"]);
+      expect(harness.actorA.getSnapshot().state.type).toBe("browsing");
+    } finally {
+      harness.releaseA();
+      harness.releaseB();
+      harness.clientA.dispose();
+      harness.clientB.dispose();
+      harness.transport.dispose();
+    }
+  });
+
+  it("reconciles an interrupted persisted checkout against repository truth", async () => {
+    persistence.load.mockReturnValue({
+      type: "checking-out",
+      session: {
+        appId: 7,
+        originBranch: "feature/origin",
+        targetVersionId: "abc123",
+        checkedOutVersionId: null,
+        exitIntent: { type: "none" },
+        selectedDiffFile: null,
+        isDiffVisible: false,
+      },
+    });
+    service.reconcile.mockResolvedValue({ branch: null });
+    const harness = createHarness();
+    await harness.actorA.resync();
+    expect(service.beginReconciliation).toHaveBeenCalledWith(7);
+    await flush();
+
+    expect(harness.actorA.getSnapshot().state).toMatchObject({
+      type: "recovery-required",
+      session: { originBranch: "feature/origin" },
+    });
+    const reconciled = harness.actorA.getSnapshot().state;
+    expect(
+      reconciled.type === "recovery-required" && reconciled.error.message,
+    ).toMatch(/restarted during a version checkout/);
+    expect(service.endReconciliation).toHaveBeenCalledWith(7);
+
+    harness.releaseA();
+    harness.releaseB();
+    harness.clientA.dispose();
+    harness.clientB.dispose();
+    harness.transport.dispose();
+  });
+
+  it("closes a live-branch restore that never moved HEAD", async () => {
+    persistence.load.mockReturnValue({
+      type: "restoring",
+      fallback: "closed",
+      session: {
+        appId: 7,
+        originBranch: null,
+        targetVersionId: "abc123",
+        checkedOutVersionId: null,
+        exitIntent: { type: "none" },
+        selectedDiffFile: null,
+        isDiffVisible: false,
+      },
+      restoreRecovery: {
+        preRestoreHead: "pre-restore-head",
+        preRestoreBranch: "main",
+        targetHead: "abc123",
+        nextStep: "preparing",
+      },
+    });
+    service.reconcile.mockResolvedValue({
+      branch: "main",
+      headOid: "pre-restore-head",
+      isClean: true,
+    });
+    const harness = createHarness();
+    await harness.actorA.resync();
+    await flush();
+
+    expect(harness.actorA.getSnapshot().state.type).toBe("closed");
+    expect(service.run).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: "return", branch: "" }),
+      expect.anything(),
+    );
+
+    harness.releaseA();
+    harness.releaseB();
+    harness.clientA.dispose();
+    harness.clientB.dispose();
+    harness.transport.dispose();
+  });
+
+  it("does not close a live-branch restore interrupted after hard reset", async () => {
+    persistence.load.mockReturnValue({
+      type: "restoring",
+      fallback: "closed",
+      session: {
+        appId: 7,
+        originBranch: null,
+        targetVersionId: "abc123",
+        checkedOutVersionId: null,
+        exitIntent: { type: "none" },
+        selectedDiffFile: null,
+        isDiffVisible: false,
+      },
+      restoreRecovery: {
+        preRestoreHead: "pre-restore-head",
+        preRestoreBranch: "main",
+        targetHead: "abc123",
+        nextStep: "soft-reset",
+      },
+    });
+    service.reconcile.mockResolvedValue({
+      branch: "main",
+      headOid: "abc123",
+      isClean: true,
+    });
+    const harness = createHarness();
+    await harness.actorA.resync();
+    await flush();
+
+    expect(
+      (
+        harness.host.peek(
+          versionPreviewDefinition.id,
+          versionPreviewKey(7),
+        ) as any
+      ).getSnapshot().state,
+    ).toMatchObject({
+      type: "restore-recovery-required",
+      error: {
+        message: expect.stringMatching(/interrupted.*restore/i),
+      },
+    });
+
+    harness.releaseA();
+    harness.releaseB();
+    harness.clientA.dispose();
+    harness.clientB.dispose();
+    harness.transport.dispose();
+  });
+
+  it.each([
+    {
+      name: "soft reset completed but commit not started",
+      restoreRecovery: {
+        preRestoreHead: "pre-restore-head",
+        preRestoreBranch: "main",
+        targetHead: "abc123",
+        nextStep: "commit" as const,
+      },
+      branch: "main",
+      headOid: "pre-restore-head",
+      isClean: false,
+      expectedType: "restore-recovery-required",
+    },
+    {
+      name: "completed restore still matches its recorded HEAD",
+      restoreRecovery: {
+        preRestoreHead: "pre-restore-head",
+        preRestoreBranch: "main",
+        targetHead: "abc123",
+        nextStep: "completed" as const,
+        completedHead: "restore-commit",
+        repositoryOutcome: "target-applied" as const,
+      },
+      branch: "main",
+      headOid: "restore-commit",
+      isClean: true,
+      expectedType: "closed",
+    },
+    {
+      name: "repository diverged after a completed restore",
+      restoreRecovery: {
+        preRestoreHead: "pre-restore-head",
+        preRestoreBranch: "main",
+        targetHead: "abc123",
+        nextStep: "completed" as const,
+        completedHead: "restore-commit",
+        repositoryOutcome: "target-applied" as const,
+      },
+      branch: "main",
+      headOid: "external-commit",
+      isClean: true,
+      expectedType: "restore-recovery-required",
+    },
+    {
+      name: "codebase completed but chat mutation may not have run",
+      restoreRecovery: {
+        preRestoreHead: "pre-restore-head",
+        preRestoreBranch: "main",
+        targetHead: "abc123",
+        nextStep: "chat-mutation" as const,
+        completedHead: "restore-commit",
+        repositoryOutcome: "target-applied" as const,
+      },
+      branch: "main",
+      headOid: "restore-commit",
+      isClean: true,
+      expectedType: "restore-recovery-required",
+    },
+    {
+      name: "hard reset may have started without moving HEAD",
+      restoreRecovery: {
+        preRestoreHead: "pre-restore-head",
+        preRestoreBranch: "main",
+        targetHead: "abc123",
+        nextStep: "hard-reset" as const,
+      },
+      branch: "main",
+      headOid: "pre-restore-head",
+      isClean: false,
+      expectedType: "restore-recovery-required",
+    },
+    {
+      name: "completed restore is detached at the recorded HEAD",
+      restoreRecovery: {
+        preRestoreHead: "pre-restore-head",
+        preRestoreBranch: "main",
+        targetHead: "abc123",
+        nextStep: "completed" as const,
+        completedHead: "restore-commit",
+        repositoryOutcome: "target-applied" as const,
+      },
+      branch: null,
+      headOid: "restore-commit",
+      isClean: true,
+      expectedType: "restore-recovery-required",
+    },
+  ])(
+    "reconciles $name from durable progress and actual HEAD",
+    async ({ restoreRecovery, branch, headOid, isClean, expectedType }) => {
+      persistence.load.mockReturnValue({
+        type: "restoring",
+        fallback: "closed",
+        session: {
+          appId: 7,
+          originBranch: null,
+          targetVersionId: "abc123",
+          checkedOutVersionId: null,
+          exitIntent: { type: "none" },
+          selectedDiffFile: null,
+          isDiffVisible: false,
+        },
+        restoreRecovery,
+      });
+      const reconciliation = deferred<{
+        branch: string | null;
+        headOid: string;
+        isClean: boolean;
+      }>();
+      service.reconcile.mockReturnValueOnce(reconciliation.promise);
+      const harness = createHarness();
+      await harness.actorA.resync();
+      expect(chatExecutionHold.isHeld(7)).toBe(true);
+      reconciliation.resolve({ branch, headOid, isClean });
+      await flush();
+
+      expect(harness.actorA.getSnapshot().state.type).toBe(expectedType);
+      expect(chatExecutionHold.isHeld(7)).toBe(expectedType !== "closed");
+
+      harness.releaseA();
+      harness.releaseB();
+      harness.clientA.dispose();
+      harness.clientB.dispose();
+      harness.transport.dispose();
+    },
+  );
+
+  it("does not close a partial restore started from a historical preview", async () => {
+    persistence.load.mockReturnValue({
+      type: "restoring",
+      fallback: "previewing",
+      session: {
+        appId: 7,
+        originBranch: "main",
+        targetVersionId: "abc123",
+        checkedOutVersionId: "older-preview",
+        exitIntent: { type: "none" },
+        selectedDiffFile: null,
+        isDiffVisible: false,
+      },
+      restoreRecovery: {
+        preRestoreHead: "pre-restore-head",
+        preRestoreBranch: "main",
+        targetHead: "abc123",
+        nextStep: "soft-reset",
+      },
+    });
+    service.reconcile.mockResolvedValue({
+      branch: "main",
+      headOid: "abc123",
+      isClean: true,
+    });
+    const harness = createHarness();
+    await harness.actorA.resync();
+    await flush();
+
+    expect(harness.actorA.getSnapshot().state.type).toBe(
+      "restore-recovery-required",
+    );
+
+    harness.releaseA();
+    harness.releaseB();
+    harness.clientA.dispose();
+    harness.clientB.dispose();
+    harness.transport.dispose();
+  });
+
+  it("settles an interrupted completed chat-only restore without Git recovery", async () => {
+    persistence.load.mockReturnValue({
+      type: "restoring",
+      fallback: "closed",
+      session: {
+        appId: 7,
+        originBranch: null,
+        targetVersionId: null,
+        checkedOutVersionId: null,
+        exitIntent: { type: "none" },
+        selectedDiffFile: null,
+        isDiffVisible: false,
+      },
+      restoreRecovery: {
+        repositoryOutcome: "unchanged",
+        nextStep: "completed",
+      },
+    });
+    service.reconcile.mockResolvedValue({
+      branch: "main",
+      headOid: "live-head",
+      isClean: true,
+    });
+    const harness = createHarness();
+    await harness.actorA.resync();
+    await flush();
+
+    expect(harness.actorA.getSnapshot().state.type).toBe("closed");
+
+    harness.releaseA();
+    harness.releaseB();
+    harness.clientA.dispose();
+    harness.clientB.dispose();
+    harness.transport.dispose();
+  });
+
+  it("keeps recovery visible when a chat-only restore may have mutated the database", async () => {
+    persistence.load.mockReturnValue({
+      type: "restoring",
+      fallback: "closed",
+      session: {
+        appId: 7,
+        originBranch: null,
+        targetVersionId: null,
+        checkedOutVersionId: null,
+        exitIntent: { type: "none" },
+        selectedDiffFile: null,
+        isDiffVisible: false,
+      },
+      restoreRecovery: {
+        repositoryOutcome: "unchanged",
+        nextStep: "chat-mutation",
+      },
+    });
+    service.reconcile.mockResolvedValue({
+      branch: "main",
+      headOid: "live-head",
+      isClean: true,
+    });
+    const harness = createHarness();
+    await harness.actorA.resync();
+    await flush();
+
+    expect(harness.actorA.getSnapshot().state.type).toBe(
+      "restore-recovery-required",
+    );
+
+    harness.releaseA();
+    harness.releaseB();
+    harness.clientA.dispose();
+    harness.clientB.dispose();
+    harness.transport.dispose();
+  });
+
+  it("reconciles retained restore recovery after the repository is repaired", async () => {
+    const restoreRecovery = {
+      preRestoreHead: "pre-restore-head",
+      preRestoreBranch: "main",
+      targetHead: "abc123",
+      nextStep: "soft-reset" as const,
+    };
+    persistence.load.mockReturnValue({
+      type: "restore-recovery-required",
+      session: {
+        appId: 7,
+        originBranch: null,
+        targetVersionId: "abc123",
+        checkedOutVersionId: null,
+        exitIntent: { type: "none" },
+        selectedDiffFile: null,
+        isDiffVisible: false,
+      },
+      error: { message: "restore interrupted" },
+      restoreRecovery,
+    });
+    service.reconcile.mockResolvedValue({
+      branch: "main",
+      headOid: "pre-restore-head",
+      isClean: true,
+    });
+    const harness = createHarness();
+    await harness.actorA.resync();
+    await flush();
+
+    expect(harness.actorA.getSnapshot().state.type).toBe("closed");
+
+    harness.releaseA();
+    harness.releaseB();
+    harness.clientA.dispose();
+    harness.clientB.dispose();
+    harness.transport.dispose();
+  });
+
+  it("keeps recovery when an interrupted branch switch lands elsewhere", async () => {
+    persistence.load.mockReturnValue({
+      type: "switching-branch",
+      appId: 7,
+      branch: "requested-branch",
+      fallback: {
+        type: "previewing",
+        session: {
+          appId: 7,
+          originBranch: "feature/origin",
+          targetVersionId: "abc123",
+          checkedOutVersionId: "abc123",
+          exitIntent: { type: "none" },
+          selectedDiffFile: null,
+          isDiffVisible: false,
+        },
+      },
+    });
+    service.reconcile.mockResolvedValue({ branch: "unrelated-branch" });
+    const harness = createHarness();
+    await harness.actorA.resync();
+    await flush();
+
+    expect(harness.actorA.getSnapshot().state).toMatchObject({
+      type: "recovery-required",
+      session: { originBranch: "feature/origin" },
+    });
+
+    harness.releaseA();
+    harness.releaseB();
+    harness.clientA.dispose();
+    harness.clientB.dispose();
+    harness.transport.dispose();
+  });
+
+  it("does not start Git mutation when the recovery checkpoint fails", async () => {
+    service.resolveOriginBranch.mockResolvedValue({
+      branch: "feature/origin",
+    });
+    persistence.checkpoint.mockImplementationOnce(() => {
+      throw new Error("disk full");
+    });
+    const harness = createHarness();
+    await harness.actorA.resync();
+
+    await harness.actorA.dispatch({
+      type: "SELECT_VERSION",
+      versionId: "abc123",
+      operationId: "preview-checkpoint-failure",
+    });
+    await flush();
+
+    expect(service.run).not.toHaveBeenCalled();
+    expect(harness.actorA.getSnapshot().state.type).toBe("browsing");
+    expect(presentation.publishError).toHaveBeenCalledWith(
+      7,
+      "preview-checkpoint-failure",
+      expect.stringContaining("disk full"),
+    );
+
+    harness.releaseA();
+    harness.releaseB();
+    harness.clientA.dispose();
+    harness.clientB.dispose();
+    harness.transport.dispose();
+  });
+
+  it.each([
+    { type: "RESTORE", outcome: "success" },
+    { type: "RESTORE", outcome: "failure" },
+    { type: "RESTORE_TO_MESSAGE", outcome: "success" },
+    { type: "RESTORE_TO_MESSAGE", outcome: "failure" },
+    { type: "RESTORE_TO_MESSAGE", outcome: "restart-failure" },
+  ] as const)(
+    "holds chat execution through $type and restart: $outcome",
+    async ({ type, outcome }) => {
+      const restore = deferred<unknown>();
+      const restart = deferred<undefined>();
+      service.run.mockReturnValueOnce(restore.promise);
+      if (outcome !== "failure")
+        appRun.executeExternalLifecycle.mockReturnValueOnce(restart.promise);
+      const harness = createHarness();
+      await harness.actorA.resync();
+      await harness.actorA.dispatch(
+        type === "RESTORE"
+          ? { type, versionId: "abc123", operationId: "held-undo" }
+          : {
+              type,
+              chatId: 23,
+              messageId: 42,
+              restoreCodebase: true,
+              operationId: "held-restore-to-message",
+            },
+      );
+      expect(chatExecutionHold.isHeld(7)).toBe(true);
+      expect(chatExecutionHold.isHeld(8)).toBe(false);
+      if (outcome !== "failure") {
+        restore.resolve({
+          repositoryOutcome: "target-applied",
+          notification: null,
+          runtimeAction: "restart",
+          affectedChatId: null,
+          createdChatId: null,
+        });
+        await vi.waitFor(() =>
+          expect(appRun.executeExternalLifecycle).toHaveBeenCalled(),
+        );
+        expect(chatExecutionHold.isHeld(7)).toBe(true);
+        if (outcome === "restart-failure") {
+          restart.reject(new Error("restart failed"));
+        } else {
+          restart.resolve(undefined);
+        }
+      } else {
+        restore.reject(new Error("restore failed"));
+      }
+      await vi.waitFor(() => expect(chatExecutionHold.isHeld(7)).toBe(false));
+      harness.releaseA();
+      harness.releaseB();
+      harness.clientA.dispose();
+      harness.clientB.dispose();
+      await harness.transport.dispose();
+      await harness.host.dispose();
+    },
+  );
+
+  it("does not hold chat execution while forking without restoring code", async () => {
+    const fork = deferred<unknown>();
+    service.run.mockReturnValueOnce(fork.promise);
+    const harness = createHarness();
+    await harness.actorA.resync();
+    await harness.actorA.dispatch({
+      type: "RESTORE_TO_MESSAGE",
+      chatId: 23,
+      messageId: 42,
+      restoreCodebase: false,
+      operationId: "fork-without-restore",
+    });
+    expect(service.run).toHaveBeenCalled();
+    expect(chatExecutionHold.isHeld(7)).toBe(false);
+    fork.resolve({
+      repositoryOutcome: "unchanged",
+      notification: null,
+      runtimeAction: "none",
+      affectedChatId: null,
+      createdChatId: 24,
+    });
+    await flush();
+    expect(chatExecutionHold.isHeld(7)).toBe(false);
+    expect(appRun.executeExternalLifecycle).not.toHaveBeenCalled();
+    harness.releaseA();
+    harness.releaseB();
+    harness.clientA.dispose();
+    harness.clientB.dispose();
+    await harness.transport.dispose();
+    await harness.host.dispose();
+  });
+
+  it.each([
+    { type: "RESTORE", disposeDuringCheckpoint: false },
+    { type: "RESTORE_TO_MESSAGE", disposeDuringCheckpoint: false },
+    { type: "RESTORE", disposeDuringCheckpoint: true },
+  ] as const)(
+    "keeps execution held after partial $type through recovery (dispose during checkpoint: $disposeDuringCheckpoint)",
+    async ({ type, disposeDuringCheckpoint }) => {
+      const restore = deferred<unknown>();
+      const validation = deferred<{ kind: "dirty" }>();
+      const checkpoint = deferred<{
+        kind: "healthy";
+        branch: string;
+        headOid: string;
+        savedVersionId: string;
+      }>();
+      service.run.mockImplementationOnce(
+        (
+          _command: unknown,
+          _operationId: string,
+          onRestoreProgress: (progress: RestoreRecovery) => void,
+        ) => {
+          onRestoreProgress({
+            preRestoreHead: "pre-restore-head",
+            preRestoreBranch: "main",
+            targetHead: "abc123",
+            nextStep: "soft-reset",
+          });
+          return restore.promise;
+        },
+      );
+      service.validateCurrentRepository.mockReturnValueOnce(validation.promise);
+      service.checkpointCurrentRepository.mockReturnValueOnce(
+        checkpoint.promise,
+      );
+      const heldChanges = vi.fn();
+      const unsubscribe = chatExecutionHold.subscribe(7, heldChanges);
+      const harness = createHarness();
+      try {
+        await harness.actorA.resync();
+        await harness.actorA.dispatch(
+          type === "RESTORE"
+            ? { type, versionId: "abc123", operationId: "partial-restore" }
+            : {
+                type,
+                chatId: 23,
+                messageId: 42,
+                restoreCodebase: true,
+                operationId: "partial-restore",
+              },
+        );
+        expect(chatExecutionHold.isHeld(7)).toBe(true);
+        restore.reject(new Error("soft reset failed"));
+        await flush();
+        expect(harness.actorA.getSnapshot().state.type).toBe(
+          "restore-recovery-required",
+        );
+        expect(chatExecutionHold.isHeld(7)).toBe(true);
+        expect(chatExecutionHold.isHeld(8)).toBe(false);
+        await harness.actorA.dispatch({
+          type: "CLOSE",
+          operationId: "close-recovery",
+        });
+        expect(chatExecutionHold.isHeld(7)).toBe(true);
+
+        await harness.actorA.dispatch({
+          type: "ACCEPT_CURRENT_REPOSITORY",
+          operationId: "accept-recovery",
+        });
+        expect(harness.actorA.getSnapshot().state.type).toBe(
+          "validating-current-repository",
+        );
+        expect(chatExecutionHold.isHeld(7)).toBe(true);
+        validation.resolve({ kind: "dirty" });
+        await flush();
+        expect(chatExecutionHold.isHeld(7)).toBe(true);
+        await harness.actorA.dispatch({
+          type: "CHECKPOINT_AND_ACCEPT_CURRENT_REPOSITORY",
+          operationId: "checkpoint-recovery",
+        });
+        expect(harness.actorA.getSnapshot().state.type).toBe(
+          "checkpointing-current-repository",
+        );
+        // No momentary release may let the chat actor dispatch queued work.
+        expect(heldChanges.mock.calls).toEqual([[true]]);
+        if (disposeDuringCheckpoint) {
+          await harness.host.dispose();
+          expect(heldChanges.mock.calls).toEqual([[true]]);
+        }
+        checkpoint.resolve({
+          kind: "healthy",
+          branch: "main",
+          headOid: "recovery-head",
+          savedVersionId: "recovery-head",
+        });
+        await flush();
+        if (!disposeDuringCheckpoint) {
+          expect(harness.actorA.getSnapshot().state.type).toBe("closed");
+        }
+        expect(heldChanges.mock.calls).toEqual([[true], [false]]);
+      } finally {
+        unsubscribe();
+        harness.releaseA();
+        harness.releaseB();
+        harness.clientA.dispose();
+        harness.clientB.dispose();
+        await harness.transport.dispose();
+      }
+    },
+  );
+
+  it("does not cross the hard-reset boundary when its progress checkpoint fails", async () => {
+    const destructiveEffect = vi.fn();
+    let checkpointCount = 0;
+    persistence.checkpointRestore.mockImplementation(() => {
+      checkpointCount += 1;
+      if (checkpointCount === 2) throw new Error("progress checkpoint failed");
+    });
+    service.run.mockImplementationOnce(
+      async (
+        _command: unknown,
+        _operationId: string,
+        onRestoreProgress: (progress: RestoreRecovery) => void,
+      ) => {
+        onRestoreProgress({
+          preRestoreHead: "pre-restore-head",
+          preRestoreBranch: "main",
+          targetHead: "abc123",
+          nextStep: "preparing",
+        });
+        onRestoreProgress({
+          preRestoreHead: "pre-restore-head",
+          preRestoreBranch: "main",
+          targetHead: "abc123",
+          nextStep: "hard-reset",
+        });
+        destructiveEffect();
+        return {
+          repositoryOutcome: "target-applied",
+          notification: null,
+          runtimeAction: "none",
+          affectedChatId: null,
+          createdChatId: null,
+        };
+      },
+    );
+    const harness = createHarness();
+    await harness.actorA.resync();
+
+    await harness.actorA.dispatch({
+      type: "RESTORE",
+      versionId: "abc123",
+      operationId: "restore-progress-checkpoint-failure",
+    });
+    await flush();
+
+    expect(destructiveEffect).not.toHaveBeenCalled();
+    expect(harness.actorA.getSnapshot().state.type).toBe("closed");
+
+    harness.releaseA();
+    harness.releaseB();
+    harness.clientA.dispose();
+    harness.clientB.dispose();
+    harness.transport.dispose();
+  });
+
+  it("keeps recovery visible when Git fails after hard reset starts", async () => {
+    service.run.mockImplementationOnce(
+      async (
+        _command: unknown,
+        _operationId: string,
+        onRestoreProgress: (progress: {
+          preRestoreHead: string;
+          preRestoreBranch: string | null;
+          targetHead: string;
+          nextStep: "soft-reset";
+        }) => void,
+      ) => {
+        onRestoreProgress({
+          preRestoreHead: "pre-restore-head",
+          preRestoreBranch: "main",
+          targetHead: "abc123",
+          nextStep: "soft-reset",
+        });
+        throw new Error("soft reset failed");
+      },
+    );
+    const harness = createHarness();
+    await harness.actorA.resync();
+
+    await harness.actorA.dispatch({
+      type: "RESTORE",
+      versionId: "abc123",
+      operationId: "restore-partial-failure",
+    });
+    await flush();
+
+    expect(
+      (
+        harness.host.peek(
+          versionPreviewDefinition.id,
+          versionPreviewKey(7),
+        ) as any
+      ).getSnapshot().state,
+    ).toMatchObject({
+      type: "restore-recovery-required",
+      error: { message: "soft reset failed" },
+      restoreRecovery: {
+        preRestoreHead: "pre-restore-head",
+        preRestoreBranch: "main",
+        targetHead: "abc123",
+        nextStep: "soft-reset",
+      },
+    });
+
+    harness.releaseA();
+    harness.releaseB();
+    harness.clientA.dispose();
+    harness.clientB.dispose();
+    harness.transport.dispose();
+  });
+
+  it("keeps recovery visible when Git fails after the branch checkout starts", async () => {
+    service.run.mockImplementationOnce(
+      async (
+        _command: unknown,
+        _operationId: string,
+        onRestoreProgress: (progress: RestoreRecovery) => void,
+      ) => {
+        onRestoreProgress({
+          preRestoreHead: "pre-restore-head",
+          preRestoreBranch: "main",
+          targetHead: "abc123",
+          nextStep: "preparing",
+        });
+        onRestoreProgress({
+          preRestoreHead: "pre-restore-head",
+          preRestoreBranch: "main",
+          targetHead: "abc123",
+          nextStep: "checkout-branch",
+        });
+        throw new Error("checkout failed");
+      },
+    );
+    const harness = createHarness();
+    await harness.actorA.resync();
+
+    await harness.actorA.dispatch({
+      type: "RESTORE_TO_MESSAGE",
+      chatId: 23,
+      messageId: 42,
+      restoreCodebase: true,
+      operationId: "restore-checkout-failure",
+    });
+    await flush();
+
+    expect(
+      (
+        harness.host.peek(
+          versionPreviewDefinition.id,
+          versionPreviewKey(7),
+        ) as any
+      ).getSnapshot().state,
+    ).toMatchObject({
+      type: "restore-recovery-required",
+      restoreRecovery: { nextStep: "checkout-branch", affectedChatId: 23 },
+    });
+
+    harness.releaseA();
+    harness.releaseB();
+    harness.clientA.dispose();
+    harness.clientB.dispose();
+    harness.transport.dispose();
+  });
+});

@@ -22,6 +22,15 @@ export const VITE_CONFIG_FILES = [
   "vite.config.cts",
 ];
 
+export const NITRO_CONFIG_FILES = [
+  "nitro.config.ts",
+  "nitro.config.js",
+  "nitro.config.mjs",
+  "nitro.config.cjs",
+  "nitro.config.mts",
+  "nitro.config.cts",
+];
+
 /**
  * Whether Neon can be connected to this app. Neon supports Next.js and Vite
  * apps (Vite apps automatically get a Nitro server layer added on connect).
@@ -47,3 +56,12 @@ export function isNeonSupportedFramework({
       NEXTJS_CONFIG_FILES.includes(file) || VITE_CONFIG_FILES.includes(file),
   );
 }
+
+/**
+ * Where Nitro's node-server preset writes the entry point it builds.
+ *
+ * One copy: the conversion writes this into an app's `start` script, and the
+ * deploy sends the same value for apps converted before it did. Two copies
+ * could drift, and the two populations would then run different commands.
+ */
+export const NITRO_START_COMMAND = "node .output/server/index.mjs";

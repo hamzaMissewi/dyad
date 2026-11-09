@@ -20,6 +20,24 @@ export const LanguageModelProviderSchema = z.object({
 
 export type LanguageModelProvider = z.infer<typeof LanguageModelProviderSchema>;
 
+export const EffortSettingsSchema = z
+  .object({
+    defaultEffortLevel: z.string().trim().min(1),
+    possibleEffortLevels: z
+      .array(z.string().trim().min(1))
+      .min(1)
+      .refine((levels) => new Set(levels).size === levels.length, {
+        message: "Effort levels must be unique",
+      }),
+  })
+  .refine(
+    ({ defaultEffortLevel, possibleEffortLevels }) =>
+      possibleEffortLevels.includes(defaultEffortLevel),
+    { message: "Default effort level must be included in possible levels" },
+  );
+
+export type EffortSettings = z.infer<typeof EffortSettingsSchema>;
+
 export const LanguageModelSchema = z.object({
   id: z.number().optional(),
   apiName: z.string(),
@@ -31,6 +49,7 @@ export const LanguageModelSchema = z.object({
   contextWindow: z.number().optional(),
   temperature: z.number().optional(),
   dollarSigns: z.number().optional(),
+  effortSettings: EffortSettingsSchema.optional(),
   type: z.enum(["custom", "local", "cloud"]).optional(),
 });
 
@@ -66,6 +85,13 @@ export const CreateCustomLanguageModelParamsSchema = z.object({
 
 export type CreateCustomLanguageModelParams = z.infer<
   typeof CreateCustomLanguageModelParamsSchema
+>;
+
+export const UpdateCustomLanguageModelParamsSchema =
+  CreateCustomLanguageModelParamsSchema.extend({ id: z.number() });
+
+export type UpdateCustomLanguageModelParams = z.infer<
+  typeof UpdateCustomLanguageModelParamsSchema
 >;
 
 export const DeleteCustomModelParamsSchema = z.object({
@@ -117,7 +143,13 @@ export const languageModelContracts = {
   createCustomModel: defineContract({
     channel: "create-custom-language-model",
     input: CreateCustomLanguageModelParamsSchema,
-    output: z.void(),
+    output: z.number(),
+  }),
+
+  updateCustomModel: defineContract({
+    channel: "update-custom-language-model",
+    input: UpdateCustomLanguageModelParamsSchema,
+    output: z.number(),
   }),
 
   deleteCustomModel: defineContract({

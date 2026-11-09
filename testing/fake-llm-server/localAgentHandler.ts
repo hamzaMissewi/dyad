@@ -7,8 +7,9 @@ import { Request, Response } from "express";
 import crypto from "crypto";
 import path from "path";
 import fs from "fs";
-import type { LocalAgentFixture, Turn } from "./localAgentTypes";
+import type { LocalAgentFixture, ToolCall, Turn } from "./localAgentTypes";
 import { resolveFixturesDir } from "./paths";
+import { fakeLlmLog } from "./log";
 
 // Register ts-node to allow loading .ts fixture files directly
 try {
@@ -25,6 +26,143 @@ const fixtureCache = new Map<string, LocalAgentFixture>();
 // Track connection attempts per session+turn for connection drop simulation.
 // Key: `${sessionId}-${passIndex}-${turnIndex}`, Value: attempt count
 const connectionAttempts = new Map<string, number>();
+
+function normalizeFixtureText(text: string): string {
+  return text.replace(/\r\n/g, "\n");
+}
+
+function parseTagAttributes(source: string): Record<string, string> {
+  return Object.fromEntries(
+    [...source.matchAll(/([\w-]+)="([^"]*)"/g)].map((match) => [
+      match[1],
+      match[2],
+    ]),
+  );
+}
+
+/**
+ * Convert the retired Build-mode XML fixture format into native tool turns.
+ * This keeps older E2E scenarios useful while ensuring they exercise the same
+ * tool-calling path as the application.
+ */
+export function convertLegacyFixtureToLocalAgent(
+  source: string,
+): LocalAgentFixture {
+  const normalized = normalizeFixtureText(source);
+  const turns: Turn[] = [];
+  const tagPattern =
+    /<dyad-(write|delete|rename|add-dependency|execute-sql|search-replace|add-integration|chat-summary)\b([^>]*)>([\s\S]*?)<\/dyad-\1>/g;
+  let precedingEnd = 0;
+
+  for (const match of normalized.matchAll(tagPattern)) {
+    const [fullMatch, tag, attributeSource, rawBody] = match;
+    const index = match.index ?? 0;
+    const text = normalized.slice(precedingEnd, index).trim();
+    const attributes = parseTagAttributes(attributeSource);
+    const body = rawBody.replace(/^\n|\n$/g, "");
+    let toolCall: ToolCall | undefined;
+
+    switch (tag) {
+      case "write":
+        toolCall = {
+          name: "write_file",
+          args: {
+            path: attributes.path,
+            content: body,
+            ...(attributes.description
+              ? { description: attributes.description }
+              : {}),
+          },
+        };
+        break;
+      case "delete":
+        toolCall = { name: "delete_file", args: { path: attributes.path } };
+        break;
+      case "rename":
+        toolCall = {
+          name: "rename_file",
+          args: { from: attributes.from, to: attributes.to },
+        };
+        break;
+      case "add-dependency":
+        toolCall = {
+          name: "add_dependency",
+          args: { packages: attributes.packages.split(/\s+/).filter(Boolean) },
+        };
+        break;
+      case "execute-sql":
+        toolCall = {
+          name: "execute_sql",
+          args: {
+            query: body.trim(),
+            ...(attributes.description
+              ? { description: attributes.description }
+              : {}),
+          },
+        };
+        break;
+      case "search-replace": {
+        const replacement = body.match(
+          /^<<<<<<< SEARCH\n([\s\S]*?)\n=======\n([\s\S]*?)\n>>>>>>> REPLACE$/,
+        );
+        if (replacement) {
+          toolCall = {
+            name: "search_replace",
+            args: {
+              file_path: attributes.path,
+              old_string: replacement[1],
+              new_string: replacement[2],
+            },
+          };
+        }
+        break;
+      }
+      case "add-integration":
+        toolCall = { name: "add_integration", args: {} };
+        break;
+      case "chat-summary":
+        toolCall = {
+          name: "set_chat_summary",
+          args: { summary: body.trim() },
+        };
+        break;
+    }
+
+    if (toolCall) {
+      turns.push({ ...(text ? { text } : {}), toolCalls: [toolCall] });
+    }
+    precedingEnd = index + fullMatch.length;
+  }
+
+  const trailingText = normalized.slice(precedingEnd).trim();
+  if (trailingText || turns.length === 0) {
+    turns.push({ text: trailingText || normalized.trim() || "Done." });
+  }
+
+  return {
+    description: "Converted legacy Build-mode E2E fixture",
+    turns,
+  };
+}
+
+function findLegacyFixturePath(fixtureName: string): string | undefined {
+  for (const fixturePath of [
+    path.join(resolveFixturesDir(), `${fixtureName}.md`),
+    path.join(resolveFixturesDir(), "engine", `${fixtureName}.md`),
+  ]) {
+    if (fs.existsSync(fixturePath)) return fixturePath;
+  }
+  return undefined;
+}
+
+function hasLocalAgentFixture(fixtureName: string): boolean {
+  const fixtureDir = path.join(resolveFixturesDir(), "engine", "local-agent");
+  return (
+    fs.existsSync(path.join(fixtureDir, `${fixtureName}.ts`)) ||
+    fs.existsSync(path.join(fixtureDir, `${fixtureName}.js`)) ||
+    Boolean(findLegacyFixturePath(fixtureName))
+  );
+}
 
 /**
  * Generate a session ID from the first user message
@@ -126,11 +264,52 @@ function extractAttachmentPath(messages: any[]): string | null {
   return null;
 }
 
+function extractSyntheticUsage(messages: any[]): Turn["usage"] | undefined {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index];
+    if (message?.role !== "user") continue;
+    const text = Array.isArray(message.content)
+      ? message.content.find((part: any) => part.type === "text")?.text
+      : typeof message.content === "string"
+        ? message.content
+        : null;
+    if (!text || text.startsWith("Summarize the following chat:")) continue;
+    const match = text.match(/\[high-tokens=(\d+)\]/);
+    if (!match) continue;
+    const totalTokens = Number(match[1]);
+    return {
+      prompt_tokens: Math.max(0, totalTokens - 100),
+      completion_tokens: Math.min(100, totalTokens),
+      total_tokens: totalTokens,
+    };
+  }
+  return undefined;
+}
+
+export function extractSyntheticDelayMs(messages: any[]): number | undefined {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index];
+    if (message?.role !== "user" || isToolResultMessage(message)) continue;
+    const text = Array.isArray(message.content)
+      ? message.content.find((part: any) => part.type === "text")?.text
+      : typeof message.content === "string"
+        ? message.content
+        : null;
+    const delay = text?.match(/\[sleep=(medium|long)\]/)?.[1];
+    if (delay === "medium") return 10_000;
+    if (delay === "long") return 30_000;
+    return undefined;
+  }
+  return undefined;
+}
+
 /**
  * Load a fixture file dynamically
  * Tries .ts first (for dev mode with ts-node), then .js
  */
-async function loadFixture(fixtureName: string): Promise<LocalAgentFixture> {
+export async function loadLocalAgentFixture(
+  fixtureName: string,
+): Promise<LocalAgentFixture> {
   if (fixtureCache.has(fixtureName)) {
     return fixtureCache.get(fixtureName)!;
   }
@@ -141,6 +320,18 @@ async function loadFixture(fixtureName: string): Promise<LocalAgentFixture> {
   let fixturePath = path.join(fixtureDir, `${fixtureName}.ts`);
   if (!fs.existsSync(fixturePath)) {
     fixturePath = path.join(fixtureDir, `${fixtureName}.js`);
+  }
+
+  if (!fs.existsSync(fixturePath)) {
+    const legacyFixturePath = findLegacyFixturePath(fixtureName);
+    if (!legacyFixturePath) {
+      throw new Error(`Local agent fixture not found: ${fixtureName}`);
+    }
+    const fixture = convertLegacyFixtureToLocalAgent(
+      fs.readFileSync(legacyFixturePath, "utf-8"),
+    );
+    fixtureCache.set(fixtureName, fixture);
+    return fixture;
   }
 
   try {
@@ -229,6 +420,8 @@ async function streamTextResponse(
   usage?: Turn["usage"],
   protocol: "openai" | "anthropic" = "openai",
 ) {
+  text = normalizeFixtureText(text);
+
   if (protocol === "anthropic") {
     await streamAnthropicTextResponse(res, text, usage);
     return;
@@ -299,9 +492,10 @@ async function streamToolCallResponse(
 
   // 2) Send text content if any
   if (turn.text) {
+    const text = normalizeFixtureText(turn.text);
     const batchSize = 32;
-    for (let i = 0; i < turn.text.length; i += batchSize) {
-      const batch = turn.text.slice(i, i + batchSize);
+    for (let i = 0; i < text.length; i += batchSize) {
+      const batch = text.slice(i, i + batchSize);
       res.write(mkChunk({ content: batch }));
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
@@ -346,7 +540,7 @@ async function streamToolCallResponse(
   }
 
   if (options?.dropAfterToolCalls) {
-    console.log(
+    fakeLlmLog(
       `[local-agent] Simulating connection drop after streaming tool calls`,
     );
     // Drop before finish_reason/[DONE] so tool calls were emitted but the
@@ -412,6 +606,8 @@ async function streamAnthropicTextBlock(
   index: number,
   text: string,
 ) {
+  text = normalizeFixtureText(text);
+
   writeAnthropicEvent(res, "content_block_start", {
     type: "content_block_start",
     index,
@@ -508,7 +704,7 @@ async function streamAnthropicToolCallResponse(
   }
 
   if (options?.dropAfterToolCalls) {
-    console.log(
+    fakeLlmLog(
       `[local-agent] Simulating Anthropic connection drop after streaming tool calls`,
     );
     res.socket?.destroy();
@@ -534,11 +730,11 @@ export async function handleLocalAgentFixture(
   const { messages = [] } = req.body;
   const protocol = options.protocol ?? "openai";
 
-  console.log(`[local-agent] Loading fixture: ${fixtureName}`);
-  console.log(`[local-agent] Messages count: ${messages.length}`);
+  fakeLlmLog(`[local-agent] Loading fixture: ${fixtureName}`);
+  fakeLlmLog(`[local-agent] Messages count: ${messages.length}`);
 
   try {
-    const fixture = await loadFixture(fixtureName);
+    const fixture = await loadLocalAgentFixture(fixtureName);
     const sessionId = getSessionId(messages);
 
     // Determine which outer loop pass we're on based on todo reminder messages
@@ -551,13 +747,13 @@ export async function handleLocalAgentFixture(
     // Get the turns for the current pass
     const turns = getTurnsForPass(fixture, passIndex);
 
-    console.error(
+    fakeLlmLog(
       `[local-agent] Loaded fixture: ${fixtureName}, Session: ${sessionId}, Pass: ${passIndex}, Turn: ${turnIndex}, Tool rounds: ${toolResultRounds}`,
     );
 
     if (turnIndex >= turns.length) {
       // All turns exhausted for this pass, send a simple completion message
-      console.log(
+      fakeLlmLog(
         `[local-agent] All turns exhausted for pass ${passIndex}, sending completion`,
       );
       await streamTextResponse(res, "Task completed.", undefined, protocol);
@@ -565,7 +761,16 @@ export async function handleLocalAgentFixture(
     }
 
     let turn = turns[turnIndex];
-    console.log(
+    const syntheticUsage = extractSyntheticUsage(messages);
+    if (syntheticUsage && !turn.toolCalls?.length) {
+      turn = { ...turn, usage: syntheticUsage };
+    }
+    const syntheticDelayMs =
+      turnIndex === 0 ? extractSyntheticDelayMs(messages) : undefined;
+    if (syntheticDelayMs && !turn.delayMs) {
+      turn = { ...turn, delayMs: syntheticDelayMs };
+    }
+    fakeLlmLog(
       `[local-agent] Executing pass ${passIndex}, turn ${turnIndex}:`,
       {
         hasText: !!turn.text,
@@ -607,13 +812,13 @@ export async function handleLocalAgentFixture(
       const currentAttempt = (connectionAttempts.get(attemptKey) || 0) + 1;
       connectionAttempts.set(attemptKey, currentAttempt);
 
-      console.log(
+      fakeLlmLog(
         `[local-agent] Connection attempt ${currentAttempt} for ${attemptKey}, ` +
           `drop on: [${turnScopedDropAttempts.join(", ")}]`,
       );
 
       if (turnScopedDropAttempts.includes(currentAttempt)) {
-        console.log(
+        fakeLlmLog(
           `[local-agent] Simulating connection drop on attempt ${currentAttempt}`,
         );
         // Stream partial data then destroy the socket to simulate a network interruption
@@ -650,9 +855,8 @@ export async function handleLocalAgentFixture(
     }
 
     // Optional delay so tests can cancel the stream while it is still open.
-    // Abort the wait as soon as the client disconnects so the timer doesn't
-    // keep the event loop alive (delaying test teardown) and we don't later
-    // try to write to a closed response (ERR_STREAM_WRITE_AFTER_END / EPIPE).
+    // Watch the response: the request can close normally as soon as its body is
+    // consumed, before the response starts streaming.
     if (turn.delayMs && turn.delayMs > 0) {
       let aborted = false;
       await new Promise<void>((resolve) => {
@@ -662,12 +866,12 @@ export async function handleLocalAgentFixture(
           resolve();
         };
         const timer = setTimeout(() => {
-          req.removeListener("close", onClose);
+          res.removeListener("close", onClose);
           resolve();
         }, turn.delayMs);
-        req.once("close", onClose);
+        res.once("close", onClose);
       });
-      if (aborted || req.destroyed) {
+      if (aborted || res.destroyed) {
         return;
       }
     }
@@ -713,7 +917,28 @@ export async function handleLocalAgentFixture(
  */
 export function extractLocalAgentFixture(content: string): string | null {
   if (!content) return null;
-  // Match tc=local-agent/FIXTURE_NAME, allowing trailing whitespace
-  const match = content.trim().match(/^tc=local-agent\/([^\s[]+)/);
-  return match ? match[1] : null;
+  if (content.startsWith("Fix error: Error Line 6 error")) {
+    return "fix-runtime-error";
+  }
+  if (content.startsWith("Fix all of the following errors:")) {
+    return "fix-all-runtime-errors";
+  }
+  if (content.includes("TypeScript compile-time error")) {
+    return "fix-typescript-errors";
+  }
+  if (
+    content.startsWith("Please fix the following security issue") ||
+    /^Please fix the following \d+ security issues/.test(content)
+  ) {
+    return "security-fix";
+  }
+  // Prefer the explicit tool-loop fixture namespace, then adapt an existing
+  // legacy fixture when a Build-mode E2E still uses tc=FIXTURE_NAME.
+  const explicitMatch = content.trim().match(/^tc=local-agent\/([^\s[]+)/);
+  if (explicitMatch) return explicitMatch[1];
+
+  const legacyMatch = content.trim().match(/^tc=([^\s[]+)/);
+  return legacyMatch && hasLocalAgentFixture(legacyMatch[1])
+    ? legacyMatch[1]
+    : null;
 }

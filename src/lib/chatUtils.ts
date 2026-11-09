@@ -38,6 +38,7 @@ export async function resolveChatSummary(
       title: chat.title,
       createdAt: chat.createdAt,
       chatMode: chat.chatMode,
+      isFavorite: chat.isFavorite,
     };
   } catch (error) {
     console.warn(
@@ -69,17 +70,4 @@ export async function resolveAppNameForAppId(
   }
 
   return "Dyad";
-}
-
-/**
- * Resolves the appId for a given chatId by checking the TanStack Query cache
- * and falling back to a direct IPC fetch if necessary.
- */
-export async function resolveAppIdForChat(
-  chatId: number,
-  queryClient: QueryClient,
-  options: ResolveChatSummaryOptions = {},
-): Promise<number | null> {
-  const summary = await resolveChatSummary(chatId, queryClient, options);
-  return summary?.appId ?? null;
 }

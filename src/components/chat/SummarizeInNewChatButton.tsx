@@ -1,16 +1,19 @@
-import { useNavigate } from "@tanstack/react-router";
 import { useAtomValue } from "jotai";
 import { selectedChatIdAtom } from "@/atoms/chatAtoms";
 import { selectedAppIdAtom } from "@/atoms/appAtoms";
 import { useStreamChat } from "@/hooks/useStreamChat";
+import { useSelectChat } from "@/hooks/useSelectChat";
 import { ipc } from "@/ipc/types";
 import { showError } from "@/lib/toast";
+import { useQueryClient } from "@tanstack/react-query";
+import { queryKeys } from "@/lib/queryKeys";
 
 export function useSummarizeInNewChat() {
   const chatId = useAtomValue(selectedChatIdAtom);
   const appId = useAtomValue(selectedAppIdAtom);
   const { streamMessage } = useStreamChat();
-  const navigate = useNavigate();
+  const { selectChat } = useSelectChat();
+  const queryClient = useQueryClient();
 
   const handleSummarize = async () => {
     if (!appId) {
@@ -27,8 +30,8 @@ export function useSummarizeInNewChat() {
         appId,
         initialChatMode: sourceChat.chatMode ?? undefined,
       });
-      // navigate to new chat
-      await navigate({ to: "/chat", search: { id: newChatId } });
+      await queryClient.invalidateQueries({ queryKey: queryKeys.chats.all });
+      selectChat({ chatId: newChatId, appId });
       await streamMessage({
         prompt: "Summarize from chat-id=" + chatId,
         chatId: newChatId,

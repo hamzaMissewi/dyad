@@ -24,7 +24,6 @@ jobs:
       should_run_tests: ${{ steps.check.outputs.should_run_tests }}
       should_run_schema_diff_tests: ${{ steps.check.outputs.should_run_schema_diff_tests }}
       should_run_schema_classifier_tests: ${{ steps.check.outputs.should_run_schema_classifier_tests }}
-      build_os: ${{ steps.matrix.outputs.build_os }}
       e2e_os: ${{ steps.matrix.outputs.e2e_os }}
       e2e_shard: ${{ steps.matrix.outputs.e2e_shard }}
       e2e_shard_total: ${{ steps.matrix.outputs.e2e_shard_total }}
@@ -120,35 +119,43 @@ jobs:
               ;;
           esac
 
-      # Sets the dynamic matrix for the build and e2e-tests jobs based on the PR author.
+      # Sets the dynamic matrix for the build-e2e-artifacts and e2e-tests jobs based on the PR author.
       # The "image" field is a JSON-encoded array string so that fromJSON() in runs-on
       # can produce the correct label(s) for both GitHub-hosted and self-hosted runners.
       #
       # Privileged authors (wwwillchen, keppo-bot/keppo-bot[bot], dyad-assistant, azizmejri1, ryangroch):
-      #   - Self-hosted macOS ARM64 runners, no Windows, 4 shards.
+      #   - Build E2E artifact on self-hosted macOS ARM64.
+      #   - E2E on self-hosted macOS ARM64, 4 shards.
+      #   - Unit tests on GitHub-hosted macOS + Windows.
       #
-      #   build (macOS self-hosted) ──> e2e-tests (macOS self-hosted, shards 1-4) ──> merge-reports
+      #   build-e2e-artifacts (macOS self-hosted) ──> e2e-tests (macOS self-hosted, shards 1-4) ──> merge-reports
+      #   unit-tests-macos (macOS GitHub-hosted)
+      #   unit-tests-windows (Windows GitHub-hosted)
       #
       # All other authors:
-      #   - GitHub-hosted runners for macOS + Windows, 4 shards each.
+      #   - Build E2E artifacts and run E2E on GitHub-hosted macOS + Windows, 4 shards each.
+      #   - Unit tests on GitHub-hosted macOS + Windows.
       #
-      #   build (macOS) ──┐
-      #   build (Windows) ┼──> e2e-tests (macOS shards 1-4)    ──┐
-      #                   │    e2e-tests (Windows shards 1-4)  ──┼──> merge-reports
-      #                   └──────────────────────────────────────┘
+      #   build-e2e-artifacts (macOS)   ──> e2e-tests (macOS shards 1-4)    ──┐
+      #   build-e2e-artifacts (Windows) ──> e2e-tests (Windows shards 1-4)  ──┼──> merge-reports
+      #                                                                       ┘
+      #   unit-tests-macos (macOS GitHub-hosted)
+      #   unit-tests-windows (Windows GitHub-hosted)
       - name: Set CI matrix
         id: matrix
         run: |
           if [ "${{ steps.author-check.outputs.is_privileged }}" = "true" ]; then
-            echo 'build_os=[{"name":"macos","image":"[\"self-hosted\",\"macOS\",\"ARM64\"]"}]' >> $GITHUB_OUTPUT
-            echo 'e2e_os=[{"name":"macos","image":"[\"self-hosted\",\"macOS\",\"ARM64\"]"}]' >> $GITHUB_OUTPUT
-            echo 'e2e_shard=[1,2,3,4]' >> $GITHUB_OUTPUT
-            echo 'e2e_shard_total=[4]' >> $GITHUB_OUTPUT
+            {
+              echo 'e2e_os=[{"name":"macos","image":"[\"self-hosted\",\"macOS\",\"ARM64\"]"}]'
+              echo 'e2e_shard=[1,2,3,4]'
+              echo 'e2e_shard_total=[4]'
+            } >> "$GITHUB_OUTPUT"
           else
-            echo 'build_os=[{"name":"windows","image":"[\"windows-2022\"]"},{"name":"macos","image":"[\"macos-latest\"]"}]' >> $GITHUB_OUTPUT
-            echo 'e2e_os=[{"name":"windows","image":"[\"windows-2022\"]"},{"name":"macos","image":"[\"macos-latest\"]"}]' >> $GITHUB_OUTPUT
-            echo 'e2e_shard=[1,2,3,4]' >> $GITHUB_OUTPUT
-            echo 'e2e_shard_total=[4]' >> $GITHUB_OUTPUT
+            {
+              echo 'e2e_os=[{"name":"windows","image":"[\"windows-2022\"]"},{"name":"macos","image":"[\"macos-latest\"]"}]'
+              echo 'e2e_shard=[1,2,3,4]'
+              echo 'e2e_shard_total=[4]'
+            } >> "$GITHUB_OUTPUT"
           fi
 
   ts-pg-schema-diff-tests:
@@ -228,7 +235,7 @@ jobs:
       - name: Unit tests
         run: npm --prefix packages/pg-schema-classifier test
 
-  build:
+  build-e2e-artifacts:
     needs: [check-changes]
     if: needs.check-changes.outputs.should_run_tests == 'true'
     # Why Mac and Windows?
@@ -238,7 +245,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(needs.check-changes.outputs.build_os) }}
+        os: ${{ fromJSON(needs.check-changes.outputs.e2e_os) }}
     runs-on: ${{ fromJSON(matrix.os.image) }}
     steps:
       - name: Checkout code
@@ -259,24 +266,8 @@ jobs:
         env:
           # Required for @vscode/ripgrep to download binaries without hitting GitHub API rate limits
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Presubmit check (e.g. lint, format)
-        # do not run this on Windows (it fails and not necessary)
-        if: contains(matrix.os.name, 'macos')
-        run: npm run presubmit
-      # Must run before type-checking and unit tests: the vitest integration
-      # harness imports the fake-llm-server in-process, so its own
-      # node_modules (express 4 + @types) must be installed for both tsc and
-      # vitest to resolve the right packages.
       - name: Prep test server
         run: cd testing/fake-llm-server && npm install && npm run build && cd -
-      - name: Type-checking
-        # do not run this on windows (it's redundant)
-        if: contains(matrix.os.name, 'macos')
-        run: npm run ts
-      - name: Unit tests
-        # do not run this on windows (it's redundant)
-        if: contains(matrix.os.name, 'macos')
-        run: npm run test
       - name: Build
         env:
           NODE_OPTIONS: "--max-old-space-size=4096"
@@ -310,8 +301,155 @@ jobs:
         if: always() && contains(matrix.os.image, 'self-hosted')
         run: bash scripts/ci-cleanup-macos.sh
 
+  unit-tests-macos:
+    needs: [check-changes]
+    if: needs.check-changes.outputs.should_run_tests == 'true'
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.ref || '' }}
+      - name: Initialize environment
+        uses: actions/setup-node@v5
+        with:
+          node-version: v24.13.1
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Install npm 11.8.0
+        run: npm install -g npm@11.8.0
+      - name: Install node modules
+        run: bash scripts/npm-ci-retry.sh
+        env:
+          # Required for @vscode/ripgrep to download binaries without hitting GitHub API rate limits
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Rebuild macOS Keychain reader
+        run: npm run rebuild:keychain-reader
+      - name: Presubmit check (e.g. lint, format)
+        run: npm run presubmit
+      # Must run before type-checking and unit tests: the vitest integration
+      # harness imports the fake-llm-server in-process, so its own
+      # node_modules (express 4 + @types) must be installed for both tsc and
+      # vitest to resolve the right packages.
+      - name: Prep test server
+        run: cd testing/fake-llm-server && npm install && npm run build && cd -
+      - name: Type-checking
+        run: npm run ts
+      - name: Unit tests
+        run: npm run test
+
+  unit-tests-windows:
+    needs: [check-changes]
+    if: needs.check-changes.outputs.should_run_tests == 'true'
+    runs-on: windows-2022
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.ref || '' }}
+      - name: Initialize environment
+        uses: actions/setup-node@v5
+        with:
+          node-version: v24.13.1
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Install npm 11.8.0
+        run: npm install -g npm@11.8.0
+      - name: Install node modules
+        run: bash scripts/npm-ci-retry.sh
+        env:
+          # Required for @vscode/ripgrep to download binaries without hitting GitHub API rate limits
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Prep test server
+        run: cd testing/fake-llm-server && npm install && npm run build && cd -
+      - name: Unit tests
+        run: npm run test
+
+  # Opt-in macOS-only regression tests for the safeStorage Keychain-identity bug
+  # (issue #3837). This spec temporarily swaps the machine-global DEFAULT macOS
+  # keychain to a throwaway one (safeStorage always uses the default keychain),
+  # so it MUST run only on GitHub-hosted, ephemeral macos-latest VMs — NEVER on
+  # the self-hosted macOS runner, whose keychain is shared across jobs and would
+  # be corrupted by the swap. It reuses the macOS build artifact but is a
+  # standalone job (not part of the sharded e2e-tests matrix or merge-reports).
+  safe-storage-e2e:
+    needs: [check-changes, build-e2e-artifacts]
+    if: needs.check-changes.outputs.should_run_tests == 'true'
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.ref || '' }}
+      - name: Initialize environment
+        uses: actions/setup-node@v5
+        with:
+          node-version: v24.13.1
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Install npm 11.8.0
+        run: npm install -g npm@11.8.0
+      - name: Install node modules
+        run: bash scripts/npm-ci-retry.sh
+        env:
+          # Required for @vscode/ripgrep to download binaries without hitting GitHub API rate limits
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Download build artifacts
+        uses: actions/download-artifact@v7
+        with:
+          name: build-macos
+      - name: Extract macOS app bundle
+        run: tar -xf out-macos.tar
+      # Build the old app here rather than publishing a permanent binary fixture.
+      # This SHA is Electron 40 with the legacy recovery reader already present.
+      - name: Checkout pinned Electron 40 baseline
+        uses: actions/checkout@v5
+        with:
+          repository: dyad-sh/dyad
+          ref: 643efc30b58da8999716bc66f40cf5ecacf661eb
+          path: .claude/tmp/safe-storage-baseline
+          persist-credentials: false
+      - name: Enable real encrypted writes in baseline fixture
+        run: node scripts/prepare-safe-storage-baseline.mjs .claude/tmp/safe-storage-baseline
+      - name: Install baseline dependencies
+        working-directory: .claude/tmp/safe-storage-baseline
+        run: bash scripts/npm-ci-retry.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Prepare baseline test server
+        working-directory: .claude/tmp/safe-storage-baseline/testing/fake-llm-server
+        run: npm ci && npm run build
+      - name: Build unsigned Electron 40 baseline
+        working-directory: .claude/tmp/safe-storage-baseline
+        run: npm run build
+        env:
+          NODE_OPTIONS: "--max-old-space-size=4096"
+      - name: Safe storage keychain identity tests
+        run: npx playwright test e2e-tests/safe_storage_keychain_identity.spec.ts --workers=1
+        env:
+          DYAD_E2E_SAFE_STORAGE: "1"
+          DYAD_E2E_SAFE_STORAGE_BASELINE_BUILD: ${{ github.workspace }}/.claude/tmp/safe-storage-baseline/out
+          DYAD_E2E_SAFE_STORAGE_CANDIDATE_BUILD: ${{ github.workspace }}/out
+      - name: Upload Playwright report
+        # In CI the reporter is "blob" (blob-report/) and traces/screenshots are
+        # retained under test-results/ on failure; there is no playwright-report/.
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: safe-storage-e2e-report
+          path: |
+            blob-report
+            test-results
+          retention-days: 3
+          if-no-files-found: ignore
+
   e2e-tests:
-    needs: [check-changes, build]
+    needs: [check-changes, build-e2e-artifacts]
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -358,9 +496,9 @@ jobs:
             ${{ matrix.os.name }}-pnpm-store-
       # Not strictly needed but makes the e2e tests faster (and less flaky)
       - name: Install scaffold dependencies
-        run: cd scaffold && pnpm install
+        run: bash scripts/pnpm-install-retry.sh scaffold
       - name: Install nextjs-template dependencies
-        run: cd nextjs-template && pnpm install
+        run: bash scripts/pnpm-install-retry.sh nextjs-template
       - name: Download build artifacts
         uses: actions/download-artifact@v7
         with:
@@ -371,6 +509,8 @@ jobs:
         run: tar -xvf out-macos.tar
       - name: E2E tests (Shard ${{ matrix.shard }}/${{ matrix.shardTotal }})
         env:
+          # Socket Firewall's binary installer queries GitHub's release API.
+          SFW_GITHUB_TOKEN: ${{ github.token }}
           # Self-hosted macOS runners use fewer retries (1) vs GitHub-hosted CI (2)
           PLAYWRIGHT_RETRIES: ${{ contains(matrix.os.image, 'self-hosted') && '1' || '2' }}
           # Pilot two workers only on self-hosted macOS shards. Keep GitHub-hosted

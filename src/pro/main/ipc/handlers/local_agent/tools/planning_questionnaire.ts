@@ -2,14 +2,17 @@ import { z } from "zod";
 import crypto from "node:crypto";
 import log from "electron-log";
 import { ToolDefinition, AgentContext } from "./types";
-import { safeSend } from "@/ipc/utils/safe_sender";
-import { questionnaireResolver } from "../userInputResolvers";
+import { userInputRegistry } from "@/user_input/main";
+import { persistQuestionnaire } from "@/user_input/questionnaire_journal";
 import {
   escapeXmlAttr,
   escapeXmlContent,
 } from "../../../../../../../shared/xmlEscape";
 
 const logger = log.scope("planning_questionnaire");
+
+export const COMPLETED_PLANNING_QUESTIONNAIRE_RESULT_PREFIX =
+  "User responses:\n\n";
 
 const QuestionSchema = z
   .object({
@@ -51,18 +54,18 @@ const planningQuestionnaireSchema = z.object({
   questions: z
     .array(QuestionSchema)
     .min(1, "questions array must not be empty")
-    .max(3, "questions array must have at most 3 questions")
-    .describe("A non empty array of 1-3 questions to present to the user"),
+    .max(5, "questions array must have at most 5 questions")
+    .describe("A non-empty array of 1-5 questions to present to the user"),
 });
 
 const DESCRIPTION = `Present a structured questionnaire to gather requirements from the user. The tool displays questions in the UI and waits for the user's responses, returning them as the tool result.
 
 <when_to_use>
 Use this tool when:
-- The user wants to create a NEW app or project
+- Blueprint mode is enabled for a new app; in that case this tool is mandatory even when the request is concrete
 - The request is vague or open-ended
 - There are multiple reasonable interpretations
-Skip when the request is a specific, concrete change.
+Skip only when blueprint mode is not enabled and the request is a specific, concrete change.
 </when_to_use>
 
 <input_schema>
@@ -78,7 +81,7 @@ Each question object has these fields:
 </input_schema>
 
 <correct_example>
-Reasoning: The user asked to "build me a todo app". I need to clarify the tech stack and key features. I'll use radio for single-choice and checkbox for multi-choice.
+Reasoning: The user asked to "build me a todo app". I need to clarify the look and feel and key product features. I'll use radio for single-choice and checkbox for multi-choice.
 
 {
   "questions": [
@@ -109,7 +112,7 @@ WRONG — Empty options array:
 WRONG — Missing options for radio:
 { "type": "radio", "question": "..." }
 
-WRONG — More than 3 questions or more than 3 options
+WRONG — More than 5 questions or more than 3 options
 
 WRONG — Array with empty object (missing required "question" and "type" fields):
 { "questions": [{}] }
@@ -128,29 +131,49 @@ export const planningQuestionnaireTool: ToolDefinition<
     `Questionnaire (${args.questions.length} questions)`,
 
   execute: async (args, ctx: AgentContext) => {
-    const requestId = `questionnaire:${crypto.randomUUID()}`;
-
     // Auto-generate missing IDs
     const questions = args.questions.map((q) => ({
       ...q,
       id: q.id || `q_${crypto.randomUUID().slice(0, 8)}`,
     }));
 
+    const requestId = crypto.randomUUID();
+    if (ctx.persistQuestionnaireRecovery)
+      await persistQuestionnaire({
+        requestId,
+        chatId: ctx.chatId,
+        questions,
+        outcome: "pending",
+      });
+    ctx.onXmlComplete(
+      `<dyad-status title="Questionnaire requested" state="finished">${escapeXmlContent(questions.map((q) => q.question).join("\n"))}</dyad-status>`,
+    );
+    userInputRegistry.request(
+      {
+        kind: "questionnaire",
+        requiresRecovery: ctx.persistQuestionnaireRecovery === true,
+        chatId: ctx.chatId,
+        questions,
+        classifier: "none",
+      },
+      requestId,
+    );
+
     logger.log(
       `Presenting questionnaire (${questions.length} questions), requestId: ${requestId}`,
     );
 
-    safeSend(ctx.event.sender, "plan:questionnaire", {
-      chatId: ctx.chatId,
-      requestId,
-      questions,
-    });
-
-    const answers = await questionnaireResolver.wait(requestId, ctx.chatId);
+    const result = await userInputRegistry.park(requestId, ctx.abortSignal);
+    const answers = result?.kind === "questionnaire" ? result.answers : null;
 
     if (!answers) {
+      ctx.onXmlComplete(
+        `<dyad-status title="Questionnaire closed" state="warning">${ctx.abortSignal?.aborted ? "Cancelled. No answers were submitted." : "Dismissed or interrupted. No answers were submitted."}</dyad-status>`,
+      );
       return "The user dismissed the questionnaire without answering. Ask them how they'd like to proceed, or try asking questions in regular chat text.";
     }
+
+    ctx.appBlueprintQuestionnaireCompleted = true;
 
     const formattedAnswers = questions
       .map((q) => {
@@ -171,6 +194,6 @@ export const planningQuestionnaireTool: ToolDefinition<
       `<dyad-questionnaire count="${questions.length}">\n${qaEntries}\n</dyad-questionnaire>`,
     );
 
-    return `User responses:\n\n${formattedAnswers}`;
+    return `${COMPLETED_PLANNING_QUESTIONNAIRE_RESULT_PREFIX}${formattedAnswers}`;
   },
 };

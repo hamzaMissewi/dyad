@@ -1,12 +1,6 @@
-import { useState, useEffect, useRef } from "react";
-import {
-  FileWarning,
-  Plus,
-  Pencil,
-  Trash2,
-  ArrowRightLeft,
-  TriangleAlert,
-} from "lucide-react";
+import { useState, useEffect, useRef, useCallback } from "react";
+import { FileWarning, TriangleAlert } from "lucide-react";
+import { useSetAtom } from "jotai";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -18,86 +12,66 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
-import {
-  useUncommittedFiles,
-  type UncommittedFile,
-} from "@/hooks/useUncommittedFiles";
-import { useCommitChanges } from "@/hooks/useCommitChanges";
+  clearStagedDiffAtom,
+  closeCommitDialogAtom,
+  openCommitDialogAtom,
+  openStagedDiffAtom,
+} from "@/atoms/commitAtoms";
+import { useUncommittedFiles } from "@/hooks/useUncommittedFiles";
+import { useCommitMessage } from "@/hooks/useCommitMessage";
 import { useDiscardChanges } from "@/hooks/useDiscardChanges";
-import { cn } from "@/lib/utils";
+import { useVersionPreview } from "@/hooks/useVersionPreview";
+import { CommitFileList } from "@/components/chat/CommitFileList";
+import { useCommitDialogRecovery } from "@/hooks/useCommitDialogRecovery";
+import {
+  CommitDialogFooter,
+  CommitRecoveryAlerts,
+} from "@/components/chat/CommitDialogActions";
 
 interface UncommittedFilesBannerProps {
   appId: number | null;
 }
 
-function getStatusIcon(status: UncommittedFile["status"]) {
-  switch (status) {
-    case "added":
-      return <Plus className="h-4 w-4 text-green-500" />;
-    case "modified":
-      return <Pencil className="h-4 w-4 text-yellow-500" />;
-    case "deleted":
-      return <Trash2 className="h-4 w-4 text-red-500" />;
-    case "renamed":
-      return <ArrowRightLeft className="h-4 w-4 text-blue-500" />;
-    default:
-      return null;
-  }
-}
-
-function getStatusLabel(status: UncommittedFile["status"]) {
-  switch (status) {
-    case "added":
-      return "Added";
-    case "modified":
-      return "Modified";
-    case "deleted":
-      return "Deleted";
-    case "renamed":
-      return "Renamed";
-    default:
-      return status;
-  }
-}
-
-function generateDefaultCommitMessage(files: UncommittedFile[]): string {
-  if (files.length === 0) return "";
-
-  const added = files.filter((f) => f.status === "added").length;
-  const modified = files.filter((f) => f.status === "modified").length;
-  const deleted = files.filter((f) => f.status === "deleted").length;
-  const renamed = files.filter((f) => f.status === "renamed").length;
-
-  const parts: string[] = [];
-  if (added > 0) parts.push(`add ${added} file${added > 1 ? "s" : ""}`);
-  if (modified > 0)
-    parts.push(`update ${modified} file${modified > 1 ? "s" : ""}`);
-  if (deleted > 0)
-    parts.push(`remove ${deleted} file${deleted > 1 ? "s" : ""}`);
-  if (renamed > 0)
-    parts.push(`rename ${renamed} file${renamed > 1 ? "s" : ""}`);
-
-  if (parts.length === 0) return "Update files";
-
-  // Capitalize first letter
-  const message = parts.join(", ");
-  return message.charAt(0).toUpperCase() + message.slice(1);
-}
-
 export function UncommittedFilesBanner({ appId }: UncommittedFilesBannerProps) {
   const { uncommittedFiles, hasUncommittedFiles, isLoading } =
     useUncommittedFiles(appId);
-  const { commitChanges, isCommitting } = useCommitChanges();
-  const { discardChanges, isDiscarding } = useDiscardChanges();
-  const [isDialogOpen, setIsDialogOpen] = useState(false);
-  const [commitMessage, setCommitMessage] = useState("");
   const [showDiscardConfirm, setShowDiscardConfirm] = useState(false);
+  const onDialogEnded = useCallback(() => setShowDiscardConfirm(false), []);
+  const { isDialogOpen, commitMessage, setCommitMessage } = useCommitMessage(
+    "banner",
+    appId,
+    uncommittedFiles,
+  );
+  const {
+    cancelCommit,
+    isCommitting,
+    isCancellingCommit,
+    commitProgress,
+    preCommitError,
+    prepareCommitMsgError,
+    commitMsgError,
+    commitError,
+    resetCommitError,
+    dismissDialog,
+    handleCommit,
+    handleFixPreCommitWithAI,
+    isStartingAiFix,
+    isCheckingAiFixAvailability,
+    aiFixUnavailableReason,
+  } = useCommitDialogRecovery({
+    appId: appId ?? -1,
+    source: "banner",
+    commitMessage,
+    onDialogEnded,
+  });
+  const { discardChanges, isDiscarding } = useDiscardChanges();
+  const { send: sendPreviewEvent } = useVersionPreview(appId);
+  const setOpenCommitDialog = useSetAtom(openCommitDialogAtom);
+  const openStagedDiffFile = useSetAtom(openStagedDiffAtom);
+  const closeCommitDialog = useSetAtom(closeCommitDialogAtom);
+  const clearStagedDiff = useSetAtom(clearStagedDiffAtom);
   const confirmPanelRef = useRef<HTMLDivElement>(null);
+  const canShowBanner = appId !== null && !isLoading && !!hasUncommittedFiles;
 
   useEffect(() => {
     if (showDiscardConfirm) {
@@ -109,32 +83,53 @@ export function UncommittedFilesBanner({ appId }: UncommittedFilesBannerProps) {
     }
   }, [showDiscardConfirm]);
 
-  if (!appId || isLoading || !hasUncommittedFiles) {
+  // The dialog lives in a global atom but is rendered here, and this banner is
+  // mounted conditionally - ChatHeader hides it while streaming and behind the
+  // version pane, and it renders nothing without uncommitted files. Hand the
+  // state back whenever it cannot be shown, so a dialog left open (or a pending
+  // return to one) cannot pop open unprompted on the next remount, and the
+  // message typed into it does not sit around to prefill a later commit.
+  useEffect(() => {
+    if (appId === null) return;
+    if (!canShowBanner) {
+      closeCommitDialog({ source: "banner", appId });
+      return;
+    }
+    return () => closeCommitDialog({ source: "banner", appId });
+  }, [canShowBanner, closeCommitDialog, appId]);
+
+  if (!canShowBanner || appId === null) {
     return null;
   }
 
-  const handleOpenDialog = () => {
-    // Set default commit message only when opening the dialog
-    // This prevents overwriting user's custom message during polling
-    setCommitMessage(generateDefaultCommitMessage(uncommittedFiles));
-    setIsDialogOpen(true);
-  };
-
-  const handleCommit = async () => {
-    if (!appId || !commitMessage.trim()) return;
-
-    await commitChanges({ appId, message: commitMessage.trim() });
+  // Dismissing without committing abandons the message: keeping it would
+  // prefill a later, unrelated commit with text written for a change set that
+  // has since moved on. It also drops any pending return to this dialog, so the
+  // staged diff's back arrow cannot resurrect the dialog just dismissed. The
+  // round trip out to a diff closes the dialog through openStagedDiffAtom
+  // instead, so the draft survives that.
+  // The diff renders in the code panel, which this banner's dialog has to
+  // reveal. Any selected version diff must close first, since CodeView
+  // suppresses staged-diff mode whenever one is active.
+  const openStagedDiff = (filePath: string) => {
+    sendPreviewEvent({ type: "CLOSE" });
     setShowDiscardConfirm(false);
-    setIsDialogOpen(false);
-    setCommitMessage("");
+    openStagedDiffFile({
+      path: filePath,
+      returnTo: { source: "banner", appId },
+    });
   };
 
   const handleDiscard = async () => {
-    if (!appId) return;
-
-    await discardChanges({ appId });
+    try {
+      await discardChanges({ appId });
+    } catch {
+      // useDiscardChanges surfaces the error via a toast; leave the dialog up.
+      return;
+    }
     setShowDiscardConfirm(false);
-    setIsDialogOpen(false);
+    closeCommitDialog({ source: "banner", appId });
+    clearStagedDiff(appId);
   };
 
   return (
@@ -153,7 +148,10 @@ export function UncommittedFilesBanner({ appId }: UncommittedFilesBannerProps) {
         <Button
           variant="outline"
           size="sm"
-          onClick={handleOpenDialog}
+          onClick={() => {
+            resetCommitError();
+            setOpenCommitDialog({ source: "banner", appId });
+          }}
           data-testid="review-commit-button"
         >
           Review & commit
@@ -163,10 +161,13 @@ export function UncommittedFilesBanner({ appId }: UncommittedFilesBannerProps) {
       <Dialog
         open={isDialogOpen}
         onOpenChange={(open) => {
+          if (open) {
+            setOpenCommitDialog({ source: "banner", appId });
+            return;
+          }
           // Prevent closing while committing or discarding
-          if (!open && (isCommitting || isDiscarding)) return;
-          if (!open) setShowDiscardConfirm(false);
-          setIsDialogOpen(open);
+          if (isCommitting || isDiscarding || isStartingAiFix) return;
+          dismissDialog();
         }}
       >
         <DialogContent
@@ -201,55 +202,24 @@ export function UncommittedFilesBanner({ appId }: UncommittedFilesBannerProps) {
               <p className="text-sm font-medium mb-2">
                 Changed files ({uncommittedFiles.length})
               </p>
-              <TooltipProvider delay={300}>
-                <div
-                  className="max-h-60 overflow-y-auto rounded-md border p-2 space-y-1"
-                  data-testid="changed-files-list"
-                >
-                  {uncommittedFiles.map((file) => (
-                    <div
-                      key={file.path}
-                      className="flex items-center gap-2 text-sm py-1 px-2 rounded hover:bg-muted"
-                    >
-                      {getStatusIcon(file.status)}
-                      <Tooltip>
-                        <TooltipTrigger
-                          render={
-                            <span
-                              className={cn(
-                                "flex-1 truncate font-mono text-xs text-left cursor-default",
-                                file.status === "deleted" &&
-                                  "line-through opacity-60",
-                              )}
-                            />
-                          }
-                        >
-                          {file.path}
-                        </TooltipTrigger>
-                        <TooltipContent side="top" align="start">
-                          <p className="max-w-[400px] break-all">{file.path}</p>
-                        </TooltipContent>
-                      </Tooltip>
-                      <span
-                        className={cn(
-                          "text-xs px-1.5 py-0.5 rounded",
-                          file.status === "added" &&
-                            "bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300",
-                          file.status === "modified" &&
-                            "bg-yellow-100 text-yellow-700 dark:bg-yellow-900 dark:text-yellow-300",
-                          file.status === "deleted" &&
-                            "bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300",
-                          file.status === "renamed" &&
-                            "bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300",
-                        )}
-                      >
-                        {getStatusLabel(file.status)}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              </TooltipProvider>
+              <CommitFileList
+                files={uncommittedFiles}
+                onSelectFile={openStagedDiff}
+                disabled={isCommitting || isDiscarding || isStartingAiFix}
+                testId="changed-files-list"
+              />
             </div>
+
+            <CommitRecoveryAlerts
+              preCommitError={preCommitError}
+              prepareCommitMsgError={prepareCommitMsgError}
+              commitMsgError={commitMsgError}
+              commitError={commitError}
+              isStartingAiFix={isStartingAiFix}
+              isCheckingAiFixAvailability={isCheckingAiFixAvailability}
+              aiFixUnavailableReason={aiFixUnavailableReason}
+              onFixPreCommitWithAI={() => void handleFixPreCommitWithAI()}
+            />
           </div>
 
           {showDiscardConfirm && (
@@ -275,7 +245,7 @@ export function UncommittedFilesBanner({ appId }: UncommittedFilesBannerProps) {
                     variant="destructive"
                     size="sm"
                     onClick={handleDiscard}
-                    disabled={isDiscarding}
+                    disabled={isDiscarding || isStartingAiFix}
                     data-testid="confirm-discard-button"
                   >
                     {isDiscarding ? "Discarding..." : "Yes, discard all"}
@@ -284,7 +254,7 @@ export function UncommittedFilesBanner({ appId }: UncommittedFilesBannerProps) {
                     variant="outline"
                     size="sm"
                     onClick={() => setShowDiscardConfirm(false)}
-                    disabled={isDiscarding}
+                    disabled={isDiscarding || isStartingAiFix}
                   >
                     Keep changes
                   </Button>
@@ -294,29 +264,33 @@ export function UncommittedFilesBanner({ appId }: UncommittedFilesBannerProps) {
           )}
 
           <DialogFooter className="px-6 pb-6 pt-2">
-            <Button
-              variant="outline"
-              className="text-destructive hover:text-destructive hover:bg-destructive/10 mr-auto"
-              onClick={() => setShowDiscardConfirm(true)}
-              disabled={isCommitting || isDiscarding || showDiscardConfirm}
-              data-testid="discard-button"
-            >
-              Discard all
-            </Button>
-            <Button
-              variant="outline"
-              onClick={() => setIsDialogOpen(false)}
-              disabled={isCommitting || isDiscarding}
-            >
-              Cancel
-            </Button>
-            <Button
-              onClick={handleCommit}
-              disabled={!commitMessage.trim() || isCommitting || isDiscarding}
-              data-testid="commit-button"
-            >
-              {isCommitting ? "Committing..." : "Commit"}
-            </Button>
+            <CommitDialogFooter
+              leadingAction={
+                <Button
+                  variant="outline"
+                  className="text-destructive hover:text-destructive hover:bg-destructive/10 mr-auto"
+                  onClick={() => setShowDiscardConfirm(true)}
+                  disabled={
+                    isCommitting ||
+                    isDiscarding ||
+                    isStartingAiFix ||
+                    showDiscardConfirm
+                  }
+                  data-testid="discard-button"
+                >
+                  Discard all
+                </Button>
+              }
+              isCommitting={isCommitting}
+              isCancellingCommit={isCancellingCommit}
+              phase={commitProgress?.phase ?? null}
+              isBusy={isDiscarding || isStartingAiFix}
+              commitDisabled={!commitMessage.trim()}
+              commitButtonTestId="commit-button"
+              onDismiss={dismissDialog}
+              onCancelCommit={() => void cancelCommit()}
+              onCommit={() => void handleCommit()}
+            />
           </DialogFooter>
         </DialogContent>
       </Dialog>

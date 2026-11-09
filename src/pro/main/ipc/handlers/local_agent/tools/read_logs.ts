@@ -4,7 +4,7 @@ import { db } from "@/db";
 import { chats } from "@/db/schema";
 import { eq } from "drizzle-orm";
 import { getLogs } from "@/lib/log_store";
-import type { ConsoleEntry } from "@/ipc/types";
+import { formatLogsForAI } from "@/shared/format_logs";
 import { DyadError, DyadErrorKind } from "@/errors/dyad_error";
 
 const readLogsSchema = z.object({
@@ -32,56 +32,6 @@ const readLogsSchema = z.object({
     .optional()
     .describe("Maximum number of logs to return (default: 50, max: 200)"),
 });
-
-function truncateMessage(message: string, maxLength: number = 1000): string {
-  if (message.length <= maxLength) {
-    return message;
-  }
-
-  // Check if it's a stack trace (lines starting with "    at " indicate stack frames)
-  const lines = message.split("\n");
-  const hasStackTrace = lines.some((line) => line.startsWith("    at "));
-
-  if (hasStackTrace) {
-    const errorMessage = lines[0];
-    const stackFrames = lines
-      .filter((line) => line.startsWith("    at "))
-      .slice(0, 5);
-
-    return (
-      errorMessage +
-      "\n" +
-      stackFrames.join("\n") +
-      "\n... [stack trace truncated]"
-    );
-  }
-
-  // Regular truncation - preserve start and end
-  const halfLength = Math.floor((maxLength - 20) / 2);
-  return (
-    message.slice(0, halfLength) +
-    "\n... [truncated] ...\n" +
-    message.slice(-halfLength)
-  );
-}
-
-function formatLogsForAI(logs: ConsoleEntry[]): string {
-  const summary = `Found ${logs.length} log${logs.length === 1 ? "" : "s"}:\n\n`;
-
-  const formatted = logs
-    .map((log) => {
-      const timestamp = new Date(log.timestamp).toISOString();
-      const level = log.level.toUpperCase();
-      const type = log.type;
-      const source = log.sourceName ? ` [${log.sourceName}]` : "";
-      const message = truncateMessage(log.message);
-
-      return `[${timestamp}] [${level}] [${type}]${source} ${message}`;
-    })
-    .join("\n");
-
-  return summary + formatted;
-}
 
 export const readLogsTool: ToolDefinition<z.infer<typeof readLogsSchema>> = {
   name: "read_logs",
@@ -140,34 +90,48 @@ ${summary}
 
     // Apply type filter
     if (args.type && args.type !== "all") {
-      filtered = filtered.filter((log) => log.type === args.type);
+      filtered = filtered.filter(
+        (log) => log.runtimeBoundary !== undefined || log.type === args.type,
+      );
     }
 
     // Apply level filter
     if (args.level && args.level !== "all") {
-      filtered = filtered.filter((log) => log.level === args.level);
+      filtered = filtered.filter(
+        (log) => log.runtimeBoundary !== undefined || log.level === args.level,
+      );
     }
 
     // Apply search term filter
     if (args.searchTerm) {
       const term = args.searchTerm.toLowerCase();
-      filtered = filtered.filter((log) =>
-        log.message.toLowerCase().includes(term),
+      filtered = filtered.filter(
+        (log) =>
+          log.runtimeBoundary !== undefined ||
+          log.message.toLowerCase().includes(term),
       );
     }
 
     // Sort by timestamp (oldest to newest)
     filtered.sort((a, b) => a.timestamp - b.timestamp);
 
-    // Limit results (take most recent)
+    // Limit matching logs while retaining lifecycle boundaries as session
+    // metadata. A small limit must not replace the only matching error with a
+    // trailing restart marker.
     const limit = Math.min(args.limit ?? 50, 200);
-    filtered = filtered.slice(-limit);
+    const recentLogs = filtered
+      .filter((log) => !log.runtimeBoundary)
+      .slice(-limit);
+    const recentLogSet = new Set(recentLogs);
+    filtered = filtered.filter(
+      (log) => log.runtimeBoundary !== undefined || recentLogSet.has(log),
+    );
 
     // Format logs for display
     const formattedLogs =
-      filtered.length === 0
+      recentLogs.length === 0
         ? "No logs found matching the specified filters."
-        : formatLogsForAI(filtered);
+        : formatLogsForAI(filtered, recentLogs.length);
 
     // Build the query summary for display
     const parts: string[] = ["Time: last 5 minutes"];
@@ -186,7 +150,7 @@ ${summary}
 
     // Output the complete results in a single tag
     ctx.onXmlComplete(
-      `<dyad-read-logs ${filters.join(" ")} count="${filtered.length}">\n${summary}\n\n${escapeXmlContent(formattedLogs)}\n</dyad-read-logs>`,
+      `<dyad-read-logs ${filters.join(" ")} count="${recentLogs.length}">\n${summary}\n\n${escapeXmlContent(formattedLogs)}\n</dyad-read-logs>`,
     );
 
     return formattedLogs;

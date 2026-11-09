@@ -13,10 +13,18 @@ export interface ModelOption {
   tagColor?: string;
   maxOutputTokens?: number;
   contextWindow?: number;
+  effortSettings?: {
+    defaultEffortLevel: string;
+    possibleEffortLevels: string[];
+  };
 }
 
 export const GPT_5_2_MODEL_NAME = "gpt-5.2";
 export const GPT_5_5_MODEL_NAME = "gpt-5.5";
+export const GPT_5_6_LUNA_MODEL_NAME = "gpt-5.6-luna";
+export const GPT_5_6_SOL_MODEL_NAME = "gpt-5.6-sol";
+export const GPT_6_LUNA_MODEL_NAME = "gpt-6-luna";
+export const SMALL_MODEL_NAME = GPT_6_LUNA_MODEL_NAME;
 export const SONNET_4_6 = "claude-sonnet-4-6";
 export const OPUS_4_6 = "claude-opus-4-6";
 export const OPUS_4_8 = "claude-opus-4-8";
@@ -28,6 +36,35 @@ export const GPT_5_NANO = "gpt-5-nano";
 
 export const MODEL_OPTIONS: Record<string, ModelOption[]> = {
   openai: [
+    {
+      name: GPT_6_LUNA_MODEL_NAME,
+      displayName: "GPT 6 Luna",
+      description: "Fast and efficient for focused, high-volume tasks",
+      maxOutputTokens: 128_000,
+      contextWindow: 1_050_000,
+      temperature: 1,
+      dollarSigns: 1,
+      effortSettings: {
+        defaultEffortLevel: "medium",
+        possibleEffortLevels: ["low", "medium", "high", "xhigh", "max"],
+      },
+    },
+    {
+      name: GPT_5_6_LUNA_MODEL_NAME,
+      displayName: "GPT 5.6 Luna",
+      description: "Fast agentic coding model",
+      contextWindow: 372_000,
+      temperature: 1,
+      dollarSigns: 6,
+    },
+    {
+      name: GPT_5_6_SOL_MODEL_NAME,
+      displayName: "GPT 5.6 Sol",
+      description: "Frontier agentic coding model used by Dyad Reviewer",
+      contextWindow: 372_000,
+      temperature: 1,
+      dollarSigns: 6,
+    },
     {
       name: GPT_5_5_MODEL_NAME,
       displayName: "GPT 5.5",
@@ -340,8 +377,21 @@ export const MODEL_OPTIONS: Record<string, ModelOption[]> = {
       tagColor: "bg-primary text-primary-foreground",
       // The following is reasonable defaults.
       maxOutputTokens: 32_000,
-      contextWindow: 200_000,
+      contextWindow: 250_000,
       temperature: 0,
+    },
+    {
+      name: "balanced",
+      displayName: "Auto (balanced)",
+      description: "Uses a balanced mix of capability, speed, and cost",
+      maxOutputTokens: undefined,
+      contextWindow: 500_000,
+      temperature: 1,
+      dollarSigns: 3,
+      effortSettings: {
+        defaultEffortLevel: "medium",
+        possibleEffortLevels: ["low", "medium", "high"],
+      },
     },
     {
       name: "free",
@@ -374,7 +424,7 @@ export const MODEL_OPTIONS: Record<string, ModelOption[]> = {
       description: "Uses the most cost-effective models available",
       maxOutputTokens: 32_000,
       contextWindow: 256_000,
-      temperature: 0,
+      temperature: 1,
       tag: "Budget",
       tagColor: "bg-emerald-500/15 text-emerald-700 dark:text-emerald-300",
     },

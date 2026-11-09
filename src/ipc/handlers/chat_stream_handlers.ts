@@ -1,46 +1,90 @@
+import { SubscriptionBillingError } from "@/shared/subscription_billing_error";
+import { DEFAULT_ENABLE_SUGGESTED_PROMPTS } from "@/shared/settings_defaults";
+import {
+  CancellationReason,
+  type CancellationCause,
+} from "@/shared/cancellation_reason";
+import { chatCancellationReason } from "../services/chat_cancellation_cause";
+import { modelForChatBackend } from "@/shared/execution_backend";
+import { isZipAttachmentName } from "@/shared/zip_attachments";
+import { isDotenvFilePath } from "@/utils/dotenv_redaction";
+import type { ExternalModelAdmission } from "../services/external_model_admission";
+import { awaitTurnPreflight } from "../services/await_turn_preflight";
+import type { AutoModelCandidates } from "../services/auto_model_candidates";
+import { preflightSubscriptionTurn } from "../services/subscription_turn_preflight";
+import {
+  executionBackendForModel,
+  BACKEND_SWITCH_MESSAGE,
+} from "@/shared/execution_backend";
+import { claudeStatus } from "@/ipc/services/claude_code/runtime";
+import { handleLocalAgentStream } from "@/pro/main/ipc/handlers/local_agent/local_agent_handler";
 import { v4 as uuidv4 } from "uuid";
-import { app, ipcMain, IpcMainInvokeEvent } from "electron";
+import { app, type IpcMainInvokeEvent, type WebContents } from "electron";
 import { createTypedHandler } from "./base";
 import {
   computeStreamingPatch,
   fastTextOutput,
 } from "../utils/stream_text_utils";
-import { chatContracts } from "../types/chat";
+import { chatContracts, ChatStreamParamsSchema } from "../types/chat";
 import {
   ModelMessage,
   TextPart,
   ImagePart,
+  FilePart,
   streamText,
   ToolSet,
   TextStreamPart,
   stepCountIs,
   hasToolCall,
-  type ToolExecutionOptions,
 } from "ai";
 
 import { db } from "../../db";
-import { chats, messages } from "../../db/schema";
+import { apps, chats, messages } from "../../db/schema";
+import { scheduleChatSearchIndexing } from "../../pro/main/ipc/handlers/local_agent/chat_search_indexer";
 import { and, eq, isNull } from "drizzle-orm";
-import type { SmartContextMode } from "../../lib/schemas";
+import {
+  hasSupabaseCredentialsForOrganization,
+  type SmartContextMode,
+} from "../../lib/schemas";
 import {
   constructSystemPrompt,
   readAiRules,
 } from "../../prompts/system_prompt";
+import {
+  constructImplementerPrompt,
+  resolveImplementerProvider,
+} from "../../prompts/local_agent_prompt";
 import { detectFrameworkType } from "../utils/framework_utils";
 import { getThemePromptById } from "../utils/theme_utils";
 import {
   getSupabaseAvailableSystemPrompt,
+  SUPABASE_DISCONNECTED_SYSTEM_PROMPT,
   SUPABASE_NOT_AVAILABLE_SYSTEM_PROMPT,
 } from "../../prompts/supabase_prompt";
-import { buildNeonPromptForApp } from "../../neon_admin/neon_prompt_context";
+import { registerTrustedIpcHandler } from "./trusted_handle";
+import {
+  buildNeonPromptForApp,
+  getNeonEmailVerificationEnabled,
+} from "../../neon_admin/neon_prompt_context";
+import { NEON_DISCONNECTED_SYSTEM_PROMPT } from "../../prompts/neon_prompt";
 import { getDyadAppPath } from "../../paths/paths";
 import { buildDyadMediaUrl } from "../../lib/dyadMediaUrl";
-import type { ChatResponseEnd, ChatStreamParams } from "@/ipc/types";
-import { DyadError, DyadErrorKind } from "@/errors/dyad_error";
+import type { ChatStreamParams } from "@/ipc/types";
+import type { ChatStreamInvocationRef } from "@/chat_stream/invocation";
+import { resolveRootDatabasePromptState } from "@/shared/database_provider";
+import type { SerializableChatTurnIntent } from "@/chat_stream/transport";
+import type {
+  ChatStreamChunkPayload,
+  ChatStreamEndPayload,
+  ChatStreamErrorPayload,
+  ChatStreamStartPayload,
+  ChatStreamTransportEndPayload,
+} from "@/chat_stream/protocol";
+import { DyadError, DyadErrorKind, isDyadError } from "@/errors/dyad_error";
 import {
   CodebaseFile,
   extractCodebase,
-  readFileWithCache,
+  listCodebaseFileMetadata,
 } from "../../utils/codebase";
 import {
   dryRunSearchReplace,
@@ -54,6 +98,10 @@ import {
   noteAck,
 } from "./testing_chat_handlers";
 import { getModelClient, ModelClient } from "../utils/get_model_client";
+import {
+  normalizeModelSelection,
+  resolveDefaultModelSelection,
+} from "../utils/model_effort";
 import log from "electron-log";
 import { sendTelemetryEvent } from "../utils/telemetry";
 import {
@@ -68,35 +116,42 @@ import * as crypto from "crypto";
 import { readFile, writeFile } from "fs/promises";
 import { getMaxTokens, getTemperature } from "../utils/token_utils";
 import { MAX_CHAT_TURNS_IN_CONTEXT } from "@/constants/settings_constants";
-import { validateChatContext } from "../utils/context_paths_utils";
 import { getProviderOptions, getAiHeaders } from "../utils/provider_options";
-import { mcpServers } from "../../db/schema";
+import { sanitizeMcpToolResult } from "../utils/mcp_result_sanitizer";
 import {
-  requireMcpToolConsent,
-  clearPendingMcpConsentsForChat,
-} from "../utils/mcp_consent";
+  createMcpTranscriptBudget,
+  previewMcpPayload,
+  truncatedFromAttr,
+} from "../utils/mcp_transcript_preview";
 
-import { handleLocalAgentStream } from "../../pro/main/ipc/handlers/local_agent/local_agent_handler";
+import {
+  clearPendingLocalAgentInputsForChat,
+  chatHasCompletedAppBlueprintQuestionnaire,
+} from "../../pro/main/ipc/handlers/local_agent/local_agent_handler";
+import { isPreCommitHookAvailable } from "../services/pre_commit_service";
+import { userInputRegistry } from "../../user_input/main";
+import { getAppBlueprintForChat } from "./app_blueprint_handlers";
 
-import { safeSend } from "../utils/safe_sender";
+import { safeSend, type SafeSender } from "../utils/safe_sender";
+import {
+  releaseChatProducerInterest,
+  sendChatChunk,
+} from "@/window_infrastructure/main/production_high_volume";
+import { queryInvalidationBus } from "@/window_infrastructure/main/query_invalidation_bus";
 import { cancelOrphanedBaseStream } from "../utils/stream_text_utils";
 import { cleanFullResponse } from "../utils/cleanFullResponse";
-import { generateProblemReport } from "../processors/tsc";
-import { createProblemFixPrompt } from "@/shared/problem_prompt";
-import { AsyncVirtualFileSystem } from "../../../shared/VirtualFilesystem";
 import { escapeXmlAttr, escapeXmlContent } from "../../../shared/xmlEscape";
-import {
-  getDyadAddDependencyTags,
-  getDyadWriteTags,
-  getDyadDeleteTags,
-  getDyadRenameTags,
-} from "../utils/dyad_tag_parser";
-import { fileExists } from "../utils/file_utils";
-import { isCodeExplorerReady } from "../processors/code_explorer";
+import { buildDyadAttachmentTag } from "../../../shared/dyadAttachment";
 import { appendCancelledResponseNotice } from "@/shared/chatCancellation";
 import {
+  isModelRefusal,
+  MODEL_REFUSAL_WARNING,
+} from "@/ipc/utils/model_refusal";
+import {
   extractMentionedAppsCodebasesFromPrompt,
-  extractMentionedAppsReferencesFromPrompt,
+  persistReferencedAppIds,
+  readStoredReferencedAppIds,
+  resolveStickyReferencedApps,
   type MentionedAppCodebaseEntry,
   type MentionedAppReference,
 } from "../utils/mention_apps";
@@ -112,29 +167,35 @@ import { resolveMediaMentions } from "../utils/resolve_media_mentions";
 import { parsePlanFile, validatePlanId } from "./planUtils";
 import { ensureDyadGitignored } from "./gitignoreUtils";
 import {
-  appendAttachmentManifestEntriesWithLogicalNames,
+  appendAttachmentManifestEntryGroups,
   createUniqueAttachmentLogicalName,
   DYAD_MEDIA_DIR_NAME,
+  removeUnreferencedMediaPaths,
+  reserveMediaPath,
   type AttachmentManifestEntryInput,
 } from "../utils/media_path_utils";
-import { mcpManager } from "../utils/mcp_manager";
-import z from "zod";
 import {
   isBasicAgentMode,
   isDyadProEnabled,
   isLocalAgentBackedMode,
-  isSupabaseConnected,
   isTurboEditsV2Enabled,
 } from "@/lib/schemas";
+import { isFreeProModel } from "@/lib/freeProModel";
+import { isImplementerSubagentEnabled } from "@/lib/autoSidekick";
 import {
-  FREE_PRO_BUILD_MODE_ERROR,
-  isFreeProBuildModeCombination,
-  isFreeProModel,
-} from "@/lib/freeProModel";
-import { resolveChatModeForTurn } from "./chat_mode_resolution";
+  assertChatModeCompatibleWithModel,
+  normalizeStoredChatMode,
+  resolveChatModeForTurn,
+} from "./chat_mode_resolution";
 import {
-  getFreeAgentQuotaStatus,
-  markMessageAsUsingFreeAgentQuota,
+  acceptChatTurn,
+  isChatTurnAlreadyAccepted,
+} from "./chat_turn_acceptance";
+import { withChatQueueLock } from "@/chat_stream/queue_lock";
+import {
+  commitFreeAgentQuotaSlot,
+  releaseFreeAgentQuotaSlot,
+  reserveFreeAgentQuotaSlot,
   unmarkMessageAsUsingFreeAgentQuota,
 } from "./free_agent_quota_handlers";
 import { AI_STREAMING_ERROR_MESSAGE_PREFIX } from "@/shared/texts";
@@ -145,25 +206,695 @@ import {
 } from "../utils/versioned_codebase_context";
 import { getAiMessagesJsonIfWithinLimit } from "../utils/ai_messages_utils";
 import { readSettings, setSentinelActiveChat } from "@/main/settings";
+import { recordAppSizeForSession } from "@/main/last_session_store";
 import {
+  buildArchiveAttachmentInfo,
   buildLocalAgentAttachmentInfo,
+  assertInlineAttachmentsFit,
+  buildInlinePdfFileParts,
   getInlineImageMimeType,
+  hasInlineMediaParts,
+  INLINE_ATTACHMENTS_TOO_LARGE_MESSAGE,
+  hasArchiveAttachment,
   hasScriptReadableAttachment,
   isTextFile,
   resolveAttachmentDeliveryConfig,
   type PendingStoredChatAttachment,
   type StoredChatAttachment,
 } from "../utils/chat_attachment_utils";
+import {
+  buildArchiveManifestEntries,
+  extractedDirNameForStoredFile,
+  extractZipAttachment,
+  isZipExtractionError,
+  toZipExtractionErrorMessage,
+  withFinalizedEntryNames,
+  type ExtractedArchiveSummary,
+} from "../utils/zip/zip_attachment";
+import { DEFAULT_ZIP_EXTRACTION_LIMITS } from "../utils/zip/zip_extract";
+import { fileExists } from "../utils/file_utils";
+import { inspectBase64DataUrl } from "../../shared/chatAttachmentLimits";
+import {
+  rendererMessageColumns,
+  toRendererMessages,
+} from "../utils/renderer_chat_message";
 
 type AsyncIterableStream<T> = AsyncIterable<T> & ReadableStream<T>;
 
+function createEmptyTextStream(): AsyncIterableStream<TextStreamPart<ToolSet>> {
+  return new ReadableStream<TextStreamPart<ToolSet>>({
+    start(controller) {
+      controller.close();
+    },
+  }) as AsyncIterableStream<TextStreamPart<ToolSet>>;
+}
+
 const logger = log.scope("chat_stream_handlers");
 
-// Track active streams for cancellation
-const activeStreams = new Map<number, AbortController>();
+type ImplementerCapabilityApp = Pick<
+  typeof apps.$inferSelect,
+  | "supabaseProjectId"
+  | "supabaseOrganizationSlug"
+  | "neonProjectId"
+  | "neonActiveBranchId"
+  | "neonDevelopmentBranchId"
+>;
 
-// Track partial responses for cancelled streams
-const partialResponses = new Map<number, string>();
+export function resolveImplementerCapabilityState(
+  app: ImplementerCapabilityApp,
+  settings: ReturnType<typeof readSettings>,
+) {
+  const supabaseConnected = hasSupabaseCredentialsForOrganization(
+    settings,
+    app.supabaseOrganizationSlug,
+  );
+  const neonConnected = Boolean(settings.neon?.accessToken?.value);
+  const neonBranchId = app.neonActiveBranchId ?? app.neonDevelopmentBranchId;
+  const neonToolsAvailable = Boolean(
+    neonConnected && app.neonProjectId && neonBranchId,
+  );
+  const provider = resolveImplementerProvider({
+    hasSupabaseProject: Boolean(app.supabaseProjectId),
+    hasNeonProject: Boolean(app.neonProjectId),
+  });
+  const providerAvailable =
+    provider === "supabase"
+      ? supabaseConnected
+      : provider === "neon"
+        ? neonToolsAvailable
+        : false;
+  const providerMetadataToolName =
+    provider === "supabase"
+      ? "get_supabase_project_info"
+      : provider === "neon"
+        ? "get_neon_project_info"
+        : undefined;
+
+  return {
+    provider,
+    supabaseConnected,
+    neonToolsAvailable,
+    neonBranchId,
+    providerMetadataReadAvailable:
+      providerAvailable &&
+      providerMetadataToolName !== undefined &&
+      settings.agentToolConsents?.[providerMetadataToolName] !== "never",
+    databaseSchemaReadAvailable:
+      providerAvailable &&
+      settings.agentToolConsents?.["get_database_table_schema"] !== "never",
+    readGuideAvailable: settings.agentToolConsents?.["read_guide"] !== "never",
+  };
+}
+
+export interface ChatStreamExecutionObserver {
+  intent: SerializableChatTurnIntent;
+  sessionQueued: boolean;
+  onAccepted?(acceptedMessageId: number): void;
+  onEnd?(response: ChatStreamEndPayload): void;
+  onError?(error: ChatStreamErrorPayload): void;
+}
+
+type InternalChatStreamHandler = (
+  event: IpcMainInvokeEvent,
+  request: ChatStreamParams,
+) => Promise<number | "error" | undefined>;
+
+let internalChatStreamHandler: InternalChatStreamHandler | undefined;
+
+export function settleUnobservedChatStreamResult(
+  request: ChatStreamParams,
+  result: number | "error",
+  observer: ChatStreamExecutionObserver,
+  wasCancelled = false,
+): void {
+  if (wasCancelled) {
+    observer.onEnd?.({
+      chatId: request.chatId,
+      invocationRef: request.invocationRef,
+      streamId: request.streamId,
+      updatedFiles: false,
+      wasCancelled: true,
+    });
+    return;
+  }
+  if (result === "error") {
+    observer.onError?.({
+      chatId: request.chatId,
+      invocationRef: request.invocationRef,
+      streamId: request.streamId,
+      error: "Chat stream ended without reporting a terminal error",
+    });
+    return;
+  }
+  observer.onEnd?.({
+    chatId: request.chatId,
+    invocationRef: request.invocationRef,
+    streamId: request.streamId,
+    updatedFiles: false,
+  });
+}
+
+export function createObservedChatStreamSender(
+  sender: WebContents,
+  observeTerminal: (channel: string, payload: unknown) => void,
+): WebContents {
+  const targetIsUnavailable = (): boolean => {
+    if (sender.isDestroyed()) return true;
+    const senderWithCrashState = sender as WebContents & {
+      isCrashed?: () => boolean;
+    };
+    return senderWithCrashState.isCrashed?.() ?? false;
+  };
+  return new Proxy(sender, {
+    get(target, property, receiver) {
+      if (property === "id" && targetIsUnavailable()) {
+        // High-volume routing treats non-integer endpoints as non-producers.
+        // This prevents a real webContents that closed after route selection
+        // from being re-registered through this observation proxy.
+        return Number.NaN;
+      }
+      // `safeSend` must reach the proxy's `send` trap even if the presentation
+      // endpoint disappeared. Actor completion is independent of renderer
+      // delivery; the trap below separately checks whether delivery is safe.
+      if (property === "isDestroyed" || property === "isCrashed") {
+        return () => false;
+      }
+      if (property === "send") {
+        return (channel: string, payload: unknown) => {
+          observeTerminal(channel, payload);
+          if (targetIsUnavailable()) return;
+          try {
+            target.send(channel, payload);
+          } catch {
+            // Presentation delivery is best effort. The observer above is the
+            // main-owned lifecycle authority and has already been notified.
+          }
+        };
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+/**
+ * Compatibility seam for the in-process Vitest harness. Production renderers
+ * must dispatch through the remote chat actor and never receive this endpoint.
+ */
+export function registerLegacyChatStreamTestHandler(): void {
+  if (!process.env.VITEST) {
+    throw new Error("Legacy chat stream IPC is test-only");
+  }
+  registerTrustedIpcHandler("chat:stream", async (event, request) => {
+    if (!internalChatStreamHandler) {
+      throw new Error("Chat stream handlers have not been registered");
+    }
+    return internalChatStreamHandler(
+      event,
+      ChatStreamParamsSchema.parse(request),
+    );
+  });
+}
+
+export async function executeChatStreamFromActor(
+  sender: WebContents,
+  request: ChatStreamParams,
+  observer: ChatStreamExecutionObserver,
+): Promise<number | "error"> {
+  if (!internalChatStreamHandler) {
+    throw new Error("Chat stream handlers have not been registered");
+  }
+  if (
+    request.invocationRef &&
+    takePendingActorStreamCancellation(request.invocationRef)
+  ) {
+    return request.chatId;
+  }
+  executionObservers.set(
+    request.intentId ?? request.invocationRef?.operationId ?? "",
+    observer,
+  );
+  let terminalObserved = false;
+  let deferredCancellation: ChatStreamEndPayload | undefined;
+  const observeTerminal = (channel: string, payload: unknown) => {
+    if (terminalObserved) return;
+    if (channel === "chat:response:end") {
+      terminalObserved = true;
+      const response = payload as ChatStreamEndPayload;
+      if (response.wasCancelled) {
+        // Cancellation is announced to renderers before the handler has
+        // finished persisting its partial response. Keep actor authority
+        // pending until the handler unwinds so its completion snapshot only
+        // becomes observable after the cancellation notice is durable.
+        deferredCancellation = response;
+      } else {
+        observer.onEnd?.(response);
+      }
+    } else if (channel === "chat:response:error") {
+      terminalObserved = true;
+      observer.onError?.(payload as ChatStreamErrorPayload);
+    }
+  };
+  const observedSender = createObservedChatStreamSender(
+    sender,
+    observeTerminal,
+  );
+  try {
+    const result =
+      (await internalChatStreamHandler(
+        { sender: observedSender } as IpcMainInvokeEvent,
+        request,
+      )) ?? "error";
+    if (deferredCancellation) {
+      observer.onEnd?.(deferredCancellation);
+    } else if (!terminalObserved) {
+      const wasCancelled = request.invocationRef
+        ? cancelledActorInvocations.delete(request.invocationRef.operationId)
+        : false;
+      settleUnobservedChatStreamResult(request, result, observer, wasCancelled);
+    }
+    return result;
+  } finally {
+    if (request.invocationRef) {
+      cancelledActorInvocations.delete(request.invocationRef.operationId);
+    }
+    executionObservers.delete(
+      request.intentId ?? request.invocationRef?.operationId ?? "",
+    );
+  }
+}
+
+const executionObservers = new Map<string, ChatStreamExecutionObserver>();
+const cancelledActorInvocations = new Set<string>();
+const pendingActorStreamCancellations = new Set<string>();
+
+export function markPendingActorStreamCancellation(
+  invocationRef: ChatStreamInvocationRef,
+): void {
+  pendingActorStreamCancellations.add(invocationRef.operationId);
+}
+
+export function takePendingActorStreamCancellation(
+  invocationRef: ChatStreamInvocationRef,
+): boolean {
+  return pendingActorStreamCancellations.delete(invocationRef.operationId);
+}
+
+export function clearPendingActorStreamCancellation(
+  invocationRef: ChatStreamInvocationRef,
+): void {
+  pendingActorStreamCancellations.delete(invocationRef.operationId);
+}
+
+function executionObserver(
+  request: ChatStreamParams,
+): ChatStreamExecutionObserver | undefined {
+  return executionObservers.get(
+    request.intentId ?? request.invocationRef?.operationId ?? "",
+  );
+}
+
+// PROTOCOL-GROUNDED REGION: tracking/completion abstraction. Keep in sync with
+// src/chat_stream/host_transition.ts and src/chat_stream/main_actor.test.ts.
+interface TrackedStream {
+  drainBeforeEnd?: boolean;
+  abortController: AbortController;
+  sender: SafeSender;
+  invocationRef?: ChatStreamInvocationRef;
+  /** @deprecated Correlation used only by pre-InvocationRef renderers. */
+  streamId?: number;
+}
+
+// Track active streams for cancellation together with the renderer correlation
+// identity. Legacy callers may omit InvocationRef and/or use numeric streamId.
+const activeStreams = new Map<number, Set<TrackedStream>>();
+const admittedStreams = new Map<number, Set<TrackedStream>>();
+const admissionPendingStreams = new Set<AbortController>();
+
+// How many chats are currently streaming a response. Used by the
+// performance monitor to record activity alongside memory snapshots.
+export function getActiveStreamCount(): number {
+  return activeStreams.size;
+}
+
+// Resolves when a stream's handler has fully unwound (its `finally` block ran,
+// so any in-flight tool/file writes have settled). `cancelStream` awaits this
+// after aborting so callers like restore-to-message don't touch the working
+// tree while a cancelled turn is still flushing partial file writes.
+const streamCompletions = new Map<number, Set<Promise<void>>>();
+
+export function addTrackedValue<T>(
+  trackedValues: Map<number, Set<T>>,
+  chatId: number,
+  value: T,
+): void {
+  const values = trackedValues.get(chatId) ?? new Set<T>();
+  values.add(value);
+  trackedValues.set(chatId, values);
+}
+
+export function removeTrackedValue<T>(
+  trackedValues: Map<number, Set<T>>,
+  chatId: number,
+  value: T,
+): void {
+  const values = trackedValues.get(chatId);
+  if (!values) {
+    return;
+  }
+  values.delete(value);
+  if (values.size === 0) {
+    trackedValues.delete(chatId);
+  }
+}
+
+export function markStreamAdmitted<T>(
+  admitted: Map<number, Set<T>>,
+  chatId: number,
+  stream: T,
+): number | null {
+  const isNewConcurrentChat = !admitted.has(chatId);
+  addTrackedValue(admitted, chatId, stream);
+  return isNewConcurrentChat && admitted.size > 1 ? admitted.size : null;
+}
+
+// A restore must drain existing streams and prevent new ones from entering the
+// same app until its Git/database mutation has finished. Counts (rather than a
+// Set) make nested/queued guards safe: releasing one guard cannot unblock an
+// app while another guard still owns it.
+const streamAdmissionBlockCounts = new Map<number, number>();
+const chatStreamAdmissionBlockCounts = new Map<number, number>();
+const streamAdmissionWaiters = new Map<number, Set<() => void>>();
+const chatStreamAdmissionWaiters = new Map<number, Set<() => void>>();
+
+function incrementAdmissionBlock(
+  blockCounts: Map<number, number>,
+  waiters: Map<number, Set<() => void>>,
+  key: number,
+): () => void {
+  blockCounts.set(key, (blockCounts.get(key) ?? 0) + 1);
+
+  let released = false;
+  return () => {
+    if (released) {
+      return;
+    }
+    released = true;
+
+    const remaining = (blockCounts.get(key) ?? 1) - 1;
+    if (remaining <= 0) {
+      blockCounts.delete(key);
+      const keyWaiters = waiters.get(key);
+      waiters.delete(key);
+      keyWaiters?.forEach((resolve) => resolve());
+    } else {
+      blockCounts.set(key, remaining);
+    }
+  };
+}
+
+export function blockNewStreamsForApp(appId: number): () => void {
+  return incrementAdmissionBlock(
+    streamAdmissionBlockCounts,
+    streamAdmissionWaiters,
+    appId,
+  );
+}
+
+export function blockNewStreamsForChat(chatId: number): () => void {
+  return incrementAdmissionBlock(
+    chatStreamAdmissionBlockCounts,
+    chatStreamAdmissionWaiters,
+    chatId,
+  );
+}
+
+function resolveAllAdmissionWaiters(waiters: Map<number, Set<() => void>>) {
+  for (const keyWaiters of waiters.values()) {
+    keyWaiters.forEach((resolve) => resolve());
+  }
+  waiters.clear();
+}
+
+async function waitForAdmissionBlockToClear({
+  blockCounts,
+  waiters,
+  key,
+  signal,
+}: {
+  blockCounts: Map<number, number>;
+  waiters: Map<number, Set<() => void>>;
+  key: number;
+  signal: AbortSignal;
+}): Promise<boolean> {
+  if ((blockCounts.get(key) ?? 0) === 0) {
+    return true;
+  }
+  if (signal.aborted) {
+    return false;
+  }
+
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    const cleanup = () => {
+      signal.removeEventListener("abort", onAbort);
+      const keyWaiters = waiters.get(key);
+      keyWaiters?.delete(onRelease);
+      if (keyWaiters?.size === 0) {
+        waiters.delete(key);
+      }
+    };
+    const settle = (admitted: boolean) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      resolve(admitted);
+    };
+    const onRelease = () => settle(!signal.aborted);
+    const onAbort = () => settle(false);
+
+    const keyWaiters = waiters.get(key) ?? new Set<() => void>();
+    keyWaiters.add(onRelease);
+    waiters.set(key, keyWaiters);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+// Track partial responses by invocation so concurrent streams for one chat do
+// not overwrite the content persisted into each assistant placeholder.
+const partialResponses = new Map<AbortController, string>();
+
+export function setPartialResponseForStream(
+  controller: AbortController,
+  response: string,
+): void {
+  partialResponses.set(controller, response);
+}
+
+export function takePartialResponseForStream(
+  controller: AbortController,
+): string {
+  const response = partialResponses.get(controller) ?? "";
+  partialResponses.delete(controller);
+  return response;
+}
+
+// PROTOCOL-GROUNDED REGION: cancellation selection, early terminals, and
+// unwind waiting. Keep in sync with src/chat_stream/host_transition.ts.
+async function cancelTrackedStreams(
+  chatIds: number[],
+  sender: SafeSender | undefined,
+  cause?: CancellationCause,
+): Promise<boolean> {
+  const trackedStreams = chatIds
+    .map((chatId) => ({
+      chatId,
+      streams: [...(activeStreams.get(chatId) ?? [])],
+      completions: [...(streamCompletions.get(chatId) ?? [])],
+    }))
+    .filter(
+      ({ streams, completions }) =>
+        streams.length > 0 || completions.length > 0,
+    );
+
+  if (trackedStreams.length === 0) {
+    return false;
+  }
+
+  // Resolve consent prompts before awaiting completion. A stream parked on a
+  // consent prompt cannot unwind until that prompt is resolved.
+  for (const { chatId, streams } of trackedStreams) {
+    for (const { invocationRef } of streams) {
+      if (invocationRef)
+        cancelledActorInvocations.add(invocationRef.operationId);
+    }
+    // The reason reaches nested work started by the turn (e.g. a test run), so
+    // it can report why it stopped. Without an explicit cause, a caller may
+    // have scoped one for this chat; otherwise this is the user's Stop.
+    const reason = cause
+      ? new CancellationReason(cause)
+      : chatCancellationReason(chatId);
+    streams.forEach(({ abortController }) => abortController.abort(reason));
+    clearPendingLocalAgentInputsForChat(chatId);
+    logger.log(`Aborted ${streams.length} stream(s) for chat ${chatId}`);
+  }
+
+  // Notify the renderer that the stream ended as soon as it is aborted, before
+  // awaiting the handler's completion. The renderer's chat stream machine
+  // finalizes (clearing the `isStreaming` projection) off these events, so
+  // delaying them until after the handler fully unwinds leaves a window where
+  // a message the user submits (or a queue the user resumes) right after
+  // pressing Stop is treated as still-streaming — it stays queued instead of
+  // dispatching immediately. Callers that need writes to have settled
+  // (restore/delete) still await the completions below; only the renderer
+  // notification moves earlier, matching the pre-cancellation-refactor timing.
+  // A new stream the renderer starts for a chat under an active restore barrier
+  // simply waits at admission, so notifying early stays safe.
+  await Promise.all(
+    trackedStreams.map(async ({ chatId, streams, completions }) => {
+      // Claude owns an external tool loop. Do not publish cancellation while
+      // approved project operations are still draining. Other backends retain
+      // their existing early-terminal contract.
+      if (streams.some((stream) => stream.drainBeforeEnd))
+        await Promise.allSettled(completions);
+      const correlations =
+        streams.length > 0
+          ? streams.map(
+              ({ invocationRef, streamId, sender: streamSender }) => ({
+                invocationRef,
+                streamId,
+                sender: streamSender,
+              }),
+            )
+          : [{ invocationRef: undefined, streamId: undefined, sender }];
+      for (const {
+        invocationRef,
+        streamId,
+        sender: streamSender,
+      } of correlations) {
+        const targetSender = streamSender ?? sender;
+        if (targetSender) {
+          safeSend(targetSender, "chat:response:end", {
+            chatId,
+            invocationRef,
+            streamId,
+            updatedFiles: false,
+            wasCancelled: true,
+          } satisfies ChatStreamEndPayload);
+        }
+      }
+      const terminalSenders = new Set(
+        streams.map(({ sender: streamSender }) => streamSender),
+      );
+      if (terminalSenders.size === 0 && sender) terminalSenders.add(sender);
+      for (const terminalSender of terminalSenders) {
+        safeSend(terminalSender, "chat:stream:end", {
+          chatId,
+        } satisfies ChatStreamTransportEndPayload);
+      }
+    }),
+  );
+
+  await Promise.all(
+    trackedStreams.flatMap(({ completions }) =>
+      completions.map((completion) => completion.catch(() => {})),
+    ),
+  );
+
+  return true;
+}
+
+/**
+ * Abort and drain every tracked stream, including streams still waiting for
+ * admission. Process/test teardown cannot safely close shared databases,
+ * servers, or temp roots while either class of handler is alive.
+ */
+export async function cancelAllActiveStreams(
+  sender?: SafeSender,
+): Promise<boolean> {
+  return cancelTrackedStreams(
+    [...new Set([...activeStreams.keys(), ...streamCompletions.keys()])],
+    sender,
+  );
+}
+
+/**
+ * Abort an in-flight stream for a single chat and wait until its handler has
+ * stopped writing. Deletion handlers call this before taking the app lock (and
+ * before deleting rows) so an in-flight generation can't re-insert messages
+ * into a chat that was just cleared or removed. Like
+ * {@link cancelActiveStreamsForApp}, it must run outside the app lock: the
+ * aborted handler can take the same lock for its own writes, so awaiting its
+ * completion while holding the lock would deadlock.
+ */
+export async function cancelActiveStreamsForChat(
+  chatId: number,
+  sender: SafeSender | undefined,
+  pendingInvocationRef?: ChatStreamInvocationRef,
+  cause?: CancellationCause,
+): Promise<boolean> {
+  if (
+    pendingInvocationRef &&
+    (activeStreams.get(chatId)?.size ?? 0) === 0 &&
+    (streamCompletions.get(chatId)?.size ?? 0) === 0
+  ) {
+    markPendingActorStreamCancellation(pendingInvocationRef);
+    return true;
+  }
+  return cancelTrackedStreams([chatId], sender, cause);
+}
+
+/**
+ * Abort every in-flight stream whose chat belongs to an app and wait until all
+ * of their handlers have stopped writing. Version handlers call this before
+ * taking the app lock so cancellation cannot deadlock behind a stream write.
+ */
+export async function cancelActiveStreamsForApp(
+  appId: number,
+  sender?: SafeSender,
+  cause?: CancellationCause,
+): Promise<boolean> {
+  const inFlightChatIds = [
+    ...new Set([...activeStreams.keys(), ...streamCompletions.keys()]),
+  ].filter((chatId) =>
+    [...(activeStreams.get(chatId) ?? [])].some(
+      ({ abortController }) => !admissionPendingStreams.has(abortController),
+    ),
+  );
+  if (inFlightChatIds.length === 0) {
+    return false;
+  }
+
+  const appChats = await db.query.chats.findMany({
+    columns: { id: true },
+    where: and(eq(chats.appId, appId), inArray(chats.id, inFlightChatIds)),
+  });
+
+  return cancelTrackedStreams(
+    appChats.map(({ id }) => id),
+    sender,
+    cause,
+  );
+}
+
+/** Read-only active-stream probe used while an app-wide admission block is held. */
+export async function hasActiveStreamsForApp(appId: number): Promise<boolean> {
+  const inFlightChatIds = [
+    ...new Set([...activeStreams.keys(), ...streamCompletions.keys()]),
+  ].filter(
+    (chatId) =>
+      (activeStreams.get(chatId)?.size ?? 0) > 0 ||
+      (streamCompletions.get(chatId)?.size ?? 0) > 0,
+  );
+  if (inFlightChatIds.length === 0) return false;
+  const matchingChat = await db.query.chats.findFirst({
+    columns: { id: true },
+    where: and(eq(chats.appId, appId), inArray(chats.id, inFlightChatIds)),
+  });
+  return matchingChat !== undefined;
+}
 
 // Use escapeXmlAttr from shared/xmlEscape for XML escaping
 
@@ -185,12 +916,13 @@ function parseMcpToolKey(toolKey: string): {
 }
 
 // Helper function to process stream chunks
-async function processStreamChunks({
+export async function processStreamChunks({
   fullStream,
   fullResponse,
   abortController,
   chatId,
   processResponseChunkUpdate,
+  includeReasoning = true,
 }: {
   fullStream: AsyncIterableStream<TextStreamPart<ToolSet>>;
   fullResponse: string;
@@ -199,9 +931,17 @@ async function processStreamChunks({
   processResponseChunkUpdate: (params: {
     fullResponse: string;
   }) => Promise<string>;
-}): Promise<{ fullResponse: string; incrementalResponse: string }> {
+  includeReasoning?: boolean;
+}): Promise<{
+  fullResponse: string;
+  incrementalResponse: string;
+  modelRefused: boolean;
+}> {
+  const responseBeforeStream = fullResponse;
   let incrementalResponse = "";
   let inThinkingBlock = false;
+  let modelRefused = false;
+  const mcpTranscriptBudget = createMcpTranscriptBudget();
 
   for await (const part of fullStream) {
     let chunk = "";
@@ -214,9 +954,17 @@ async function processStreamChunks({
       chunk = "</think>";
       inThinkingBlock = false;
     }
-    if (part.type === "text-delta") {
+    if (isModelRefusal(part)) {
+      // Anthropic returns Fable classifier refusals as successful responses.
+      // A refusal can arrive after partial output, which Anthropic documents as
+      // incomplete, so replace this stream's output with a persisted warning.
+      fullResponse = responseBeforeStream;
+      incrementalResponse = "";
+      chunk = MODEL_REFUSAL_WARNING;
+      modelRefused = true;
+    } else if (part.type === "text-delta") {
       chunk += part.text;
-    } else if (part.type === "reasoning-delta") {
+    } else if (part.type === "reasoning-delta" && includeReasoning) {
       if (!inThinkingBlock) {
         chunk = "<think>";
         inThinkingBlock = true;
@@ -225,20 +973,29 @@ async function processStreamChunks({
       chunk += escapeDyadTags(part.text);
     } else if (part.type === "tool-call") {
       const { serverName, toolName } = parseMcpToolKey(part.toolName);
-      const content = escapeDyadTags(JSON.stringify(part.input));
-      chunk = `<dyad-mcp-tool-call server="${escapeXmlAttr(serverName)}" tool="${escapeXmlAttr(toolName)}" call-id="${escapeXmlAttr(part.toolCallId)}">\n${content}\n</dyad-mcp-tool-call>\n`;
+      const preview = previewMcpPayload(
+        JSON.stringify(part.input),
+        mcpTranscriptBudget,
+      );
+      chunk = `<dyad-mcp-tool-call server="${escapeXmlAttr(serverName)}" tool="${escapeXmlAttr(toolName)}" call-id="${escapeXmlAttr(part.toolCallId)}"${truncatedFromAttr(preview)}>\n${escapeDyadTags(preview.text)}\n</dyad-mcp-tool-call>\n`;
     } else if (part.type === "tool-result") {
       const { serverName, toolName } = parseMcpToolKey(part.toolName);
-      const content = escapeDyadTags(part.output);
-      chunk = `<dyad-mcp-tool-result server="${escapeXmlAttr(serverName)}" tool="${escapeXmlAttr(toolName)}" call-id="${escapeXmlAttr(part.toolCallId)}">\n${content}\n</dyad-mcp-tool-result>\n`;
+      const preview = previewMcpPayload(
+        String(part.output ?? ""),
+        mcpTranscriptBudget,
+      );
+      chunk = `<dyad-mcp-tool-result server="${escapeXmlAttr(serverName)}" tool="${escapeXmlAttr(toolName)}" call-id="${escapeXmlAttr(part.toolCallId)}"${truncatedFromAttr(preview)}>\n${escapeXmlContent(preview.text)}\n</dyad-mcp-tool-result>\n`;
     } else if (part.type === "tool-error") {
       // Emit an errored result so the merged card terminates in an error
       // state instead of staying on "Running".
       const { serverName, toolName } = parseMcpToolKey(part.toolName);
       const message =
         part.error instanceof Error ? part.error.message : String(part.error);
-      const content = escapeDyadTags(message);
-      chunk = `<dyad-mcp-tool-result server="${escapeXmlAttr(serverName)}" tool="${escapeXmlAttr(toolName)}" call-id="${escapeXmlAttr(part.toolCallId)}" is-error="true">\n${content}\n</dyad-mcp-tool-result>\n`;
+      const preview = previewMcpPayload(
+        sanitizeMcpToolResult(message).serialized,
+        mcpTranscriptBudget,
+      );
+      chunk = `<dyad-mcp-tool-result server="${escapeXmlAttr(serverName)}" tool="${escapeXmlAttr(toolName)}" call-id="${escapeXmlAttr(part.toolCallId)}" is-error="true"${truncatedFromAttr(preview)}>\n${escapeXmlContent(preview.text)}\n</dyad-mcp-tool-result>\n`;
     }
 
     if (!chunk) {
@@ -257,9 +1014,13 @@ async function processStreamChunks({
       logger.log(`Stream for chat ${chatId} was aborted`);
       break;
     }
+
+    if (modelRefused) {
+      break;
+    }
   }
 
-  return { fullResponse, incrementalResponse };
+  return { fullResponse, incrementalResponse, modelRefused };
 }
 
 export function registerChatStreamHandlers() {
@@ -267,11 +1028,21 @@ export function registerChatStreamHandlers() {
   // the module-level stream-tracking maps don't outlive their renderer.
   // (Guarded: `app` is undefined when this module is imported in unit tests.)
   app?.on?.("before-quit", () => {
-    for (const controller of activeStreams.values()) {
-      controller.abort();
+    userInputRegistry.dispose();
+    for (const controllers of activeStreams.values()) {
+      controllers.forEach(({ abortController }) =>
+        abortController.abort(new CancellationReason("app-quit")),
+      );
     }
     activeStreams.clear();
     partialResponses.clear();
+    streamCompletions.clear();
+    streamAdmissionBlockCounts.clear();
+    chatStreamAdmissionBlockCounts.clear();
+    admissionPendingStreams.clear();
+    pendingActorStreamCancellations.clear();
+    resolveAllAdmissionWaiters(streamAdmissionWaiters);
+    resolveAllAdmissionWaiters(chatStreamAdmissionWaiters);
   });
 
   createTypedHandler(
@@ -281,27 +1052,76 @@ export function registerChatStreamHandlers() {
     },
   );
 
-  ipcMain.handle("chat:stream", async (event, req: ChatStreamParams) => {
+  const chatStreamHandler = async (
+    event: IpcMainInvokeEvent,
+    req: ChatStreamParams,
+  ) => {
     let attachmentPaths: string[] = [];
+    const abortController = new AbortController();
+    let trackedStream: TrackedStream | undefined;
+    // Set on every successful terminal path — including the agent-mode branches
+    // that return early below. The `finally` block only arms a user-input
+    // follow-up (`streamFinished`) when this is true, so leaving it false on a
+    // turn that actually completed sweeps the armed request instead.
+    let finishedNaturally = false;
+    let replayedAcceptedFollowUp = false;
+    let mutatedPersistedChat = false;
+    let freeAgentQuotaReservationId: number | null = null;
+    let reservedFreeAgentQuotaMessageId: number | null = null;
+    // Expose a promise that resolves once this handler fully unwinds (see the
+    // `finally` block) so `cancelStream` can await in-flight tool/file writes.
+    let resolveCompletion: () => void = () => {};
+    const completion = new Promise<void>((resolve) => {
+      resolveCompletion = resolve;
+    });
+    addTrackedValue(streamCompletions, req.chatId, completion);
     try {
-      let dyadRequestId: string | undefined;
-      // Create an AbortController for this stream
-      const abortController = new AbortController();
-      activeStreams.set(req.chatId, abortController);
+      // This legacy stream handler predates createTypedHandler, so enforce the
+      // contract explicitly before any attachment string is decoded.
+      const parsedRequest = ChatStreamParamsSchema.safeParse(req);
+      if (!parsedRequest.success) {
+        throw new DyadError(
+          parsedRequest.error.issues[0]?.message ?? "Invalid chat request.",
+          DyadErrorKind.Validation,
+        );
+      }
+      req = parsedRequest.data;
 
-      // Notify renderer that stream is starting
-      safeSend(event.sender, "chat:stream:start", { chatId: req.chatId });
+      let dyadRequestId: string | undefined;
+      trackedStream = {
+        abortController,
+        sender: event.sender,
+        invocationRef: req.invocationRef,
+        streamId: req.streamId,
+      };
+      addTrackedValue(activeStreams, req.chatId, trackedStream);
+      admissionPendingStreams.add(abortController);
+
+      const loadChatForStream = () =>
+        db.query.chats.findFirst({
+          where: eq(chats.id, req.chatId),
+          with: {
+            messages: {
+              // Only redo reads messages here; the turn loads its history later.
+              columns: { id: true, role: true },
+              orderBy: (messages, { asc }) => [
+                asc(messages.createdAt),
+                asc(messages.id),
+              ],
+            },
+            app: true, // Include app information
+          },
+        });
 
       // Get the chat to check for existing messages
-      const chat = await db.query.chats.findFirst({
-        where: eq(chats.id, req.chatId),
-        with: {
-          messages: {
-            orderBy: (messages, { asc }) => [asc(messages.createdAt)],
-          },
-          app: true, // Include app information
-        },
-      });
+      let chat = await loadChatForStream();
+
+      // Cancellation can arrive while the initial chat lookup is pending. Let
+      // cancelTrackedStreams remain the sole sender of the cancelled end events
+      // instead of also surfacing an admission/not-found error for this request.
+      if (abortController.signal.aborted) {
+        return req.chatId;
+      }
 
       if (!chat) {
         throw new DyadError(
@@ -309,6 +1129,84 @@ export function registerChatStreamHandlers() {
           DyadErrorKind.NotFound,
         );
       }
+
+      // PROTOCOL-GROUNDED REGION: admission barrier loop and atomic admission.
+      // Keep in sync with src/chat_stream/host_transition.ts.
+      while (true) {
+        if ((chatStreamAdmissionBlockCounts.get(req.chatId) ?? 0) > 0) {
+          const admitted = await waitForAdmissionBlockToClear({
+            blockCounts: chatStreamAdmissionBlockCounts,
+            waiters: chatStreamAdmissionWaiters,
+            key: req.chatId,
+            signal: abortController.signal,
+          });
+          if (!admitted) {
+            return req.chatId;
+          }
+          chat = await loadChatForStream();
+        }
+
+        if (abortController.signal.aborted) {
+          return req.chatId;
+        }
+
+        if (!chat) {
+          throw new DyadError(
+            `Chat not found: ${req.chatId}`,
+            DyadErrorKind.NotFound,
+          );
+        }
+
+        if ((streamAdmissionBlockCounts.get(chat.appId) ?? 0) > 0) {
+          const admitted = await waitForAdmissionBlockToClear({
+            blockCounts: streamAdmissionBlockCounts,
+            waiters: streamAdmissionWaiters,
+            key: chat.appId,
+            signal: abortController.signal,
+          });
+          if (!admitted) {
+            return req.chatId;
+          }
+          chat = await loadChatForStream();
+          continue;
+        }
+
+        // Both admission blocks are clear. Remove the pending marker HERE, in
+        // the same synchronous frame as the block checks above and before any
+        // further `await`, so admission is atomic with barrier installation.
+        // `cancelActiveStreamsForApp` deliberately skips controllers still in
+        // `admissionPendingStreams`; a restore that installs its app barrier
+        // (`blockNewStreamsForApp`) after this stream last checked the block but
+        // before the marker is cleared would therefore neither cancel this
+        // stream nor make it re-observe the new barrier, letting it start
+        // mid-restore and dirty the freshly reverted tree after the revert
+        // releases the app lock. Keeping the check-then-clear free of any
+        // intervening `await` closes that window: the stream either observes the
+        // barrier above and waits, or clears its marker before the barrier is
+        // installed and is then a plain in-flight stream the restore cancels.
+        // Do NOT introduce an `await` between the checks above and this line.
+        admissionPendingStreams.delete(abortController);
+        const concurrentChatCount = markStreamAdmitted(
+          admittedStreams,
+          req.chatId,
+          trackedStream,
+        );
+        if (concurrentChatCount !== null) {
+          sendTelemetryEvent("chat:concurrent-stream-started", {
+            concurrentChatCount,
+          });
+        }
+        break;
+      }
+
+      // Notify the renderer only after admission succeeds. Requests that arrive
+      // during an in-progress restore wait above and then start normally,
+      // keeping the submitted prompt owned by the stream instead of dropping it.
+      safeSend(event.sender, "chat:stream:start", {
+        chatId: req.chatId,
+        invocationRef: req.invocationRef,
+        streamId: req.streamId,
+      } satisfies ChatStreamStartPayload);
 
       // Record the streaming chat in the crash sentinel so a later force-close
       // can offer to upload it. We intentionally don't clear this when the
@@ -319,7 +1217,75 @@ export function registerChatStreamHandlers() {
       // value is cleared on clean exit.
       setSentinelActiveChat(req.chatId);
 
-      // Handle redo option: remove the most recent messages if needed
+      let baseSettings = readSettings();
+      let selectedModel = chat.modelSelection
+        ? await normalizeModelSelection(chat.modelSelection)
+        : await resolveDefaultModelSelection({
+            ...baseSettings,
+            selectedModel: modelForChatBackend(chat, baseSettings),
+          });
+      let { settings: storedSettings, mode: selectedChatMode } =
+        await resolveChatModeForTurn({
+          storedChatMode: chat.chatMode,
+          requestedChatMode: req.requestedChatMode,
+          settings: { ...baseSettings, selectedModel },
+        });
+      assertChatModeCompatibleWithModel(storedSettings, selectedChatMode);
+      if (
+        executionBackendForModel(selectedModel) !==
+        (chat.executionBackend ?? "dyad")
+      )
+        throw new DyadError(BACKEND_SWITCH_MESSAGE, DyadErrorKind.Precondition);
+      if (chat.executionBackend === "claude-code") {
+        if (trackedStream) trackedStream.drainBeforeEnd = true;
+        if (!baseSettings.enableClaudeCodeSubscription)
+          throw new DyadError(
+            'Turn on "Enable Claude Code subscription" in Settings → Experiments before using this chat.',
+            DyadErrorKind.Precondition,
+          );
+        if (req.redo)
+          throw new DyadError(
+            "Claude Code cannot replace an earlier turn without retaining hidden CLI context. Start a new chat to retry; your current chat stays unchanged.",
+            DyadErrorKind.Precondition,
+          );
+        const status = await claudeStatus();
+        if (!status.connected || !status.compatible)
+          throw new DyadError(status.detail, DyadErrorKind.Precondition);
+      }
+
+      // Reserve quota before redo or attachment persistence. The reservation
+      // is converted to a durable message mark only after turn acceptance.
+      let isBasicAgentModeRequest = isBasicAgentMode({
+        ...storedSettings,
+        selectedChatMode,
+      });
+      const isAcceptedReplay = isChatTurnAlreadyAccepted(db, {
+        chatId: req.chatId,
+        chatTurnIntentId: req.intentId,
+        userInputRequestId: req.userInputRequestId,
+      });
+      if (isBasicAgentModeRequest && !isAcceptedReplay) {
+        const quotaReservation = await reserveFreeAgentQuotaSlot();
+        if (quotaReservation.kind === "quota-exceeded") {
+          const { quotaStatus } = quotaReservation;
+          safeSend(event.sender, "chat:response:error", {
+            chatId: req.chatId,
+            invocationRef: req.invocationRef,
+            streamId: req.streamId,
+            error: JSON.stringify({
+              type: "FREE_AGENT_QUOTA_EXCEEDED",
+              hoursUntilReset: quotaStatus.hoursUntilReset,
+              resetTime: quotaStatus.resetTime,
+            }),
+          } satisfies ChatStreamErrorPayload);
+          return req.chatId;
+        }
+        freeAgentQuotaReservationId = quotaReservation.reservationId;
+      }
+
+      // Capture redo targets now, but delete them only when the replacement
+      // turn is durably accepted after all rejecting preflight checks.
+      const redoMessageIds: number[] = [];
       if (req.redo) {
         // Get the most recent messages
         const chatMessages = [...chat.messages];
@@ -334,21 +1300,14 @@ export function registerChatStreamHandlers() {
         }
 
         if (lastUserMessageIndex >= 0) {
-          // Delete the user message
-          await db
-            .delete(messages)
-            .where(eq(messages.id, chatMessages[lastUserMessageIndex].id));
+          redoMessageIds.push(chatMessages[lastUserMessageIndex].id);
 
           // If there's an assistant message after the user message, delete it too
           if (
             lastUserMessageIndex < chatMessages.length - 1 &&
             chatMessages[lastUserMessageIndex + 1].role === "assistant"
           ) {
-            await db
-              .delete(messages)
-              .where(
-                eq(messages.id, chatMessages[lastUserMessageIndex + 1].id),
-              );
+            redoMessageIds.push(chatMessages[lastUserMessageIndex + 1].id);
           }
         }
       }
@@ -360,10 +1319,47 @@ export function registerChatStreamHandlers() {
       let storedAttachments: StoredChatAttachment[] = [];
       const pendingStoredAttachments: PendingStoredChatAttachment[] = [];
       const manifestEntries: AttachmentManifestEntryInput[] = [];
+      // Parallel to pendingStoredAttachments: the unpacked contents of each
+      // zip attachment, registered under the archive's final logical name
+      // once that name is known.
+      const pendingArchiveSummaries: (ExtractedArchiveSummary | undefined)[] =
+        [];
+      // One expansion budget for the whole turn, so several small archives
+      // cannot each expand to the full per-archive limit.
+      let remainingArchiveBytes =
+        DEFAULT_ZIP_EXTRACTION_LIMITS.maxTotalUncompressedBytes;
+      let remainingArchiveEntries = DEFAULT_ZIP_EXTRACTION_LIMITS.maxEntries;
+      // Stored files and extraction directories this turn created. Stored
+      // files are shared by content hash across chats, so if the turn is
+      // rejected before the manifest records them, only paths that no other
+      // turn has registered meanwhile are removed.
+      const turnCreatedMediaPaths: string[] = [];
+      // Every media path this turn touches is reserved until the manifest
+      // records it, so a concurrent turn's rollback leaves it alone.
+      const mediaReservations: Array<() => void> = [];
+      const releaseMediaReservations = () => {
+        for (const release of mediaReservations.splice(0)) {
+          release();
+        }
+      };
+      const discardTurnCreatedMedia = async () => {
+        releaseMediaReservations();
+        const candidates = turnCreatedMediaPaths.splice(0);
+        await removeUnreferencedMediaPaths(appPath, candidates).catch(
+          (error) => {
+            logger.warn("Failed to discard media from a rejected turn:", error);
+          },
+        );
+      };
       const usedLogicalNames = new Set<string>();
       const appPath = getDyadAppPath(chat.app.path);
 
-      if (req.attachments && req.attachments.length > 0) {
+      // Detach the serialized payloads from the long-lived stream request as
+      // soon as they are persisted. Otherwise every base64 string remains
+      // reachable for the entire LLM turn and duplicates later disk reads.
+      let incomingAttachments = req.attachments;
+      req.attachments = undefined;
+      if (incomingAttachments && incomingAttachments.length > 0) {
         attachmentInfo = "\n\nAttachments:\n";
 
         // Create persistent .dyad/media directory for this app
@@ -373,73 +1369,180 @@ export function registerChatStreamHandlers() {
         }
         await ensureDyadGitignored(appPath);
 
-        for (const attachment of req.attachments) {
-          // Extract the base64 data (remove the data:mime/type;base64, prefix)
-          const base64Data = attachment.data.split(";base64,").pop() || "";
-          const fileBuffer = Buffer.from(base64Data, "base64");
-          const hash = crypto
-            .createHash("sha256")
-            .update(fileBuffer)
-            .digest("hex");
-          const fileExtension = path.extname(attachment.name);
-          const filename = `${hash}${fileExtension}`;
-          const logicalName = createUniqueAttachmentLogicalName(
-            attachment.name,
-            usedLogicalNames,
-          );
+        try {
+          for (const attachment of incomingAttachments) {
+            if (
+              chat.executionBackend === "claude-code" &&
+              isDotenvFilePath(attachment.name)
+            ) {
+              throw new DyadError(
+                "Claude Code cannot read dotenv attachments. Remove the attachment before sending.",
+                DyadErrorKind.Validation,
+              );
+            }
+            const inspection = inspectBase64DataUrl(attachment.data);
+            if (!inspection.ok) {
+              throw new DyadError(
+                `"${attachment.name}" is not a valid base64 attachment.`,
+                DyadErrorKind.Validation,
+              );
+            }
+            const base64Data = attachment.data.slice(inspection.payloadStart);
+            const fileBuffer = Buffer.from(base64Data, "base64");
+            const hash = crypto
+              .createHash("sha256")
+              .update(fileBuffer)
+              .digest("hex");
+            const isZipArchive = isZipAttachmentName(attachment.name);
+            // Archives always store as ".zip" so the same bytes map to one
+            // stored file and one extraction directory whatever the upload's
+            // extension casing.
+            const fileExtension = isZipArchive
+              ? ".zip"
+              : path.extname(attachment.name);
+            const filename = `${hash}${fileExtension}`;
+            const logicalName = createUniqueAttachmentLogicalName(
+              attachment.name,
+              usedLogicalNames,
+            );
 
-          // Save to .dyad/media dir
-          const persistentPath = path.join(mediaDir, filename);
-          await writeFile(persistentPath, fileBuffer);
-          attachmentPaths.push(persistentPath);
-          pendingStoredAttachments.push({
-            filePath: persistentPath,
-            attachmentType: attachment.attachmentType,
-          });
-          manifestEntries.push({
-            requestedLogicalName: logicalName,
-            originalName: attachment.name,
-            storedFileName: filename,
-            mimeType: attachment.type,
-            sizeBytes: fileBuffer.byteLength,
-            createdAt: new Date().toISOString(),
-          });
-          sendTelemetryEvent("attachment.stored", {
-            appId: chat.app.id,
-            chatId: req.chatId,
-            attachmentType: attachment.attachmentType,
-            mimeType: attachment.type,
-            sizeBytes: fileBuffer.byteLength,
-          });
+            // Save to .dyad/media dir
+            const persistentPath = path.join(mediaDir, filename);
+            mediaReservations.push(reserveMediaPath(persistentPath));
+            const storedFileExisted = await fileExists(persistentPath);
+            await writeFile(persistentPath, fileBuffer);
+            if (!storedFileExisted) {
+              turnCreatedMediaPaths.push(persistentPath);
+            }
 
-          // Build dyad-media:// URL for display
-          // Use a fixed hostname to avoid URL hostname normalization (lowercasing)
-          // Encode path segments so special characters (spaces, #, ?, %) don't
-          // break URL parsing. The protocol handler already decodeURIComponent's.
-          const mediaUrl = `dyad-media://media/${encodeURIComponent(chat.app.path)}/.dyad/media/${encodeURIComponent(filename)}`;
-
-          // Build display tag for inline rendering (escape attribute values)
-          displayAttachmentInfo += `\n<dyad-attachment name="${escapeXmlAttr(attachment.name)}" type="${escapeXmlAttr(attachment.type)}" url="${escapeXmlAttr(mediaUrl)}" path="${escapeXmlAttr(persistentPath)}" attachment-type="${escapeXmlAttr(attachment.attachmentType)}"></dyad-attachment>\n`;
-
-          if (attachment.attachmentType === "upload-to-codebase") {
-            // Provide the .dyad/media path so the AI can copy it into the codebase
-            attachmentInfo += `\n\nFile to upload to codebase: "${attachment.name}" (path: ${persistentPath})\nUse the copy_file tool when tools are available, or emit a <dyad-copy> tag otherwise, to copy this file into the codebase at the appropriate location.\n`;
-          } else {
-            // For chat-context, provide file info for reference (no path to avoid auto-copying)
-            attachmentInfo += `- ${attachment.name} (${attachment.type})\n`;
-            // If it's a text-based file, try to include the content
-            if (await isTextFile(persistentPath)) {
+            // Unpack zip archives next to the stored file so the agent can
+            // reach each entry as attachments:<archive>/<path>. A corrupt or
+            // oversized archive rejects the turn with a clear message.
+            let archiveSummary: ExtractedArchiveSummary | undefined;
+            if (isZipArchive) {
+              const extractionDir = path.join(
+                mediaDir,
+                extractedDirNameForStoredFile(filename),
+              );
+              mediaReservations.push(reserveMediaPath(extractionDir));
+              const extractionDirExisted = await fileExists(extractionDir);
               try {
-                attachmentInfo += `<dyad-text-attachment filename="${escapeXmlAttr(attachment.name)}" type="${escapeXmlAttr(attachment.type)}" path="${escapeXmlAttr(persistentPath)}">
+                archiveSummary = await extractZipAttachment({
+                  mediaDir,
+                  storedFileName: filename,
+                  archive: fileBuffer,
+                  limits: {
+                    maxTotalUncompressedBytes: remainingArchiveBytes,
+                    maxEntries: remainingArchiveEntries,
+                  },
+                  signal: abortController.signal,
+                });
+              } catch (error) {
+                if (isZipExtractionError(error)) {
+                  throw new DyadError(
+                    toZipExtractionErrorMessage(attachment.name, error, {
+                      sharedBudgetBytes:
+                        remainingArchiveBytes <
+                        DEFAULT_ZIP_EXTRACTION_LIMITS.maxTotalUncompressedBytes
+                          ? DEFAULT_ZIP_EXTRACTION_LIMITS.maxTotalUncompressedBytes
+                          : undefined,
+                      sharedBudgetEntries:
+                        remainingArchiveEntries <
+                        DEFAULT_ZIP_EXTRACTION_LIMITS.maxEntries
+                          ? DEFAULT_ZIP_EXTRACTION_LIMITS.maxEntries
+                          : undefined,
+                    }),
+                    DyadErrorKind.Validation,
+                  );
+                }
+                throw error;
+              }
+              remainingArchiveBytes -= archiveSummary.totalBytes;
+              remainingArchiveEntries -= archiveSummary.entryCount;
+              if (!extractionDirExisted) {
+                turnCreatedMediaPaths.push(extractionDir);
+              }
+              sendTelemetryEvent("attachment.archive_extracted", {
+                appId: chat.app.id,
+                chatId: req.chatId,
+                fileCount: archiveSummary.files.length,
+                totalBytes: archiveSummary.totalBytes,
+                skipped: archiveSummary.skipped,
+              });
+            }
+            pendingArchiveSummaries.push(archiveSummary);
+            attachmentPaths.push(persistentPath);
+            pendingStoredAttachments.push({
+              filePath: persistentPath,
+              attachmentType: attachment.attachmentType,
+            });
+            manifestEntries.push({
+              requestedLogicalName: logicalName,
+              originalName: attachment.name,
+              storedFileName: filename,
+              mimeType: attachment.type,
+              sizeBytes: fileBuffer.byteLength,
+              createdAt: new Date().toISOString(),
+            });
+            sendTelemetryEvent("attachment.stored", {
+              appId: chat.app.id,
+              chatId: req.chatId,
+              attachmentType: attachment.attachmentType,
+              mimeType: attachment.type,
+              sizeBytes: fileBuffer.byteLength,
+            });
+
+            // Build dyad-media:// URL for display
+            // Use a fixed hostname to avoid URL hostname normalization (lowercasing)
+            // Encode path segments so special characters (spaces, #, ?, %) don't
+            // break URL parsing. The protocol handler already decodeURIComponent's.
+            const mediaUrl = `dyad-media://media/${encodeURIComponent(chat.app.path)}/.dyad/media/${encodeURIComponent(filename)}`;
+
+            // Build display tag for inline rendering (escape attribute values)
+            displayAttachmentInfo += buildDyadAttachmentTag({
+              name: attachment.name,
+              type: attachment.type,
+              url: mediaUrl,
+              path: persistentPath,
+              attachmentType: attachment.attachmentType,
+            });
+
+            if (archiveSummary) {
+              // Archives are described, with their entries, once the manifest
+              // has assigned their final names.
+            } else if (attachment.attachmentType === "upload-to-codebase") {
+              // Provide the .dyad/media path so the AI can copy it into the codebase
+              attachmentInfo += `\n\nFile to upload to codebase: "${attachment.name}" (path: ${persistentPath})\nUse the copy_file tool when tools are available, or emit a <dyad-copy> tag otherwise, to copy this file into the codebase at the appropriate location.\n`;
+            } else {
+              // For chat-context, provide file info for reference (no path to avoid auto-copying)
+              attachmentInfo += `- ${attachment.name} (${attachment.type})\n`;
+              // If it's a text-based file, try to include the content
+              if (await isTextFile(persistentPath)) {
+                try {
+                  attachmentInfo += `<dyad-text-attachment filename="${escapeXmlAttr(attachment.name)}" type="${escapeXmlAttr(attachment.type)}" path="${escapeXmlAttr(persistentPath)}">
                 </dyad-text-attachment>
                 \n\n`;
-              } catch (err) {
-                logger.error(`Error reading file content: ${err}`);
+                } catch (err) {
+                  logger.error(`Error reading file content: ${err}`);
+                }
               }
             }
           }
+          // A Stop that lands after the extractor's last check (for example
+          // while moving its directory into place) still discards this
+          // turn's media.
+          abortController.signal.throwIfAborted();
+        } catch (error) {
+          await discardTurnCreatedMedia();
+          // Stop during attachment handling is a cancel, not a failure;
+          // cancelTrackedStreams already sent the cancelled end events.
+          if (abortController.signal.aborted) {
+            return req.chatId;
+          }
+          throw error;
         }
       }
+      incomingAttachments = undefined;
 
       // Build the full AI prompt. Attachment-specific instructions are added
       // to the user message, never the system prompt.
@@ -521,7 +1624,13 @@ export function registerChatStreamHandlers() {
               createdAt: new Date().toISOString(),
             });
             const mediaUrl = buildDyadMediaUrl(chat.app.path, media.fileName);
-            mediaDisplayInfo += `\n<dyad-attachment name="${escapeXmlAttr(media.fileName)}" type="${escapeXmlAttr(media.mimeType)}" url="${escapeXmlAttr(mediaUrl)}" path="${escapeXmlAttr(media.filePath)}" attachment-type="chat-context"></dyad-attachment>\n`;
+            mediaDisplayInfo += buildDyadAttachmentTag({
+              name: media.fileName,
+              type: media.mimeType,
+              url: mediaUrl,
+              path: media.filePath,
+              attachmentType: "chat-context",
+            });
           }
           // Strip only resolved @media: tags from the prompt text.
           // This preserves adjacent user text when mentions are directly followed
@@ -543,19 +1652,66 @@ export function registerChatStreamHandlers() {
         }
       }
 
-      const finalizedManifestEntries =
-        await appendAttachmentManifestEntriesWithLogicalNames(
-          appPath,
-          manifestEntries,
+      // Before registering the attachments, so a rejected turn leaves no
+      // manifest entries behind.
+      try {
+        assertInlineAttachmentsFit(
+          pendingStoredAttachments.map((attachment, index) => ({
+            ...attachment,
+            sizeBytes: manifestEntries[index].sizeBytes,
+          })),
+          userPrompt.length,
         );
-      storedAttachments = finalizedManifestEntries.map((entry, index) => ({
-        ...entry,
-        filePath: pendingStoredAttachments[index].filePath,
-        attachmentType: pendingStoredAttachments[index].attachmentType,
-      }));
+      } catch (error) {
+        await discardTurnCreatedMedia();
+        throw error;
+      }
+      try {
+        // Unpacked archive entries are registered under the archive's final
+        // logical name (which may have gained a suffix) so
+        // attachments:<archive>/<path> resolves through the manifest like any
+        // other attachment. The prompt then lists the names the manifest
+        // actually assigned.
+        const { entries: finalizedManifestEntries, childEntries } =
+          await appendAttachmentManifestEntryGroups(
+            appPath,
+            manifestEntries,
+            (finalized) =>
+              finalized.map((entry, index) => {
+                const archive = pendingArchiveSummaries[index];
+                return archive
+                  ? buildArchiveManifestEntries(
+                      entry.logicalName,
+                      archive,
+                      entry.createdAt,
+                    )
+                  : [];
+              }),
+          );
+        storedAttachments = finalizedManifestEntries.map((entry, index) => {
+          const archive = pendingArchiveSummaries[index];
+          return {
+            ...entry,
+            filePath: pendingStoredAttachments[index].filePath,
+            attachmentType: pendingStoredAttachments[index].attachmentType,
+            archive:
+              archive &&
+              withFinalizedEntryNames(
+                archive,
+                entry.logicalName,
+                childEntries[index],
+              ),
+          };
+        });
+      } catch (error) {
+        await discardTurnCreatedMedia();
+        throw error;
+      }
+      // Everything this turn stored is now in the manifest.
+      releaseMediaReservations();
 
       // Expand /implement-plan= into full implementation prompt
-      // Keep the original short form for display in the UI; the expanded
+      // Keep a human-readable title for display in the UI; the expanded
       // content is only injected into the AI message history.
       let implementPlanDisplayPrompt: string | undefined;
       const implementPlanMatch = userPrompt.match(/^\/implement-plan=(.+)$/);
@@ -574,7 +1730,11 @@ export function registerChatStreamHandlers() {
           const raw = await fs.promises.readFile(planFilePath, "utf-8");
           const { meta, content } = parsePlanFile(raw);
 
-          const planPath = `.dyad/plans/${planSlug}.md`;
+          const acceptedSnapshot = /^chat-\d+-plan-[a-f0-9]{64}$/.test(
+            planSlug,
+          );
+          const planPath = `.dyad/plans/${acceptedSnapshot ? `chat-${req.chatId}-plan` : planSlug}.md`;
+          implementPlanDisplayPrompt = `Implement plan: ${meta.title || "Implementation Plan"}`;
 
           userPrompt = `Please implement the following plan:
 
@@ -583,7 +1743,7 @@ export function registerChatStreamHandlers() {
 ${content}
 
 Start implementing this plan now. Follow the steps outlined and create/modify the necessary files.
-You may update the plan at \`${planPath}\` to mark your progress.`;
+Update the working plan at \`${planPath}\` to mark your progress. Do not modify any hash-versioned accepted plan snapshot.`;
         } catch (e) {
           implementPlanDisplayPrompt = undefined;
           logger.error("Failed to expand /implement-plan= prompt:", e);
@@ -637,37 +1797,256 @@ ${componentSnippet}
       const defaultAiUserPrompt =
         userPrompt + (attachmentInfo ? attachmentInfo : "");
 
-      const [insertedUserMessage] = await db
-        .insert(messages)
-        .values({
+      const autoModelCandidates: AutoModelCandidates = new Map();
+      let externalModelAdmission: ExternalModelAdmission | undefined;
+      const readAdmissionChat = () => {
+        const latestChat = db
+          .select({
+            chatMode: chats.chatMode,
+            modelSelection: chats.modelSelection,
+          })
+          .from(chats)
+          .where(eq(chats.id, req.chatId))
+          .get();
+        if (!latestChat) {
+          throw new DyadError(
+            `Chat not found: ${req.chatId}`,
+            DyadErrorKind.NotFound,
+          );
+        }
+
+        return latestChat;
+      };
+      const readAdmissionSettings = () => {
+        const current = readSettings();
+        return {
+          enableDyadPro: current.enableDyadPro,
+          enableClaudeCodeSubscription: current.enableClaudeCodeSubscription,
+          proModelUsage: current.proModelUsage,
+          providerSettings: current.providerSettings,
+          selectedModel: current.selectedModel,
+          selectedChatMode: current.selectedChatMode,
+          defaultChatMode: current.defaultChatMode,
+          modelEffortPreferences: current.modelEffortPreferences,
+        };
+      };
+      const retryAdmission = Symbol("retry-admission");
+      const acceptTurn = async () => {
+        // Preflight can wait on remote catalogs, auth and credits. Keep those
+        // waits outside the queue lock so Stop and picker/queue edits can run.
+        while (true) {
+          abortController.signal.throwIfAborted();
+          const snapshot = readAdmissionChat();
+          const sourceSettings = readAdmissionSettings();
+          const attemptSettings = { ...baseSettings, ...sourceSettings };
+          const candidates: AutoModelCandidates = new Map();
+          const prepared = await awaitTurnPreflight(
+            (async () => {
+              const model = snapshot.modelSelection
+                ? await normalizeModelSelection(snapshot.modelSelection)
+                : await resolveDefaultModelSelection({
+                    ...attemptSettings,
+                    selectedModel: modelForChatBackend(chat, attemptSettings),
+                  });
+              const { mode } = await resolveChatModeForTurn({
+                storedChatMode: snapshot.chatMode,
+                requestedChatMode:
+                  req.requestedChatMode ??
+                  normalizeStoredChatMode(snapshot.chatMode),
+                settings: { ...attemptSettings, selectedModel: model },
+              });
+              return isAcceptedReplay
+                ? { model, externalModelAdmission: undefined }
+                : preflightSubscriptionTurn(
+                    model,
+                    { ...attemptSettings, selectedChatMode: mode },
+                    abortController.signal,
+                    candidates,
+                  );
+            })().then(
+              (result) => ({ ok: true as const, ...result }),
+              (error) => ({ ok: false as const, error }),
+            ),
+            abortController.signal,
+          );
+          const result = await withChatQueueLock(req.chatId, async () => {
+            abortController.signal.throwIfAborted();
+            const latestChat = readAdmissionChat();
+            // Even a rejection belongs to the checked selection, not a model
+            // the user chose while that check was pending.
+            if (
+              JSON.stringify(latestChat) !== JSON.stringify(snapshot) ||
+              JSON.stringify(readAdmissionSettings()) !==
+                JSON.stringify(sourceSettings)
+            )
+              return retryAdmission;
+            if (!prepared.ok) throw prepared.error;
+            baseSettings = attemptSettings;
+            selectedModel = prepared.model;
+            externalModelAdmission = prepared.externalModelAdmission;
+            autoModelCandidates.clear();
+            for (const [alias, candidate] of candidates)
+              autoModelCandidates.set(alias, candidate);
+            const latestResolution = await resolveChatModeForTurn({
+              storedChatMode: latestChat.chatMode,
+              requestedChatMode:
+                req.requestedChatMode ??
+                normalizeStoredChatMode(latestChat.chatMode),
+              settings: { ...baseSettings, selectedModel },
+            });
+            ({ settings: storedSettings, mode: selectedChatMode } =
+              latestResolution);
+            assertChatModeCompatibleWithModel(storedSettings, selectedChatMode);
+            isBasicAgentModeRequest = isBasicAgentMode({
+              ...storedSettings,
+              selectedChatMode,
+            });
+
+            if (
+              isBasicAgentModeRequest &&
+              freeAgentQuotaReservationId === null &&
+              !isAcceptedReplay
+            ) {
+              const quotaReservation = await reserveFreeAgentQuotaSlot();
+              if (quotaReservation.kind === "quota-exceeded") {
+                const { quotaStatus } = quotaReservation;
+                safeSend(event.sender, "chat:response:error", {
+                  chatId: req.chatId,
+                  invocationRef: req.invocationRef,
+                  streamId: req.streamId,
+                  error: JSON.stringify({
+                    type: "FREE_AGENT_QUOTA_EXCEEDED",
+                    hoursUntilReset: quotaStatus.hoursUntilReset,
+                    resetTime: quotaStatus.resetTime,
+                  }),
+                } satisfies ChatStreamErrorPayload);
+                return null;
+              }
+              freeAgentQuotaReservationId = quotaReservation.reservationId;
+            } else if (
+              !isBasicAgentModeRequest &&
+              freeAgentQuotaReservationId !== null
+            ) {
+              await releaseFreeAgentQuotaSlot(freeAgentQuotaReservationId);
+              freeAgentQuotaReservationId = null;
+            }
+
+            const persistAcceptedTurn = () => {
+              abortController.signal.throwIfAborted();
+              return acceptChatTurn(db, {
+                chatId: req.chatId,
+                storedChatMode: latestChat.chatMode,
+                selectedChatMode,
+                selectedModel,
+                content:
+                  implementPlanDisplayPrompt ??
+                  displayUserPrompt ??
+                  defaultAiUserPrompt,
+                userInputRequestId: req.userInputRequestId,
+                chatTurnIntentId: req.intentId,
+                chatTurnIntent: executionObserver(req)?.intent,
+                usingFreeAgentModeQuota: freeAgentQuotaReservationId !== null,
+                redoMessageIds,
+              });
+            };
+            if (freeAgentQuotaReservationId === null) {
+              return persistAcceptedTurn();
+            }
+
+            const reservationId = freeAgentQuotaReservationId;
+            const acceptedTurn = await commitFreeAgentQuotaSlot(
+              reservationId,
+              persistAcceptedTurn,
+            );
+            freeAgentQuotaReservationId = null;
+            if (acceptedTurn.userMessageId !== null) {
+              reservedFreeAgentQuotaMessageId = acceptedTurn.userMessageId;
+            }
+            return acceptedTurn;
+          });
+          if (result !== retryAdmission) return result;
+        }
+      };
+
+      const acceptedTurn = await acceptTurn();
+      if (acceptedTurn === null) {
+        return req.chatId;
+      }
+      mutatedPersistedChat = true;
+
+      // Accept the user message and latch an implicit chat's first mode in one
+      // synchronous transaction. This keeps the idempotent message insert and
+      // the mode latch atomic. The conditional update also arbitrates
+      // concurrent first turns; a loser reloads and uses the winner below.
+      mutatedPersistedChat = true;
+      if (acceptedTurn.userMessageId !== null) {
+        executionObserver(req)?.onAccepted?.(acceptedTurn.userMessageId);
+      }
+
+      if (acceptedTurn.userMessageId === null) {
+        // A renderer replayed a continuation after main had already accepted
+        // the same idempotency key. Confirm acceptance without
+        // inserting another user message or starting another model turn. The
+        // transaction above also repairs a still-null first-turn mode.
+        replayedAcceptedFollowUp = true;
+        sendChatChunk(event.sender, {
           chatId: req.chatId,
-          role: "user",
-          content:
-            implementPlanDisplayPrompt ??
-            displayUserPrompt ??
-            defaultAiUserPrompt,
-        })
-        .returning({ id: messages.id });
-      const userMessageId = insertedUserMessage.id;
-      const {
+          invocationRef: req.invocationRef,
+          streamId: req.streamId,
+          acceptedUserInputRequestId: req.userInputRequestId,
+        } satisfies ChatStreamChunkPayload);
+        const terminalResponse = {
+          chatId: req.chatId,
+          invocationRef: req.invocationRef,
+          streamId: req.streamId,
+          updatedFiles: false,
+        } satisfies ChatStreamEndPayload;
+        safeSend(event.sender, "chat:response:end", terminalResponse);
+        return req.chatId;
+      }
+
+      if (acceptedTurn.authoritativeModel) {
+        const connection = selectedModel.connection;
+        selectedModel = {
+          ...(await normalizeModelSelection(acceptedTurn.authoritativeModel)),
+          connection,
+        };
+        storedSettings = { ...storedSettings, selectedModel };
+      }
+
+      const authoritativeResolution = await resolveChatModeForTurn({
+        storedChatMode: acceptedTurn.authoritativeChatMode,
+        requestedChatMode:
+          req.requestedChatMode ??
+          normalizeStoredChatMode(acceptedTurn.authoritativeChatMode),
         settings: storedSettings,
-        mode: selectedChatMode,
-        fallbackReason: chatModeFallbackReason,
-      } = await resolveChatModeForTurn({
-        storedChatMode: chat.chatMode,
-        requestedChatMode: req.requestedChatMode,
       });
+      ({ settings: storedSettings, mode: selectedChatMode } =
+        authoritativeResolution);
+      assertChatModeCompatibleWithModel(storedSettings, selectedChatMode);
+
+      const userMessageId = acceptedTurn.userMessageId;
+      if (req.userInputRequestId) {
+        sendChatChunk(event.sender, {
+          chatId: req.chatId,
+          invocationRef: req.invocationRef,
+          streamId: req.streamId,
+          acceptedUserInputRequestId: req.userInputRequestId,
+        } satisfies ChatStreamChunkPayload);
+      }
       const settings = {
         ...storedSettings,
         selectedChatMode,
       };
+      isBasicAgentModeRequest = isBasicAgentMode(settings);
       if (
-        isFreeProBuildModeCombination(settings.selectedModel, selectedChatMode)
+        !isBasicAgentModeRequest &&
+        reservedFreeAgentQuotaMessageId !== null
       ) {
-        throw new DyadError(
-          FREE_PRO_BUILD_MODE_ERROR,
-          DyadErrorKind.Precondition,
+        await unmarkMessageAsUsingFreeAgentQuota(
+          reservedFreeAgentQuotaMessageId,
         );
+        reservedFreeAgentQuotaMessageId = null;
       }
       const freeModelMode = isFreeProModel(settings.selectedModel);
       const hasImageAttachments = storedAttachments.some((attachment) =>
@@ -688,15 +2067,23 @@ ${componentSnippet}
           storedAttachments,
           attachmentDeliveryConfig,
         );
-      safeSend(event.sender, "chat:response:chunk", {
+      sendChatChunk(event.sender, {
         chatId: req.chatId,
+        invocationRef: req.invocationRef,
+        streamId: req.streamId,
         effectiveChatMode: selectedChatMode,
-        chatModeFallbackReason,
-      });
+      } satisfies ChatStreamChunkPayload);
       // Only Dyad Pro requests have request ids.
       if (settings.enableDyadPro) {
         // Generate requestId early so it can be saved with the message
         dyadRequestId = uuidv4();
+      }
+      const willUseLocalAgentStream = isLocalAgentBackedMode(selectedChatMode);
+      if (!willUseLocalAgentStream) {
+        throw new DyadError(
+          `Chat mode ${selectedChatMode} is not backed by the local agent stream`,
+          DyadErrorKind.Internal,
+        );
       }
 
       // Add a placeholder assistant message immediately
@@ -706,8 +2093,17 @@ ${componentSnippet}
           chatId: req.chatId,
           role: "assistant",
           content: "", // Start with empty content
+          // Agentic tools apply their mutations as they run. Mark their
+          // messages as already handled so legacy proposal actions cannot
+          // replay tool XML after an error or cancellation.
+          approvalState: willUseLocalAgentStream ? "approved" : null,
           requestId: dyadRequestId,
-          model: settings.selectedModel.name,
+          model:
+            chat.executionBackend === "claude-code"
+              ? null
+              : selectedModel.connection === "subscription"
+                ? `ChatGPT subscription (${selectedModel.name})`
+                : selectedModel.name,
           sourceCommitHash: await getCurrentCommitHash({
             path: getDyadAppPath(chat.app.path),
           }),
@@ -719,7 +2115,12 @@ ${componentSnippet}
         where: eq(chats.id, req.chatId),
         with: {
           messages: {
-            orderBy: (messages, { asc }) => [asc(messages.createdAt)],
+            // Agent modes load their bounded model history separately.
+            columns: rendererMessageColumns,
+            orderBy: (messages, { asc }) => [
+              asc(messages.createdAt),
+              asc(messages.id),
+            ],
           },
           app: true, // Include app information
         },
@@ -733,10 +2134,12 @@ ${componentSnippet}
       }
 
       // Send the messages right away so that the loading state is shown for the message.
-      safeSend(event.sender, "chat:response:chunk", {
+      sendChatChunk(event.sender, {
         chatId: req.chatId,
-        messages: updatedChat.messages,
-      });
+        invocationRef: req.invocationRef,
+        streamId: req.streamId,
+        messages: toRendererMessages(updatedChat.messages),
+      } satisfies ChatStreamChunkPayload);
 
       let fullResponse = "";
       let maxTokensUsed: number | undefined;
@@ -749,6 +2152,8 @@ ${componentSnippet}
         fullResponse = await streamTestResponse(
           event,
           req.chatId,
+          req.invocationRef,
+          req.streamId,
           testResponse,
           abortController,
           placeholderAssistantMessage.id,
@@ -756,8 +2161,17 @@ ${componentSnippet}
       } else {
         // Normal AI processing for non-test prompts
         const { modelClient, isEngineEnabled, isSmartContextEnabled } =
-          await getModelClient(settings.selectedModel, settings);
+          await getModelClient(
+            settings.selectedModel,
+            settings,
+            selectedModel,
+            { chatId: req.chatId, autoModelCandidates, externalModelAdmission },
+          );
 
+        const isBuildMode = selectedChatMode === "build";
+        const isLocalAgentMode = selectedChatMode === "local-agent";
+        const isAskMode = selectedChatMode === "ask";
+        const isPlanMode = selectedChatMode === "plan";
         const appPath = getDyadAppPath(updatedChat.app.path);
         // When we don't have smart context enabled, we
         // only include the selected components' files for codebase context.
@@ -774,13 +2188,44 @@ ${componentSnippet}
                 })),
                 smartContextAutoIncludes: [],
               }
-            : validateChatContext(updatedChat.app.chatContext);
+            : {
+                contextPaths: [],
+                smartContextAutoIncludes: [],
+                excludePaths: [],
+              };
 
-        // Extract codebase for current app
-        const { formattedOutput: codebaseInfo, files } = await extractCodebase({
-          appPath,
-          chatContext,
-        });
+        let codebaseInfo = "";
+        let files: Awaited<ReturnType<typeof extractCodebase>>["files"] = [];
+        if (willUseLocalAgentStream) {
+          // Agent-backed modes inspect files on demand, but session diagnostics
+          // still need the lightweight app-size measurement. Metadata listing
+          // applies the same exclusions without reading file contents.
+          const { sizeStats } = await listCodebaseFileMetadata({
+            appPath,
+            chatContext,
+          });
+          if (sizeStats) {
+            recordAppSizeForSession({
+              appId: updatedChat.app.id,
+              ...sizeStats,
+            });
+          }
+        } else {
+          const extractedCodebase = await extractCodebase({
+            appPath,
+            chatContext,
+            // Recorded as soon as the file list is known rather than after the
+            // extract is built, so a turn that dies reading a large codebase
+            // still reports the size it died on.
+            onSizeStats: (sizeStats) =>
+              recordAppSizeForSession({
+                appId: updatedChat.app.id,
+                ...sizeStats,
+              }),
+          });
+          codebaseInfo = extractedCodebase.formattedOutput;
+          files = extractedCodebase.files;
+        }
 
         // For smart context and selected components, we will mark the selected components' files as focused.
         // This means that we don't do the regular smart context handling, but we'll allow fetching
@@ -800,23 +2245,29 @@ ${componentSnippet}
           }
         }
 
-        const isLocalAgentMode = selectedChatMode === "local-agent";
-        const isAskMode = selectedChatMode === "ask";
-        const isPlanMode = selectedChatMode === "plan";
-        const willUseLocalAgentStream =
-          isLocalAgentBackedMode(selectedChatMode);
-
-        // Agent/ask/plan modes reach referenced apps via tool calls (`app_name`
+        // Tool-backed modes reach referenced apps via tool calls (`app_name`
         // on read-only tools), so we only need name/path pairs — skip the heavy
-        // codebase extraction entirely. Build mode still injects full codebases.
+        // full referenced-app codebase extraction entirely.
         let mentionedAppsCodebases: MentionedAppCodebaseEntry[] = [];
         let referencedAppsForAgent: MentionedAppReference[] = [];
         if (willUseLocalAgentStream) {
-          referencedAppsForAgent =
-            await extractMentionedAppsReferencesFromPrompt(
-              req.prompt,
-              updatedChat.app.id, // Exclude current app
-            );
+          // References are sticky for the rest of the chat here: carrying a
+          // name/path pair costs nothing until the model actually reads from
+          // it, and re-typing `@app:Name` every turn to keep tool access is a
+          // trap (the mention stays visible in history after access is gone).
+          const stickyReferences = await resolveStickyReferencedApps({
+            prompt: req.prompt,
+            persistedAppIds: readStoredReferencedAppIds(
+              updatedChat.referencedAppIds,
+            ),
+            excludeCurrentAppId: updatedChat.app.id,
+          });
+          referencedAppsForAgent = stickyReferences.references;
+          if (stickyReferences.changed) {
+            // This also invalidates the chat in every window, so the composer's
+            // chip row picks the reference up now rather than when the turn ends.
+            await persistReferencedAppIds(req.chatId, stickyReferences.appIds);
+          }
         } else {
           mentionedAppsCodebases =
             await extractMentionedAppsCodebasesFromPrompt(
@@ -824,16 +2275,36 @@ ${componentSnippet}
               updatedChat.app.id, // Exclude current app
             );
           referencedAppsForAgent = mentionedAppsCodebases.map(
-            ({ appName, appPath }) => ({ appName, appPath }),
+            ({ appId, appName, appPath }) => ({ appId, appName, appPath }),
           );
         }
         const useReferencedAppManifest =
           willUseLocalAgentStream && referencedAppsForAgent.length > 0;
+        // Modes that inline attachments instead of using the on-disk block
+        // still need to know how to reach an archive's entries, with the
+        // hints the final mode allows.
+        const inlineArchiveInfo = storedAttachments
+          .flatMap((attachment) =>
+            attachment.archive
+              ? [
+                  buildArchiveAttachmentInfo(
+                    { ...attachment, archive: attachment.archive },
+                    attachmentDeliveryConfig,
+                  ).join("\n"),
+                ]
+              : [],
+          )
+          .map((info) => `\n${info}\n`)
+          .join("");
         const effectiveAiUserPrompt =
           attachmentDeliveryConfig.useOnDiskAttachmentBlock
             ? localAgentAiUserPrompt
-            : defaultAiUserPrompt;
+            : defaultAiUserPrompt + inlineArchiveInfo;
 
+        // Every currently selectable chat mode returns through the tool-backed
+        // handlers below. This legacy full-context path is intentionally
+        // dormant during the stored-response protocol migration; none of its
+        // auto-approval or destructive-SQL checks are live safety boundaries.
         const isDeepContextEnabled =
           isEngineEnabled &&
           settings.enableProSmartFilesContextMode &&
@@ -946,12 +2417,137 @@ ${componentSnippet}
         );
 
         const frameworkType = detectFrameworkType(appPath);
-        // Gate on Pro to match the `explore_code` tool's `isEnabled`, so the
-        // prompt never points the model at a tool that isn't in the toolset.
+        // Match the Explorer persona's actual tool gate so the prompt never
+        // points the model at spawn_agent(persona="explorer") when that
+        // persona is disabled. Code-index readiness is independent now that
+        // spawn_agent replaces the old explore_code tool.
         const codeExplorerAvailable =
           isDyadProEnabled(settings) &&
-          !!settings.enableCodeExplorer &&
-          isCodeExplorerReady(appPath);
+          settings.enableExplorerSubagent !== false &&
+          settings.agentToolConsents?.["spawn_agent"] !== "never";
+        // Mirrors explore_chat_history's toolset inclusion (Pro, and not
+        // consent-"never") so the prompt never points the model at a tool
+        // that isn't in the toolset. Consent is read from settings directly
+        // because this module must not import the pro tool registry.
+        const historyExplorerAvailable =
+          isDyadProEnabled(settings) &&
+          settings.agentToolConsents?.["explore_chat_history"] !== "never";
+        const implementerAvailable =
+          selectedChatMode === "local-agent" &&
+          isDyadProEnabled(settings) &&
+          isImplementerSubagentEnabled(settings);
+        const restartAppToolAvailable =
+          settings.agentToolConsents?.["restart_app"] !== "never";
+        const preCommitHookAvailable =
+          selectedChatMode === "local-agent" &&
+          settings.agentToolConsents?.["run_pre_commit"] !== "never" &&
+          (await isPreCommitHookAvailable(appPath));
+        const reinstallAndRestartAppToolAvailable =
+          settings.agentToolConsents?.["reinstall_and_restart_app"] !== "never";
+        const runBuildToolAvailable =
+          settings.agentToolConsents?.["run_build"] !== "never";
+        const planningQuestionnaireAvailable =
+          settings.agentToolConsents?.["planning_questionnaire"] !== "never";
+        const appBlueprint = getAppBlueprintForChat(updatedChat.id);
+        const hasAppBlueprint = Boolean(appBlueprint);
+        const appBlueprintQuestionnaireCompleted =
+          await chatHasCompletedAppBlueprintQuestionnaire(updatedChat.id);
+        const initialSupabaseProviderToolsAvailable = Boolean(
+          updatedChat.app.supabaseProjectId &&
+          hasSupabaseCredentialsForOrganization(
+            settings,
+            updatedChat.app.supabaseOrganizationSlug,
+          ),
+        );
+        const initialNeonCredentialsAvailable = Boolean(
+          updatedChat.app.neonProjectId && settings.neon?.accessToken?.value,
+        );
+        const initialNeonProviderToolsAvailable = Boolean(
+          initialNeonCredentialsAvailable &&
+          (updatedChat.app.neonActiveBranchId ??
+            updatedChat.app.neonDevelopmentBranchId),
+        );
+        const implementerFallbackSystemPrompt = constructImplementerPrompt(
+          aiRules,
+          {
+            provider: resolveImplementerProvider({
+              hasSupabaseProject: Boolean(updatedChat.app.supabaseProjectId),
+              hasNeonProject: Boolean(updatedChat.app.neonProjectId),
+            }),
+            frameworkType,
+            testingEnabled: Boolean(updatedChat.app.testingEnabled),
+            runTestsAvailable:
+              settings.agentToolConsents?.["run_tests"] !== "never",
+            // Refresh failure disables every provider tool for the child, so
+            // the fallback prompt must not advertise live provider reads.
+            supabaseConnected: false,
+            neonToolsAvailable: false,
+            neonEmailVerificationEnabled: undefined,
+            providerMetadataReadAvailable: false,
+            databaseSchemaReadAvailable: false,
+            readGuideAvailable:
+              settings.agentToolConsents?.["read_guide"] !== "never",
+          },
+        );
+        const refreshImplementerContext = async () => {
+          const refreshedApp =
+            (await db.query.apps.findFirst({
+              where: eq(apps.id, updatedChat.app.id),
+            })) ?? updatedChat.app;
+          const latestSettings = readSettings();
+          const capabilityState = resolveImplementerCapabilityState(
+            refreshedApp,
+            latestSettings,
+          );
+          const {
+            provider,
+            supabaseConnected,
+            neonToolsAvailable,
+            neonBranchId,
+            providerMetadataReadAvailable,
+            databaseSchemaReadAvailable,
+            readGuideAvailable,
+          } = capabilityState;
+          const refreshedFrameworkType = detectFrameworkType(
+            getDyadAppPath(refreshedApp.path),
+          );
+          const neonEmailVerificationEnabled =
+            provider === "neon" &&
+            neonToolsAvailable &&
+            refreshedApp.neonProjectId
+              ? await getNeonEmailVerificationEnabled(
+                  refreshedApp.neonProjectId,
+                  neonBranchId,
+                )
+              : provider === "neon"
+                ? undefined
+                : false;
+          return {
+            systemPrompt: constructImplementerPrompt(aiRules, {
+              provider,
+              frameworkType: refreshedFrameworkType,
+              testingEnabled: Boolean(refreshedApp.testingEnabled),
+              runTestsAvailable:
+                latestSettings.agentToolConsents?.["run_tests"] !== "never",
+              supabaseConnected,
+              neonToolsAvailable,
+              neonEmailVerificationEnabled,
+              providerMetadataReadAvailable,
+              databaseSchemaReadAvailable,
+              readGuideAvailable,
+            }),
+            supabaseProjectId: refreshedApp.supabaseProjectId,
+            supabaseOrganizationSlug: refreshedApp.supabaseOrganizationSlug,
+            neonProjectId: refreshedApp.neonProjectId,
+            neonActiveBranchId: neonBranchId,
+            supabaseProviderToolsAvailable: Boolean(
+              supabaseConnected && refreshedApp.supabaseProjectId,
+            ),
+            neonProviderToolsAvailable: neonToolsAvailable,
+            frameworkType: refreshedFrameworkType,
+            testingEnabled: Boolean(refreshedApp.testingEnabled),
+          };
+        };
 
         // Migration on read converts "agent" to "build", so no need to check for it here
         let systemPrompt = constructSystemPrompt({
@@ -965,14 +2561,26 @@ ${componentSnippet}
           hasSupabaseProject: !!updatedChat.app?.supabaseProjectId,
           enableAppBlueprint:
             settings.enableAppBlueprint && updatedChat.app.needsAppBlueprint,
+          hasAppBlueprint,
+          planningQuestionnaireAvailable,
+          appBlueprintQuestionnaireCompleted,
+          appBlueprint,
           codeExplorerAvailable,
+          historyExplorerAvailable,
+          implementerAvailable,
+          testingEnabled: !!updatedChat.app?.testingEnabled,
+          preCommitHookAvailable,
+          restartAppToolAvailable,
+          reinstallAndRestartAppToolAvailable,
+          runBuildToolAvailable,
+          suggestedPromptsEnabled:
+            settings.enableSuggestedPrompts ?? DEFAULT_ENABLE_SUGGESTED_PROMPTS,
         });
 
-        // Add information about mentioned apps for build mode only.
-        // Full codebase injection (build mode): full file contents already
-        // concatenated into `otherAppsCodebaseInfo`.
+        // Add information for any legacy caller that still injects full
+        // referenced-app codebases.
         //
-        // Agent/ask/plan modes don't need anything in the system prompt —
+        // Tool-backed modes don't need anything in the system prompt —
         // handleLocalAgentStream injects a `<system-reminder>` into the
         // user's latest message so the system prompt stays static.
         if (otherAppsCodebaseInfo) {
@@ -1005,12 +2613,15 @@ ${componentSnippet}
           }
         }
 
-        if (
-          updatedChat.app?.supabaseProjectId &&
-          isSupabaseConnected(settings)
-        ) {
+        const rootDatabasePromptState = resolveRootDatabasePromptState({
+          hasSupabaseProject: Boolean(updatedChat.app.supabaseProjectId),
+          supabaseCredentialsAvailable: initialSupabaseProviderToolsAvailable,
+          hasNeonProject: Boolean(updatedChat.app.neonProjectId),
+          neonCredentialsAvailable: initialNeonCredentialsAvailable,
+        });
+        if (rootDatabasePromptState === "supabase") {
           const supabaseClientCode = await getSupabaseClientCode({
-            projectId: updatedChat.app.supabaseProjectId,
+            projectId: updatedChat.app.supabaseProjectId!,
             organizationSlug: updatedChat.app.supabaseOrganizationSlug ?? null,
           });
           systemPrompt +=
@@ -1018,14 +2629,16 @@ ${componentSnippet}
             getSupabaseAvailableSystemPrompt(supabaseClientCode) +
             "\n\n" +
             // For local agent, we will explicitly fetch the database context when needed.
-            (selectedChatMode === "local-agent"
+            (willUseLocalAgentStream
               ? ""
               : await getSupabaseContext({
-                  supabaseProjectId: updatedChat.app.supabaseProjectId,
+                  supabaseProjectId: updatedChat.app.supabaseProjectId!,
                   organizationSlug:
                     updatedChat.app.supabaseOrganizationSlug ?? null,
                 }));
-        } else if (updatedChat.app?.neonProjectId) {
+        } else if (rootDatabasePromptState === "supabase-disconnected") {
+          systemPrompt += "\n\n" + SUPABASE_DISCONNECTED_SYSTEM_PROMPT;
+        } else if (rootDatabasePromptState === "neon") {
           // Neon is connected — inject Neon prompt instead of Supabase
           systemPrompt +=
             "\n\n" +
@@ -1037,9 +2650,11 @@ ${componentSnippet}
               selectedChatMode,
             })) +
             "\n\n";
+        } else if (rootDatabasePromptState === "neon-disconnected") {
+          systemPrompt += "\n\n" + NEON_DISCONNECTED_SYSTEM_PROMPT;
         } else if (
           // In local agent mode, we will suggest integrations as part of the add-integration tool
-          selectedChatMode !== "local-agent" &&
+          !willUseLocalAgentStream &&
           // If in security review mode, we don't need to mention integrations are available.
           !isSecurityReviewIntent
         ) {
@@ -1145,6 +2760,8 @@ This conversation includes one or more image attachments. When the user uploads 
                     attachmentDeliveryConfig.includeImageParts,
                   inlineTextAttachments:
                     attachmentDeliveryConfig.inlineTextAttachments,
+                  pdfFileParts:
+                    await buildInlinePdfFileParts(storedAttachments),
                 },
               );
             }
@@ -1161,6 +2778,13 @@ This conversation includes one or more image attachments. When the user uploads 
                   .update(messages)
                   .set({ aiMessagesJson: userAiMessagesJson })
                   .where(eq(messages.id, userMessageId));
+              } else if (hasInlineMediaParts(chatMessages[lastUserIndex])) {
+                // Without the structured message the model would only see
+                // the plain-text prompt, silently missing the attachments.
+                throw new DyadError(
+                  INLINE_ATTACHMENTS_TOO_LARGE_MESSAGE,
+                  DyadErrorKind.Validation,
+                );
               }
             }
           }
@@ -1176,7 +2800,11 @@ This conversation includes one or more image attachments. When the user uploads 
             where: eq(chats.id, parseInt(req.prompt.split("=")[1])),
             with: {
               messages: {
-                orderBy: (messages, { asc }) => [asc(messages.createdAt)],
+                columns: { role: true, content: true },
+                orderBy: (messages, { asc }) => [
+                  asc(messages.createdAt),
+                  asc(messages.id),
+                ],
               },
             },
           });
@@ -1232,12 +2860,14 @@ This conversation includes one or more image attachments. When the user uploads 
             versionedFiles,
             mentionedAppsCodebases,
             builtinProviderId: modelClient.builtinProviderId,
-            settings,
+            reasoningEffortProviderId: modelClient.reasoningEffortProviderId,
+            modelSelection: selectedModel,
           });
 
           const streamResult = streamText({
             headers: getAiHeaders({
               builtinProviderId: modelClient.builtinProviderId,
+              dyadRequestId,
             }),
             maxOutputTokens: await getMaxTokens(settings.selectedModel),
             temperature: await getTemperature(settings.selectedModel),
@@ -1295,10 +2925,13 @@ This conversation includes one or more image attachments. When the user uploads 
               );
               event.sender.send("chat:response:error", {
                 chatId: req.chatId,
-                error: `${AI_STREAMING_ERROR_MESSAGE_PREFIX}${requestIdPrefix}${message}`,
-              });
-              // Clean up the abort controller
-              activeStreams.delete(req.chatId);
+                invocationRef: req.invocationRef,
+                streamId: req.streamId,
+                error:
+                  error?.error instanceof SubscriptionBillingError
+                    ? error.error.serialize()
+                    : `${AI_STREAMING_ERROR_MESSAGE_PREFIX}${requestIdPrefix}${message}`,
+              } satisfies ChatStreamErrorPayload);
             },
             abortSignal: abortController.signal,
           });
@@ -1334,7 +2967,7 @@ This conversation includes one or more image attachments. When the user uploads 
           fullResponse: string;
         }) => {
           // Store the current partial response
-          partialResponses.set(req.chatId, fullResponse);
+          setPartialResponseForStream(abortController, fullResponse);
           // Save to DB (in case user is switching chats during the stream)
           const now = Date.now();
           if (now - lastDbSaveAt >= 150) {
@@ -1351,11 +2984,13 @@ This conversation includes one or more image attachments. When the user uploads 
           if (!patch) {
             return fullResponse;
           }
-          safeSend(event.sender, "chat:response:chunk", {
+          sendChatChunk(event.sender, {
             chatId: req.chatId,
+            invocationRef: req.invocationRef,
+            streamId: req.streamId,
             streamingMessageId: placeholderAssistantMessage.id,
             streamingPatch: patch,
-          });
+          } satisfies ChatStreamChunkPayload);
           return fullResponse;
         };
 
@@ -1364,7 +2999,7 @@ This conversation includes one or more image attachments. When the user uploads 
         // Ask mode does not consume free agent quota
         if (isAskMode) {
           // Reconstruct system prompt for local-agent read-only mode
-          const readOnlySystemPrompt = constructSystemPrompt({
+          let readOnlySystemPrompt = constructSystemPrompt({
             aiRules,
             chatMode: "local-agent",
             enableTurboEditsV2: false,
@@ -1372,7 +3007,14 @@ This conversation includes one or more image attachments. When the user uploads 
             readOnly: true,
             freeModelMode,
             codeExplorerAvailable,
+            historyExplorerAvailable,
           });
+          if (rootDatabasePromptState === "supabase-disconnected") {
+            readOnlySystemPrompt +=
+              "\n\n" + SUPABASE_DISCONNECTED_SYSTEM_PROMPT;
+          } else if (rootDatabasePromptState === "neon-disconnected") {
+            readOnlySystemPrompt += "\n\n" + NEON_DISCONNECTED_SYSTEM_PROMPT;
+          }
 
           // Return value indicates success/failure for quota tracking.
           // Ask mode doesn't consume quota, but we still capture it for
@@ -1394,10 +3036,16 @@ This conversation includes one or more image attachments. When the user uploads 
               readOnly: true,
               messageOverride: isSummarizeIntent ? chatMessages : undefined,
               settingsOverride: settings,
+              modelSelectionOverride: selectedModel,
+              autoModelCandidates,
+              externalModelAdmission,
               freeModelMode,
               referencedApps: referencedAppsForAgent,
               currentTurnHasOnDiskAttachment:
                 hasScriptReadableAttachment(storedAttachments),
+              supabaseProviderToolsAvailable:
+                initialSupabaseProviderToolsAvailable,
+              neonProviderToolsAvailable: initialNeonProviderToolsAvailable,
             },
           );
           if (!streamSuccess) {
@@ -1405,6 +3053,7 @@ This conversation includes one or more image attachments. When the user uploads 
               "Ask mode local agent stream did not complete successfully",
             );
           }
+          finishedNaturally = streamSuccess;
           return;
         }
 
@@ -1412,25 +3061,75 @@ This conversation includes one or more image attachments. When the user uploads 
         // Plan mode is for requirements gathering and creating implementation plans
         if (isPlanMode) {
           // Reconstruct system prompt for plan mode
-          const planModeSystemPrompt = constructSystemPrompt({
+          let planModeSystemPrompt = constructSystemPrompt({
             aiRules,
             chatMode: "plan",
             enableTurboEditsV2: false,
             themePrompt,
             freeModelMode,
           });
+          if (rootDatabasePromptState === "supabase-disconnected") {
+            planModeSystemPrompt +=
+              "\n\n" + SUPABASE_DISCONNECTED_SYSTEM_PROMPT;
+          } else if (rootDatabasePromptState === "neon-disconnected") {
+            planModeSystemPrompt += "\n\n" + NEON_DISCONNECTED_SYSTEM_PROMPT;
+          }
 
-          await handleLocalAgentStream(event, req, abortController, {
-            placeholderMessageId: placeholderAssistantMessage.id,
-            systemPrompt: planModeSystemPrompt,
-            dyadRequestId: dyadRequestId ?? "[no-request-id]",
-            planModeOnly: true,
-            messageOverride: isSummarizeIntent ? chatMessages : undefined,
-            settingsOverride: settings,
-            freeModelMode,
-            referencedApps: referencedAppsForAgent,
-            currentTurnHasOnDiskAttachment: false,
-          });
+          finishedNaturally = await handleLocalAgentStream(
+            event,
+            req,
+            abortController,
+            {
+              placeholderMessageId: placeholderAssistantMessage.id,
+              systemPrompt: planModeSystemPrompt,
+              dyadRequestId: dyadRequestId ?? "[no-request-id]",
+              planModeOnly: true,
+              messageOverride: isSummarizeIntent ? chatMessages : undefined,
+              settingsOverride: settings,
+              modelSelectionOverride: selectedModel,
+              autoModelCandidates,
+              externalModelAdmission,
+              freeModelMode,
+              referencedApps: referencedAppsForAgent,
+              currentTurnHasOnDiskAttachment:
+                hasArchiveAttachment(storedAttachments),
+              supabaseProviderToolsAvailable:
+                initialSupabaseProviderToolsAvailable,
+              neonProviderToolsAvailable: initialNeonProviderToolsAvailable,
+            },
+          );
+          return;
+        }
+
+        // Build uses the same multi-step tool-calling loop as Agent, but with
+        // a fail-closed app-building tool profile: no sub-agents, Engine tools,
+        // logs, verification commands, sandbox scripts, or MCP servers.
+        if (isBuildMode) {
+          const readOnlyBuildTurn = isSecurityReviewIntent || isSummarizeIntent;
+          finishedNaturally = await handleLocalAgentStream(
+            event,
+            req,
+            abortController,
+            {
+              placeholderMessageId: placeholderAssistantMessage.id,
+              systemPrompt,
+              dyadRequestId: dyadRequestId ?? "[no-request-id]",
+              readOnly: readOnlyBuildTurn,
+              toolProfile: "build",
+              messageOverride: isSummarizeIntent ? chatMessages : undefined,
+              settingsOverride: settings,
+              modelSelectionOverride: selectedModel,
+              autoModelCandidates,
+              externalModelAdmission,
+              freeModelMode,
+              referencedApps: referencedAppsForAgent,
+              currentTurnHasOnDiskAttachment:
+                hasScriptReadableAttachment(storedAttachments),
+              supabaseProviderToolsAvailable:
+                initialSupabaseProviderToolsAvailable,
+              neonProviderToolsAvailable: initialNeonProviderToolsAvailable,
+            },
+          );
           return;
         }
 
@@ -1441,120 +3140,51 @@ This conversation includes one or more image attachments. When the user uploads 
         // injects a `<system-reminder>` into the user's latest message telling
         // the agent which `app_name` values are valid.
         if (isLocalAgentMode) {
-          // Check quota for Basic Agent mode (non-Pro users)
-          const isBasicAgentModeRequest = isBasicAgentMode(settings);
-          if (isBasicAgentModeRequest) {
-            const quotaStatus = await getFreeAgentQuotaStatus();
-            if (quotaStatus.isQuotaExceeded) {
-              safeSend(event.sender, "chat:response:error", {
-                chatId: req.chatId,
-                error: JSON.stringify({
-                  type: "FREE_AGENT_QUOTA_EXCEEDED",
-                  hoursUntilReset: quotaStatus.hoursUntilReset,
-                  resetTime: quotaStatus.resetTime,
-                }),
-              });
-              return;
-            }
+          const streamSuccess = await handleLocalAgentStream(
+            event,
+            req,
+            abortController,
+            {
+              placeholderMessageId: placeholderAssistantMessage.id,
+              systemPrompt,
+              dyadRequestId: dyadRequestId ?? "[no-request-id]",
+              messageOverride: isSummarizeIntent ? chatMessages : undefined,
+              settingsOverride: settings,
+              modelSelectionOverride: selectedModel,
+              autoModelCandidates,
+              externalModelAdmission,
+              freeModelMode,
+              preCommitHookAvailable,
+              refreshImplementerContext,
+              implementerFallbackSystemPrompt,
+              supabaseProviderToolsAvailable:
+                initialSupabaseProviderToolsAvailable,
+              neonProviderToolsAvailable: initialNeonProviderToolsAvailable,
+              referencedApps: referencedAppsForAgent,
+              currentTurnHasOnDiskAttachment:
+                hasScriptReadableAttachment(storedAttachments),
+            },
+          );
+          if (streamSuccess) {
+            reservedFreeAgentQuotaMessageId = null;
           }
 
-          // Mark the user message as using quota BEFORE starting the stream
-          // to prevent race conditions with parallel requests
-          if (isBasicAgentModeRequest && userMessageId) {
-            await markMessageAsUsingFreeAgentQuota(userMessageId);
-          }
-
-          let streamSuccess = false;
-          try {
-            streamSuccess = await handleLocalAgentStream(
-              event,
-              req,
-              abortController,
-              {
-                placeholderMessageId: placeholderAssistantMessage.id,
-                systemPrompt,
-                dyadRequestId: dyadRequestId ?? "[no-request-id]",
-                messageOverride: isSummarizeIntent ? chatMessages : undefined,
-                settingsOverride: settings,
-                freeModelMode,
-                referencedApps: referencedAppsForAgent,
-                currentTurnHasOnDiskAttachment:
-                  hasScriptReadableAttachment(storedAttachments),
-              },
-            );
-          } finally {
-            // If the stream failed, was aborted, or threw, refund the quota
-            if (isBasicAgentModeRequest && userMessageId && !streamSuccess) {
-              await unmarkMessageAsUsingFreeAgentQuota(userMessageId);
-            }
-          }
-
+          finishedNaturally = streamSuccess;
           return;
         }
 
-        // Use MCP agent code path if:
-        // 1. The enableMcpServersForBuildMode experiment is on AND
-        // 2. Mode is "build" AND there are enabled MCP servers
-        if (
-          settings.enableMcpServersForBuildMode &&
-          selectedChatMode === "build"
-        ) {
-          const tools = await getMcpTools(event, req.chatId);
-          const hasEnabledMcpServers = Object.keys(tools).length > 0;
-
-          // Only run MCP agent path if build mode has enabled MCP servers
-          if (hasEnabledMcpServers) {
-            const { fullStream } = await simpleStreamText({
-              chatMessages: limitedHistoryChatMessages,
-              modelClient,
-              tools: {
-                ...tools,
-                "generate-code": {
-                  description:
-                    "ALWAYS use this tool whenever generating or editing code for the codebase.",
-                  inputSchema: z.object({}),
-                  execute: async () => "",
-                },
-              },
-              systemPromptOverride: constructSystemPrompt({
-                aiRules: await readAiRules(
-                  getDyadAppPath(updatedChat.app.path),
-                ),
-                chatMode: "build",
-                enableTurboEditsV2: false,
-                freeModelMode,
-                frameworkType,
-                hasSupabaseProject: !!updatedChat.app?.supabaseProjectId,
-              }),
-              files: files,
-              dyadDisableFiles: true,
-            });
-
-            const result = await processStreamChunks({
-              fullStream,
-              fullResponse,
-              abortController,
-              chatId: req.chatId,
-              processResponseChunkUpdate,
-            });
-            fullResponse = result.fullResponse;
-            chatMessages.push({
-              role: "assistant",
-              content: fullResponse,
-            });
-            chatMessages.push({
-              role: "user",
-              content: "OK.",
-            });
-          }
-        }
+        let modelRefused = false;
 
         // When calling streamText, the messages need to be properly formatted for mixed content
-        const { fullStream } = await simpleStreamText({
-          chatMessages,
-          modelClient,
-          files: files,
-        });
+        const fullStream = modelRefused
+          ? createEmptyTextStream()
+          : (
+              await simpleStreamText({
+                chatMessages,
+                modelClient,
+                files: files,
+              })
+            ).fullStream;
 
         // Process the stream as before
         try {
@@ -1566,8 +3196,11 @@ This conversation includes one or more image attachments. When the user uploads 
             processResponseChunkUpdate,
           });
           fullResponse = result.fullResponse;
+          if (result.modelRefused) {
+            modelRefused = true;
+          }
 
-          if (isTurboEditsV2Enabled(settings)) {
+          if (!modelRefused && isTurboEditsV2Enabled(settings)) {
             let issues = await dryRunSearchReplace({
               fullResponse,
               appPath: getDyadAppPath(updatedChat.app.path),
@@ -1615,9 +3248,7 @@ This conversation includes one or more image attachments. When the user uploads 
               searchReplaceFixAttempts++;
               const userPrompt = {
                 role: "user",
-                content: `${fixSearchReplacePrompt}
-                
-${formattedSearchReplaceIssues}`,
+                content: `${fixSearchReplacePrompt}\n\n${formattedSearchReplaceIssues}`,
               } as const;
 
               const { fullStream: fixSearchReplaceStream } =
@@ -1641,6 +3272,10 @@ ${formattedSearchReplaceIssues}`,
                 processResponseChunkUpdate,
               });
               fullResponse = result.fullResponse;
+              if (result.modelRefused) {
+                modelRefused = true;
+                break;
+              }
               previousAttempts.push({
                 role: "assistant",
                 content: removeNonEssentialTags(result.incrementalResponse),
@@ -1665,6 +3300,7 @@ ${formattedSearchReplaceIssues}`,
           }
 
           if (
+            !modelRefused &&
             !abortController.signal.aborted &&
             hasUnclosedDyadWrite(fullResponse)
           ) {
@@ -1696,148 +3332,27 @@ ${formattedSearchReplaceIssues}`,
                 modelClient,
                 files: files,
               });
-              for await (const part of contStream) {
-                // If the stream was aborted, exit early
-                if (abortController.signal.aborted) {
-                  logger.log(`Stream for chat ${req.chatId} was aborted`);
-                  break;
-                }
-                if (part.type !== "text-delta") continue; // ignore reasoning for continuation
-                fullResponse += part.text;
-                fullResponse = cleanFullResponse(fullResponse);
-                fullResponse = await processResponseChunkUpdate({
-                  fullResponse,
-                });
-              }
-            }
-          }
-          const addDependencies = getDyadAddDependencyTags(fullResponse);
-          if (
-            !abortController.signal.aborted &&
-            // If there are dependencies, we don't want to auto-fix problems
-            // because there's going to be type errors since the packages aren't
-            // installed yet.
-            addDependencies.length === 0 &&
-            settings.enableAutoFixProblems
-          ) {
-            try {
-              // IF auto-fix is enabled
-              let problemReport = await generateProblemReport({
+              const result = await processStreamChunks({
+                fullStream: contStream,
                 fullResponse,
-                appPath: getDyadAppPath(updatedChat.app.path),
+                abortController,
+                chatId: req.chatId,
+                processResponseChunkUpdate,
+                includeReasoning: false,
               });
-
-              let autoFixAttempts = 0;
-              const originalFullResponse = fullResponse;
-              const previousAttempts: ModelMessage[] = [];
-              while (
-                problemReport.problems.length > 0 &&
-                autoFixAttempts < 2 &&
-                !abortController.signal.aborted
-              ) {
-                fullResponse += `<dyad-problem-report summary="${problemReport.problems.length} problems">
-${problemReport.problems
-  .map(
-    (problem) =>
-      `<problem file="${escapeXmlAttr(problem.file)}" line="${problem.line}" column="${problem.column}" code="${problem.code}">${escapeXmlContent(problem.message)}</problem>`,
-  )
-  .join("\n")}
-</dyad-problem-report>`;
-
-                logger.info(
-                  `Attempting to auto-fix problems, attempt #${autoFixAttempts + 1}`,
-                );
-                autoFixAttempts++;
-                const problemFixPrompt = createProblemFixPrompt(problemReport);
-
-                const virtualFileSystem = new AsyncVirtualFileSystem(
-                  getDyadAppPath(updatedChat.app.path),
-                  {
-                    fileExists: (fileName: string) => fileExists(fileName),
-                    readFile: (fileName: string) => readFileWithCache(fileName),
-                  },
-                );
-                const writeTags = getDyadWriteTags(fullResponse);
-                const renameTags = getDyadRenameTags(fullResponse);
-                const deletePaths = getDyadDeleteTags(fullResponse);
-                virtualFileSystem.applyResponseChanges({
-                  deletePaths,
-                  renameTags,
-                  writeTags,
-                });
-
-                const { formattedOutput: codebaseInfo, files } =
-                  await extractCodebase({
-                    appPath,
-                    chatContext,
-                    virtualFileSystem,
-                  });
-                const { modelClient } = await getModelClient(
-                  settings.selectedModel,
-                  settings,
-                );
-
-                const { fullStream } = await simpleStreamText({
-                  modelClient,
-                  files: files,
-                  chatMessages: [
-                    ...chatMessages.map((msg, index) => {
-                      if (
-                        index === 0 &&
-                        msg.role === "user" &&
-                        typeof msg.content === "string" &&
-                        msg.content.startsWith(CODEBASE_PROMPT_PREFIX)
-                      ) {
-                        return {
-                          role: "user",
-                          content: createCodebasePrompt(codebaseInfo),
-                        } as const;
-                      }
-                      return msg;
-                    }),
-                    {
-                      role: "assistant",
-                      content: removeNonEssentialTags(originalFullResponse),
-                    },
-                    ...previousAttempts,
-                    { role: "user", content: problemFixPrompt },
-                  ],
-                });
-                previousAttempts.push({
-                  role: "user",
-                  content: problemFixPrompt,
-                });
-                const result = await processStreamChunks({
-                  fullStream,
-                  fullResponse,
-                  abortController,
-                  chatId: req.chatId,
-                  processResponseChunkUpdate,
-                });
-                fullResponse = result.fullResponse;
-                previousAttempts.push({
-                  role: "assistant",
-                  content: removeNonEssentialTags(result.incrementalResponse),
-                });
-
-                problemReport = await generateProblemReport({
-                  fullResponse,
-                  appPath: getDyadAppPath(updatedChat.app.path),
-                });
+              fullResponse = result.fullResponse;
+              if (result.modelRefused) {
+                modelRefused = true;
+                break;
               }
-            } catch (error) {
-              logger.error(
-                "Error generating problem report or auto-fixing:",
-                settings.enableAutoFixProblems,
-                error,
-              );
             }
           }
         } catch (streamError) {
           // Check if this was an abort error
           if (abortController.signal.aborted) {
             const chatId = req.chatId;
-            const partialResponse = partialResponses.get(req.chatId) ?? "";
+            const partialResponse =
+              takePartialResponseForStream(abortController);
             try {
               // Update the placeholder assistant message with the partial content and cancellation note
               await db
@@ -1850,7 +3365,6 @@ ${problemReport.problems
               logger.log(
                 `Updated cancelled response for placeholder message ${placeholderAssistantMessage.id} in chat ${chatId}`,
               );
-              partialResponses.delete(req.chatId);
             } catch (error) {
               logger.error(
                 `Error saving partial response for chat ${chatId}:`,
@@ -1866,7 +3380,7 @@ ${problemReport.problems
       // If the stream was aborted but didn't throw (e.g. stream ended gracefully),
       // save the cancellation notice to the placeholder message.
       if (abortController.signal.aborted) {
-        const partialResponse = partialResponses.get(req.chatId) ?? "";
+        const partialResponse = takePartialResponseForStream(abortController);
         try {
           await db
             .update(messages)
@@ -1874,7 +3388,8 @@ ${problemReport.problems
               content: appendCancelledResponseNotice(partialResponse),
             })
             .where(eq(messages.id, placeholderAssistantMessage.id));
-          partialResponses.delete(req.chatId);
+          // Settled (cancelled): index this turn's messages for chat search
+          scheduleChatSearchIndexing();
         } catch (error) {
           logger.error(
             `Error saving cancelled response for chat ${req.chatId}:`,
@@ -1883,6 +3398,9 @@ ${problemReport.problems
         }
       }
 
+      // PROTOCOL-GROUNDED REGION: handler terminal emission, outer catch,
+      // guarded transport end, and completion resolution. Keep in sync with
+      // src/chat_stream/host_transition.ts.
       // Only save the response and process it if we weren't aborted
       if (!abortController.signal.aborted && fullResponse) {
         // Scrape from: <dyad-chat-summary>Renaming profile file</dyad-chat-title>
@@ -1902,6 +3420,8 @@ ${problemReport.problems
           .update(messages)
           .set({ content: fullResponse })
           .where(eq(messages.id, placeholderAssistantMessage.id));
+        // Settled: index this turn's messages for chat search
+        scheduleChatSearchIndexing();
         const latestSettings = readSettings();
         const shouldAutoApply =
           latestSettings.autoApproveChanges && selectedChatMode !== "ask";
@@ -1917,6 +3437,7 @@ ${problemReport.problems
             {
               chatSummary,
               messageId: placeholderAssistantMessage.id,
+              signal: abortController.signal,
             }, // Use placeholder ID
           );
 
@@ -1924,87 +3445,154 @@ ${problemReport.problems
             where: eq(chats.id, req.chatId),
             with: {
               messages: {
-                orderBy: (messages, { asc }) => [asc(messages.createdAt)],
+                columns: rendererMessageColumns,
+                orderBy: (messages, { asc }) => [
+                  asc(messages.createdAt),
+                  asc(messages.id),
+                ],
               },
             },
           });
 
-          safeSend(event.sender, "chat:response:chunk", {
+          sendChatChunk(event.sender, {
             chatId: req.chatId,
-            messages: chat!.messages,
-          });
+            invocationRef: req.invocationRef,
+            streamId: req.streamId,
+            messages: toRendererMessages(chat!.messages),
+          } satisfies ChatStreamChunkPayload);
 
           if (status.error) {
             safeSend(event.sender, "chat:response:error", {
               chatId: req.chatId,
+              invocationRef: req.invocationRef,
+              streamId: req.streamId,
               error: `Sorry, there was an error applying the AI's changes: ${status.error}`,
               warningMessages: status.warningMessages,
-            });
+            } satisfies ChatStreamErrorPayload);
           }
 
           // Signal that the stream has completed
-          safeSend(event.sender, "chat:response:end", {
+          const terminalResponse = {
             chatId: req.chatId,
+            invocationRef: req.invocationRef,
+            streamId: req.streamId,
             updatedFiles: status.updatedFiles ?? false,
             extraFiles: status.extraFiles,
             extraFilesError: status.extraFilesError,
             warningMessages: status.warningMessages,
             chatSummary,
-          } satisfies ChatResponseEnd);
+          } satisfies ChatStreamEndPayload;
+          safeSend(event.sender, "chat:response:end", terminalResponse);
         } else {
-          safeSend(event.sender, "chat:response:end", {
+          const terminalResponse = {
             chatId: req.chatId,
+            invocationRef: req.invocationRef,
+            streamId: req.streamId,
             updatedFiles: false,
             chatSummary,
-          } satisfies ChatResponseEnd);
+          } satisfies ChatStreamEndPayload;
+          safeSend(event.sender, "chat:response:end", terminalResponse);
         }
       }
 
       // Return the chat ID for backwards compatibility
+      finishedNaturally = true;
       return req.chatId;
     } catch (error) {
       logger.error("Error calling LLM:", error);
+      const errorMessage = isDyadError(error) ? error.message : String(error);
+      const rendererError =
+        error instanceof SubscriptionBillingError
+          ? error.serialize()
+          : `Sorry, there was an error processing your request: ${errorMessage}`;
       safeSend(event.sender, "chat:response:error", {
         chatId: req.chatId,
-        error: `Sorry, there was an error processing your request: ${error}`,
-      });
+        invocationRef: req.invocationRef,
+        streamId: req.streamId,
+        error: rendererError,
+      } satisfies ChatStreamErrorPayload);
 
       return "error";
     } finally {
+      if (freeAgentQuotaReservationId !== null) {
+        try {
+          await releaseFreeAgentQuotaSlot(freeAgentQuotaReservationId);
+        } catch (error) {
+          logger.error("Failed to release pending Basic Agent quota", error);
+        }
+      }
+      if (reservedFreeAgentQuotaMessageId !== null) {
+        try {
+          await unmarkMessageAsUsingFreeAgentQuota(
+            reservedFreeAgentQuotaMessageId,
+          );
+        } catch (error) {
+          logger.error("Failed to refund reserved Basic Agent quota", error);
+        }
+      }
+      if (mutatedPersistedChat) {
+        queryInvalidationBus.publish(
+          [{ family: "chats" }, { family: "chat", chatId: req.chatId }],
+          {
+            originEndpoint: event.sender,
+            // Every terminal path refreshes the origin's list; detail must
+            // still be invalidated on errors/cancellation.
+            originHandledScopes: [{ family: "chats" }],
+          },
+        );
+      }
+      releaseChatProducerInterest(event.sender, req.chatId);
       // Clean up the abort controller
-      activeStreams.delete(req.chatId);
+      if (trackedStream) {
+        removeTrackedValue(activeStreams, req.chatId, trackedStream);
+        removeTrackedValue(admittedStreams, req.chatId, trackedStream);
+      }
+      admissionPendingStreams.delete(abortController);
+      partialResponses.delete(abortController);
 
-      // Notify renderer that stream has ended
-      safeSend(event.sender, "chat:stream:end", { chatId: req.chatId });
-      // Unblock any pending MCP consents (their banners are cleared on stream end).
-      clearPendingMcpConsentsForChat(req.chatId);
+      // Notify renderer that stream has ended. When the stream was cancelled,
+      // `cancelTrackedStreams` is the sole sender of the end events (it emits
+      // both `chat:response:end` with `wasCancelled` and `chat:stream:end`
+      // as soon as it aborts this stream). Sending `chat:stream:end` here too
+      // would deliver a duplicate end event to the renderer, so skip it on the
+      // aborted path.
+      if (!abortController.signal.aborted) {
+        safeSend(event.sender, "chat:stream:end", {
+          chatId: req.chatId,
+        } satisfies ChatStreamTransportEndPayload);
+      }
+      if (!replayedAcceptedFollowUp) {
+        if (finishedNaturally) {
+          userInputRegistry.streamFinished(req.chatId);
+        } else if (!activeStreams.has(req.chatId)) {
+          // Errors and cancellation sweep pending user inputs; only successful
+          // natural completion can arm a follow-up dispatch.
+          // A memory-owned follow-up stays due on dispatch failure. Sweeping
+          // it here would prevent renderer focus/remount from retrying it.
+          userInputRegistry.sweepChat(req.chatId, req.userInputRequestId);
+        }
+      }
+
+      // Signal any awaiting `cancelStream` call that all writes have settled,
+      // then drop the (now-resolved) completion promise for this chat. Resolve
+      // before deleting so a reader that consults the map after the abort still
+      // observes a settled promise rather than a missing entry.
+      resolveCompletion();
+      removeTrackedValue(streamCompletions, req.chatId, completion);
     }
-  });
+  };
+  internalChatStreamHandler = chatStreamHandler;
 
   // Handler to cancel an ongoing stream
   createTypedHandler(chatContracts.cancelStream, async (event, chatId) => {
-    const abortController = activeStreams.get(chatId);
-
-    if (abortController) {
-      // Abort the stream
-      abortController.abort();
-      activeStreams.delete(chatId);
-      logger.log(`Aborted stream for chat ${chatId}`);
-    } else {
+    const cancelled = await cancelTrackedStreams(
+      [chatId],
+      event.sender,
+      "chat-stop",
+    );
+    if (!cancelled) {
       logger.warn(`No active stream found for chat ${chatId}`);
     }
-
-    // Send the end event to the renderer with wasCancelled flag
-    safeSend(event.sender, "chat:response:end", {
-      chatId,
-      updatedFiles: false,
-      wasCancelled: true,
-    } satisfies ChatResponseEnd);
-
-    // Also emit stream:end so cleanup listeners (e.g., pending agent consents) fire
-    safeSend(event.sender, "chat:stream:end", { chatId });
-    // Unblock any pending MCP consents (their banners are cleared on stream end).
-    clearPendingMcpConsentsForChat(chatId);
 
     return true;
   });
@@ -2084,9 +3672,11 @@ async function prepareMessageWithAttachments(
   {
     includeImageAttachments = true,
     inlineTextAttachments = true,
+    pdfFileParts = [],
   }: {
     includeImageAttachments?: boolean;
     inlineTextAttachments?: boolean;
+    pdfFileParts?: FilePart[];
   } = {},
 ): Promise<ModelMessage> {
   let textContent = message.content;
@@ -2111,7 +3701,7 @@ async function prepareMessageWithAttachments(
   }
 
   // For user messages with attachments, create a content array
-  const contentParts: (TextPart | ImagePart)[] = [];
+  const contentParts: (TextPart | ImagePart | FilePart)[] = [];
 
   // Add the text part first with possibly modified content
   contentParts.push({
@@ -2145,6 +3735,8 @@ async function prepareMessageWithAttachments(
       }
     }
   }
+
+  contentParts.push(...pdfFileParts);
 
   // Return the message with the content array
   return {
@@ -2218,69 +3810,4 @@ These are the other apps that I've mentioned in my prompt. These other apps' cod
 
 ${otherAppsCodebaseInfo}
 `;
-}
-
-async function getMcpTools(
-  event: IpcMainInvokeEvent,
-  chatId: number,
-): Promise<ToolSet> {
-  const mcpToolSet: ToolSet = {};
-  try {
-    const servers = await db
-      .select()
-      .from(mcpServers)
-      .where(eq(mcpServers.enabled, true as any));
-    for (const s of servers) {
-      // One bad server (e.g. unconnected OAuth) must not strip tools
-      // from every later enabled server in the same agent run.
-      const toolSet = await (async () => {
-        try {
-          const client = await mcpManager.getClient(s.id);
-          return await client.tools();
-        } catch (e) {
-          logger.warn(
-            `Failed to load tools for MCP server ${s.id} (${s.name})`,
-            e,
-          );
-          return null;
-        }
-      })();
-      if (!toolSet) continue;
-      for (const [name, mcpTool] of Object.entries(toolSet)) {
-        const key = `${String(s.name || "").replace(/[^a-zA-Z0-9_-]/g, "-")}__${String(name).replace(/[^a-zA-Z0-9_-]/g, "-")}`;
-        mcpToolSet[key] = {
-          description: mcpTool.description,
-          inputSchema: mcpTool.inputSchema,
-          execute: async (args: unknown, execCtx: ToolExecutionOptions) => {
-            const inputPreview =
-              typeof args === "string"
-                ? args
-                : Array.isArray(args)
-                  ? args.join(" ")
-                  : JSON.stringify(args).slice(0, 500);
-            const { approved } = await requireMcpToolConsent(event, {
-              serverId: s.id,
-              serverName: s.name,
-              toolName: name,
-              toolDescription: mcpTool.description,
-              inputPreview,
-              chatId,
-            });
-
-            if (!approved)
-              throw new DyadError(
-                `User declined running tool ${key}`,
-                DyadErrorKind.UserCancelled,
-              );
-            const res = await mcpTool.execute(args, execCtx);
-
-            return typeof res === "string" ? res : JSON.stringify(res);
-          },
-        };
-      }
-    }
-  } catch (e) {
-    logger.warn("Failed building MCP toolset", e);
-  }
-  return mcpToolSet;
 }

@@ -7,46 +7,21 @@ import type { Version } from "@/ipc/types";
 import { queryKeys } from "@/lib/queryKeys";
 import { useVersions } from "./useVersions";
 
-const {
-  getChatMock,
-  listVersionsMock,
-  restartAppMock,
-  revertVersionMock,
-  setVersionFavoriteMock,
-  setVersionNoteMock,
-} = vi.hoisted(() => ({
-  getChatMock: vi.fn(),
-  listVersionsMock: vi.fn(),
-  restartAppMock: vi.fn(),
-  revertVersionMock: vi.fn(),
-  setVersionFavoriteMock: vi.fn(),
-  setVersionNoteMock: vi.fn(),
-}));
+const { listVersionsMock, setVersionFavoriteMock, setVersionNoteMock } =
+  vi.hoisted(() => ({
+    listVersionsMock: vi.fn(),
+    setVersionFavoriteMock: vi.fn(),
+    setVersionNoteMock: vi.fn(),
+  }));
 
 vi.mock("@/ipc/types", () => ({
   ipc: {
-    chat: {
-      getChat: getChatMock,
-    },
     version: {
       listVersions: listVersionsMock,
-      revertVersion: revertVersionMock,
       setVersionFavorite: setVersionFavoriteMock,
       setVersionNote: setVersionNoteMock,
     },
   },
-}));
-
-vi.mock("./useRunApp", () => ({
-  useRunApp: () => ({
-    restartApp: restartAppMock,
-  }),
-}));
-
-vi.mock("./useSettings", () => ({
-  useSettings: () => ({
-    settings: undefined,
-  }),
 }));
 
 function makeWrapper(queryClient: QueryClient) {
@@ -65,12 +40,10 @@ function makeWrapper(queryClient: QueryClient) {
 
 describe("useVersions", () => {
   beforeEach(() => {
-    getChatMock.mockReset();
     listVersionsMock.mockReset();
-    restartAppMock.mockReset();
-    revertVersionMock.mockReset();
     setVersionFavoriteMock.mockReset();
     setVersionNoteMock.mockReset();
+    listVersionsMock.mockResolvedValue([]);
   });
 
   it("updates the versions query cache after saving a note", async () => {

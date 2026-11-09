@@ -4,23 +4,29 @@ import type { PropsWithChildren } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { selectedAppIdAtom } from "@/atoms/appAtoms";
-import {
-  currentPackageManagerWarningAtom,
-  setPackageManagerWarningForAppAtom,
-} from "@/atoms/previewRuntimeAtoms";
 import { PackageManagerWarningBanner } from "./PackageManagerWarningBanner";
+import { PackageManagerWarningStore } from "@/package_manager_warnings/store";
+import { PackageManagerWarningProvider } from "@/package_manager_warnings/PackageManagerWarningProvider";
 
 const {
+  appRunState,
   getNodejsStatusMock,
   installPnpmMock,
   openExternalUrlMock,
   rebuildAppAfterPnpmInstallMock,
+  restartAppMock,
+  stopAppMock,
+  executeAppUpgradeMock,
   updateSettingsMock,
 } = vi.hoisted(() => ({
+  appRunState: { loading: false },
   getNodejsStatusMock: vi.fn(),
   installPnpmMock: vi.fn(),
   openExternalUrlMock: vi.fn(),
   rebuildAppAfterPnpmInstallMock: vi.fn(),
+  restartAppMock: vi.fn(),
+  stopAppMock: vi.fn(),
+  executeAppUpgradeMock: vi.fn(),
   updateSettingsMock: vi.fn(),
 }));
 
@@ -30,6 +36,9 @@ vi.mock("@/ipc/types", () => ({
       getNodejsStatus: getNodejsStatusMock,
       installPnpm: installPnpmMock,
       openExternalUrl: openExternalUrlMock,
+    },
+    upgrade: {
+      executeAppUpgrade: executeAppUpgradeMock,
     },
   },
 }));
@@ -42,16 +51,28 @@ vi.mock("@/hooks/useSettings", () => ({
 
 vi.mock("@/hooks/useRunApp", () => ({
   useRebuildAppAfterPnpmInstall: () => rebuildAppAfterPnpmInstallMock,
+  useRunApp: () => ({
+    loading: appRunState.loading,
+    restartApp: restartAppMock,
+    stopApp: stopAppMock,
+  }),
 }));
 
 describe("PackageManagerWarningBanner", () => {
   beforeEach(() => {
     vi.useFakeTimers();
+    appRunState.loading = false;
     getNodejsStatusMock.mockReset();
     installPnpmMock.mockReset();
     openExternalUrlMock.mockReset();
     rebuildAppAfterPnpmInstallMock.mockReset();
+    restartAppMock.mockReset();
+    stopAppMock.mockReset();
+    executeAppUpgradeMock.mockReset();
     updateSettingsMock.mockReset();
+    executeAppUpgradeMock.mockResolvedValue(undefined);
+    restartAppMock.mockResolvedValue(undefined);
+    stopAppMock.mockResolvedValue(undefined);
     getNodejsStatusMock.mockResolvedValue({
       nodeVersion: "v22.14.0",
       pnpmVersion: "10.15.0",
@@ -69,14 +90,19 @@ describe("PackageManagerWarningBanner", () => {
     vi.useRealTimers();
   });
 
-  function renderBanner() {
+  function renderBanner({
+    kind = "release-age",
+    message = "Install pnpm 10.16.0 or newer for the strongest protection",
+  }: {
+    kind?: "release-age" | "pnpm-migration";
+    message?: string;
+  } = {}) {
     const store = createStore();
+    const warningStore = new PackageManagerWarningStore();
     store.set(selectedAppIdAtom, 1);
-    store.set(setPackageManagerWarningForAppAtom, {
-      appId: 1,
-      warning: {
-        message: "Install pnpm 10.16.0 or newer for the strongest protection",
-      },
+    warningStore.setWarning(1, {
+      kind,
+      message,
     });
 
     const queryClient = new QueryClient({
@@ -89,25 +115,29 @@ describe("PackageManagerWarningBanner", () => {
 
     const Wrapper = ({ children }: PropsWithChildren) => (
       <QueryClientProvider client={queryClient}>
-        <Provider store={store}>{children}</Provider>
+        <Provider store={store}>
+          <PackageManagerWarningProvider manager={warningStore}>
+            {children}
+          </PackageManagerWarningProvider>
+        </Provider>
       </QueryClientProvider>
     );
 
     render(<PackageManagerWarningBanner />, { wrapper: Wrapper });
-    return store;
+    return { store, warningStore };
   }
 
   it("dismisses the warning for the current session", () => {
-    const store = renderBanner();
+    const { warningStore } = renderBanner();
 
     fireEvent.click(screen.getByLabelText("Dismiss pnpm warning"));
 
     expect(updateSettingsMock).not.toHaveBeenCalled();
-    expect(store.get(currentPackageManagerWarningAtom)).toBeUndefined();
+    expect(warningStore.getSnapshot(1)).toBeUndefined();
   });
 
   it("only shows the warning for the selected app", () => {
-    const store = renderBanner();
+    const { store } = renderBanner();
 
     act(() => {
       store.set(selectedAppIdAtom, 2);
@@ -125,7 +155,7 @@ describe("PackageManagerWarningBanner", () => {
   });
 
   it("installs pnpm, rebuilds the app, and clears the banner after success", async () => {
-    const store = renderBanner();
+    const { warningStore } = renderBanner();
 
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: /install/i }));
@@ -143,11 +173,11 @@ describe("PackageManagerWarningBanner", () => {
       vi.advanceTimersByTime(2_000);
     });
 
-    expect(store.get(currentPackageManagerWarningAtom)).toBeUndefined();
+    expect(warningStore.getSnapshot(1)).toBeUndefined();
   });
 
   it("resets install state when a new warning is shown", async () => {
-    const store = renderBanner();
+    const { warningStore } = renderBanner();
 
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: /install/i }));
@@ -158,11 +188,9 @@ describe("PackageManagerWarningBanner", () => {
     });
 
     act(() => {
-      store.set(setPackageManagerWarningForAppAtom, {
-        appId: 1,
-        warning: {
-          message: "Install pnpm 10.16.0 or newer for the strongest protection",
-        },
+      warningStore.setWarning(1, {
+        kind: "release-age",
+        message: "Install pnpm 10.16.0 or newer for the strongest protection",
       });
     });
 
@@ -221,5 +249,71 @@ describe("PackageManagerWarningBanner", () => {
       "https://example.com/node.pkg",
     );
     expect(installPnpmMock).not.toHaveBeenCalled();
+  });
+
+  it("stops the app before running the pnpm migration upgrade", async () => {
+    renderBanner({
+      kind: "pnpm-migration",
+      message:
+        "This app pins an older pnpm that can't read the lockfile Dyad writes.",
+    });
+
+    expect(screen.queryByRole("button", { name: /install/i })).toBeNull();
+
+    await act(async () => {
+      fireEvent.click(
+        screen.getByTestId("package-manager-warning-run-upgrade"),
+      );
+      await Promise.resolve();
+    });
+
+    expect(stopAppMock).toHaveBeenCalledWith(1);
+    expect(executeAppUpgradeMock).toHaveBeenCalledWith({
+      appId: 1,
+      upgradeId: "pnpm-version-migration",
+    });
+    expect(restartAppMock).toHaveBeenCalledTimes(1);
+    expect(installPnpmMock).not.toHaveBeenCalled();
+
+    expect(stopAppMock.mock.invocationCallOrder[0]).toBeLessThan(
+      executeAppUpgradeMock.mock.invocationCallOrder[0],
+    );
+    expect(executeAppUpgradeMock.mock.invocationCallOrder[0]).toBeLessThan(
+      restartAppMock.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("waits for the active app lifecycle before starting migration", () => {
+    appRunState.loading = true;
+    renderBanner({
+      kind: "pnpm-migration",
+      message:
+        "This app pins an older pnpm that can't read the lockfile Dyad writes.",
+    });
+
+    const migrateButton = screen.getByTestId(
+      "package-manager-warning-run-upgrade",
+    ) as HTMLButtonElement;
+    expect(migrateButton.disabled).toBe(true);
+  });
+
+  it("keeps release-age warnings ahead of pnpm migration warnings", () => {
+    const { warningStore } = renderBanner({
+      kind: "pnpm-migration",
+      message: "Migrate to pnpm 11",
+    });
+
+    act(() => {
+      warningStore.setWarning(1, {
+        kind: "release-age",
+        message: "Install pnpm 10.16.0 or newer",
+      });
+      warningStore.setWarning(1, {
+        kind: "pnpm-migration",
+        message: "Migrate to pnpm 11",
+      });
+    });
+
+    screen.getByText("Install pnpm 10.16.0 or newer");
   });
 });

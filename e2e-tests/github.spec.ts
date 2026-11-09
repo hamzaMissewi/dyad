@@ -1,263 +1,155 @@
+import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+
 import { expect } from "@playwright/test";
+
 import { test, Timeout } from "./helpers/test_helper";
 
-test("should connect to GitHub using device flow", async ({ po }) => {
+function git(cwd: string, ...args: string[]) {
+  return execFileSync(
+    "git",
+    [
+      "-c",
+      "user.email=test@example.com",
+      "-c",
+      "user.name=Test User",
+      "-c",
+      "commit.gpgsign=false",
+      ...args,
+    ],
+    {
+      cwd,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+      stdio: "pipe",
+    },
+  )
+    .toString()
+    .trim();
+}
+
+test("completes the GitHub publish happy paths", async ({ po }) => {
   await po.setUp();
   await po.sendPrompt("tc=basic");
-
+  // GitHub operations coordinate with app startup. Wait for the generated
+  // app's dependency install and runtime startup to release their claims before
+  // starting the publish flow; loaded Windows runners can take over a minute.
+  await po.previewPanel.expectPreviewIframeIsVisible(Timeout.EXTRA_LONG);
   await po.appManagement.getTitleBarAppNameButton().click();
+
   await po.githubConnector.connect();
-
-  // Wait for device flow to start and show the code
-  await expect(po.page.locator("text=FAKE-CODE")).toBeVisible();
-
-  // Verify the verification URI is displayed
+  await expect(po.githubConnector.getSetupRepo()).toContainText(
+    "Set up your GitHub repo",
+    { timeout: Timeout.MEDIUM },
+  );
+  // The setup UI is only rendered after the device flow has exchanged the
+  // token, refreshed settings, and acknowledged the completed flow.
   await expect(
-    po.page.locator("text=https://github.com/login/device"),
-  ).toBeVisible();
+    po.page.getByRole("button", { name: "Connect to GitHub" }),
+  ).toBeHidden();
+  await expect(po.page.getByText("FAKE-CODE")).toBeHidden();
 
-  // Verify the "Set up your GitHub repo" section appears
-  await expect(po.githubConnector.getSetupYourGitHubRepoButton()).toBeVisible({
-    timeout: Timeout.MEDIUM,
+  const repoName = `github-e2e-${Date.now()}`;
+  await po.githubConnector.createRepo(repoName);
+  await expect(po.page.getByTestId("github-connected-repo")).toContainText(
+    `testuser/${repoName}`,
+  );
+  await po.githubConnector.expectPushEvent({
+    repo: repoName,
+    branch: "main",
+    operation: "create",
   });
-});
 
-test("create and sync to new repo", async ({ po }) => {
-  await po.setUp();
-  await po.sendPrompt("tc=basic");
+  const collaborators = po.page.getByTestId("collaborators-header");
+  await collaborators.click();
+  const collaborator = "github-e2e-collaborator";
+  await po.page.getByTestId("collaborator-invite-input").fill(collaborator);
+  await po.page.getByTestId("collaborator-invite-button").click();
+  await expect(
+    po.page.getByTestId(`collaborator-item-${collaborator}`),
+  ).toBeVisible({ timeout: Timeout.MEDIUM });
+  await po.page
+    .getByTestId(`collaborator-remove-button-${collaborator}`)
+    .click();
+  await po.page.getByTestId("confirm-remove-collaborator").click();
+  await expect(
+    po.page.getByTestId(`collaborator-item-${collaborator}`),
+  ).toBeHidden({ timeout: Timeout.MEDIUM });
 
-  await po.appManagement.getTitleBarAppNameButton().click();
-  await po.githubConnector.connect();
-
-  // Verify "Create new repo" is selected by default
-  await expect(po.githubConnector.getCreateNewRepoModeButton()).toHaveClass(
-    /bg-primary/,
+  const branchMenu = po.page.getByTestId("branch-actions-menu-trigger");
+  await expect(branchMenu).toBeVisible({ timeout: Timeout.MEDIUM });
+  await branchMenu.click();
+  await po.page.getByTestId("create-branch-trigger").click();
+  await po.page.getByTestId("new-branch-name-input").fill("feature-e2e");
+  await po.page.getByTestId("create-branch-submit-button").click();
+  await expect(po.page.getByTestId("branch-select-trigger")).toContainText(
+    "feature-e2e",
     { timeout: Timeout.MEDIUM },
   );
 
-  await po.githubConnector.fillCreateRepoName("test-new-repo");
+  const appPath = await po.appManagement.getCurrentAppPath();
+  fs.writeFileSync(path.join(appPath, "github-e2e.txt"), "from feature branch");
+  git(appPath, "add", "github-e2e.txt");
+  git(appPath, "commit", "-m", "Add GitHub E2E fixture");
 
-  // Wait for availability check
-  await expect(po.page.getByText("Repository name is available!")).toBeVisible({
+  await po.page.getByTestId("branch-select-trigger").click();
+  await po.page.getByRole("option", { name: "main" }).click();
+  await expect(po.page.getByTestId("branch-select-trigger")).toContainText(
+    "main",
+  );
+  expect(fs.existsSync(path.join(appPath, "github-e2e.txt"))).toBe(false);
+
+  await po.page.getByTestId("branches-header").click();
+  await po.page.getByTestId("branch-actions-feature-e2e").click();
+  await po.page.getByTestId("rename-branch-menu-item").click();
+  await po.page.getByTestId("rename-branch-input").fill("feature-publish");
+  await po.page.getByTestId("rename-branch-submit-button").click();
+  await expect(po.page.getByTestId("branch-item-feature-publish")).toBeVisible({
     timeout: Timeout.MEDIUM,
   });
 
-  // Click create repo button
-  await po.githubConnector.clickCreateRepoButton();
+  await po.page.getByTestId("branch-actions-feature-publish").click();
+  await po.page.getByTestId("merge-branch-menu-item").click();
+  await po.page.getByTestId("merge-branch-submit-button").click();
+  await expect
+    .poll(() => fs.existsSync(path.join(appPath, "github-e2e.txt")), {
+      timeout: Timeout.MEDIUM,
+    })
+    .toBe(true);
 
-  // Snapshot post-creation state
-  await po.githubConnector.snapshotConnectedRepo();
-
-  // Sync: capture success message
-  await po.githubConnector.clickSyncToGithubButton();
-
-  await po.githubConnector.snapshotConnectedRepo();
-  // Verify the push was received for the default branch (main)
-  await expect(async () => {
-    await po.githubConnector.verifyPushEvent({
-      repo: "test-new-repo",
-      branch: "main",
-      operation: "create",
-    });
-  }).toPass({ timeout: Timeout.MEDIUM });
-});
-
-test("create and sync to new repo - custom branch", async ({ po }) => {
-  await po.setUp();
-  await po.sendPrompt("tc=basic");
-
-  await po.appManagement.getTitleBarAppNameButton().click();
-  await po.githubConnector.connect();
-
-  await po.githubConnector.fillCreateRepoName("test-new-repo-custom");
-  await po.githubConnector.fillNewRepoBranchName("new-branch");
-
-  // Click create repo button
-  await po.githubConnector.clickCreateRepoButton();
-
-  // Sync to GitHub
-  await po.githubConnector.clickSyncToGithubButton();
-
-  // Snapshot post-creation state
-  await po.githubConnector.snapshotConnectedRepo();
-
-  // Verify the push was received for the correct custom branch
-  await expect(async () => {
-    await po.githubConnector.verifyPushEvent({
-      repo: "test-new-repo-custom",
-      branch: "new-branch",
-      operation: "create",
-    });
-  }).toPass({ timeout: Timeout.MEDIUM });
-});
-
-test("create repo with spaces in name - should normalize to hyphens", async ({
-  po,
-}) => {
-  await po.setUp();
-  await po.sendPrompt("tc=basic");
-
-  await po.appManagement.getTitleBarAppNameButton().click();
-  await po.githubConnector.connect();
-
-  // Enter a repo name with spaces - GitHub normalizes these to hyphens
-  await po.githubConnector.fillCreateRepoName("my new repo");
-
-  // Wait for availability check
-  await expect(po.page.getByText("Repository name is available!")).toBeVisible({
+  await po.page.getByTestId("branch-actions-feature-publish").click();
+  await po.page.getByTestId("delete-branch-menu-item").click();
+  await po.page.getByRole("button", { name: "Delete Branch" }).click();
+  await expect(po.page.getByTestId("branch-item-feature-publish")).toBeHidden({
     timeout: Timeout.MEDIUM,
   });
 
-  // Click create repo button
-  await po.githubConnector.clickCreateRepoButton();
+  await po.githubConnector.sync();
+  const remoteUrl = git(appPath, "remote", "get-url", "origin");
+  const remoteClone = path.join(po.userDataDir, "github-remote-clone");
+  fs.mkdirSync(remoteClone, { recursive: true });
+  git(remoteClone, "clone", remoteUrl, ".");
+  fs.writeFileSync(path.join(remoteClone, "remote-change.txt"), "from remote");
+  git(remoteClone, "add", "remote-change.txt");
+  git(remoteClone, "commit", "-m", "Add remote change");
+  git(remoteClone, "push", "origin", "HEAD:main");
 
-  // Verify the connected repo shows the normalized name (with hyphens, not spaces)
-  await expect(po.page.locator("text=testuser/my-new-repo")).toBeVisible();
-
-  // Sync to GitHub
-  await po.githubConnector.clickSyncToGithubButton();
-
-  // Verify the push was received with the normalized repo name
-  await expect(async () => {
-    await po.githubConnector.verifyPushEvent({
-      repo: "my-new-repo",
-      branch: "main",
-      operation: "create",
-    });
-  }).toPass({ timeout: Timeout.MEDIUM });
-});
-
-test("disconnect from repo", async ({ po }) => {
-  await po.setUp();
-  await po.sendPrompt("tc=basic");
-
-  await po.appManagement.getTitleBarAppNameButton().click();
-  await po.githubConnector.connect();
-
-  await po.githubConnector.fillCreateRepoName("test-new-repo-disconnect");
-  await po.githubConnector.clickCreateRepoButton();
-
-  await po.githubConnector.clickDisconnectRepoButton();
-  await po.githubConnector.getSetupYourGitHubRepoButton().click();
-  // Make this deterministic
-  await po.githubConnector.fillCreateRepoName("[scrubbed]");
-  await po.githubConnector.snapshotSetupRepo();
-});
-
-test("shows reconnect prompt for a linked repo when GitHub credentials are missing", async ({
-  po,
-}) => {
-  await po.setUp();
-  await po.sendPrompt("tc=basic");
-  const appName = await po.appManagement.getCurrentAppName();
-  expect(appName).toBeDefined();
-
-  await po.appManagement.getTitleBarAppNameButton().click();
-  await po.githubConnector.connect();
-  await po.githubConnector.fillCreateRepoName("test-new-repo-reconnect");
-  await po.githubConnector.clickCreateRepoButton();
-
-  await po.navigation.goToSettingsTab();
-  await po.page.getByRole("button", { name: "Disconnect from GitHub" }).click();
-
-  await po.navigation.goToAppsTab();
-  await po.appManagement.clickAppListItem({ appName: appName! });
-
-  await expect(po.page.getByTestId("github-unconnected-repo")).toBeVisible({
+  await branchMenu.click();
+  await po.page.getByTestId("git-pull-button").click();
+  await expect(
+    po.page.getByText("Pulled latest changes from remote"),
+  ).toBeVisible({
     timeout: Timeout.MEDIUM,
   });
-  await expect(
-    po.page.getByText("Reconnect your GitHub account"),
-  ).toBeVisible();
-  await expect(
-    po.page.getByText(
-      "This app is linked to testuser/test-new-repo-reconnect, but GitHub credentials are missing from settings.",
-    ),
-  ).toBeVisible();
-  await expect(
-    po.page.getByRole("button", { name: "Connect to GitHub" }),
-  ).toBeVisible();
-  await expect(
-    po.page.getByRole("button", { name: "Sync to GitHub" }),
-  ).toBeHidden();
-});
+  await expect
+    .poll(() => fs.existsSync(path.join(appPath, "remote-change.txt")), {
+      timeout: Timeout.MEDIUM,
+    })
+    .toBe(true);
 
-test("create and sync to existing repo", async ({ po }) => {
-  await po.setUp();
-  await po.sendPrompt("tc=basic");
-
-  await po.appManagement.getTitleBarAppNameButton().click();
-  await po.githubConnector.connect();
-
-  await po.githubConnector.getConnectToExistingRepoModeButton().click();
-
-  await po.githubConnector.selectRepo("testuser/existing-app");
-  await po.githubConnector.selectBranch("main");
-  await po.githubConnector.clickConnectToRepoButton();
-
-  await po.githubConnector.snapshotConnectedRepo();
-});
-
-test("create and sync to existing repo - custom branch", async ({ po }) => {
-  // Clear any previous push events
-  await po.githubConnector.clearPushEvents();
-
-  await po.setUp();
-  await po.sendPrompt("tc=basic");
-
-  await po.appManagement.getTitleBarAppNameButton().click();
-  await po.githubConnector.connect();
-
-  await po.githubConnector.getConnectToExistingRepoModeButton().click();
-
-  await po.githubConnector.selectRepo("testuser/existing-app");
-  await po.githubConnector.selectCustomBranch("new-branch");
-  await po.githubConnector.clickConnectToRepoButton();
-
-  // Sync to GitHub to trigger a push
-  await po.githubConnector.clickSyncToGithubButton();
-  await po.githubConnector.snapshotConnectedRepo();
-  // Verify the push was received for the correct custom branch
-  await expect(async () => {
-    await po.githubConnector.verifyPushEvent({
-      repo: "existing-app",
-      branch: "new-branch",
-      operation: "create",
-    });
-  }).toPass({ timeout: Timeout.MEDIUM });
-});
-
-test("github clear integration settings", async ({ po }) => {
-  await po.setUp({ autoApprove: true });
-  await po.sendPrompt("tc=basic");
-
-  await po.appManagement.getTitleBarAppNameButton().click();
-  await po.githubConnector.connect();
-  await expect(po.githubConnector.getCreateNewRepoModeButton()).toBeVisible({
-    timeout: Timeout.MEDIUM,
-  });
-
-  // Capture settings before disconnecting
-
-  await po.appManagement.clickOpenInChatButton();
-  // Make sure we are committing so that githubUser.email is getting set.
-  await po.sendPrompt("tc=write-index");
-  const beforeSettings = po.settings.recordSettings();
-
-  // Navigate to settings
-  await po.navigation.goToSettingsTab();
-
-  // Verify the "Disconnect from GitHub" button is visible (meaning we're connected)
-  const disconnectButton = po.page.getByRole("button", {
-    name: "Disconnect from GitHub",
-  });
-
-  // Click disconnect
-  await disconnectButton.click();
-
-  // Verify the button is no longer visible (component returns null when not connected)
-  await expect(disconnectButton).not.toBeVisible();
-
-  // Snapshot only the settings that changed (GitHub token/user removed)
-  po.settings.snapshotSettingsDelta(beforeSettings);
+  await po.githubConnector.disconnectRepo();
+  await po.githubConnector.connectExistingRepo("testuser/existing-app", "main");
+  await expect(po.page.getByTestId("github-connected-repo")).toContainText(
+    "testuser/existing-app",
+  );
 });

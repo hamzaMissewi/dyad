@@ -13,3 +13,13 @@ OpenAI's Responses API requires reasoning items to always be followed by an outp
 - Only reasoning was generated in a turn
 
 The fix in `src/ipc/utils/ai_messages_utils.ts` filters orphaned reasoning parts within `cleanMessage()` before sending conversation history back to OpenAI.
+
+## Dyad Engine model aliases
+
+When a Dyad Engine alias is backed by an OpenAI reasoning model, create it with `provider.responses(...)` and pass `providerId: "openai"`. Passing the alias provider (for example, `"auto"`) prevents `getExtraProviderOptionsForEngine()` from adding reasoning effort, summaries, encrypted reasoning content, and `store: false`.
+
+Dyad Engine models expose the AI SDK provider name `dyad-engine`; provider-family call options such as `providerOptions.google` are ignored. Pass the resolved family through `providerId` and let `createDyadFetch()` inject `getExtraProviderOptionsForEngine()` instead of duplicating family options on fallback entries.
+
+Every multi-step `streamText` loop must clean or sanitize the complete message array in `prepareStep`, including same-turn tool-call/results. With `store: false`, replaying an OpenAI/Azure reasoning `itemId` (`rs_...`) on the post-tool request fails with “Item with id ... not found”; use the shared `cleanMessage` / `sanitizeStepMessages` helpers rather than cleaning only persisted history.
+
+Keep provider-specific transcript repairs at the destination-provider boundary. LiteLLM can encode Gemini thought signatures in long tool-call IDs (`call_...__thought__...`), and Gemini continuations require that exact ID. If OpenAI Responses needs a shorter `call_id`, normalize matching call/result IDs based on the resolved runtime model, not the persisted display selection (Auto Sidekick resolves to `auto/auto`, while non-Pro Auto may resolve directly to Google). This includes `auto/value` and, pragmatically, runtime `auto/auto` because its common path starts with OpenAI; a rare same-turn fallback from Auto to Gemini may lose the encoded signature. Do not perform this rewrite in provider-agnostic parsing/cleaning or for a runtime model resolved directly to Gemini.

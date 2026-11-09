@@ -24,15 +24,20 @@ testWithRealCatalog(
       timeout: Timeout.MEDIUM,
     });
 
-    // Verify primary providers appear from the real catalog
-    await expect(po.page.getByText("OpenAI", { exact: true })).toBeVisible();
-    await expect(po.page.getByText("Anthropic", { exact: true })).toBeVisible();
+    await po.page
+      .getByRole("menuitem", {
+        name: /^All models(?:\s+All models)?$/i,
+      })
+      .first()
+      .click();
 
-    // Select OpenAI submenu and verify models submenu header appears
-    await po.page.getByText("OpenAI", { exact: true }).click();
-    await expect(po.page.getByText("OpenAI Models")).toBeVisible({
-      timeout: Timeout.SHORT,
-    });
+    // Primary-provider models are flattened into price tiers in the catalog.
+    await expect(
+      po.page.locator('[data-model-provider="openai"]').first(),
+    ).toBeVisible({ timeout: Timeout.SHORT });
+    await expect(
+      po.page.locator('[data-model-provider="anthropic"]').first(),
+    ).toBeVisible({ timeout: Timeout.SHORT });
 
     // Close the model picker
     await po.page.keyboard.press("Escape");

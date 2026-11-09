@@ -5,6 +5,7 @@ import {
   PtyCommandExecutionError,
   runPtyCommand,
 } from "./pty_command_runner";
+import { OUTPUT_TRUNCATION_MARKER } from "./bounded_output_buffer";
 
 const { processSpawnMock, spawnMock } = vi.hoisted(() => ({
   processSpawnMock: vi.fn(),
@@ -37,6 +38,8 @@ vi.mock("node-pty", () => ({
 interface MockPtyController {
   emitData(data: string): void;
   emitExit(event: { exitCode: number; signal?: number }): void;
+  dataListenerCount(): number;
+  exitListenerCount(): number;
   pty: {
     pid: number;
     kill: ReturnType<typeof vi.fn>;
@@ -62,6 +65,8 @@ function createMockPtyController(): MockPtyController {
         listener(event);
       }
     },
+    dataListenerCount: () => dataListeners.size,
+    exitListenerCount: () => exitListeners.size,
     pty: {
       pid: 1234,
       kill: vi.fn(),
@@ -167,6 +172,57 @@ describe("runPtyCommand", () => {
     await expect(promise).resolves.toEqual({
       output: "Resolved\nadded 1 package",
     });
+    expect(controller.dataListenerCount()).toBe(0);
+    expect(controller.exitListenerCount()).toBe(0);
+  });
+
+  it("retains only the newest output bytes from noisy commands", async () => {
+    const controller = createMockPtyController();
+    spawnMock.mockReturnValue(controller.pty);
+
+    const promise = runPtyCommand("pnpm", ["install"], {
+      maxOutputBytes: 16,
+    });
+
+    controller.emitData("a".repeat(1_000_000));
+    controller.emitData("0123456789abcdef");
+    controller.emitExit({ exitCode: 1 });
+
+    await expect(promise).rejects.toMatchObject({
+      output: OUTPUT_TRUNCATION_MARKER.trimEnd() + "\n0123456789abcdef",
+    } satisfies Partial<PtyCommandExecutionError>);
+  });
+
+  it("strips split ANSI sequences before truncating PTY output", async () => {
+    const controller = createMockPtyController();
+    spawnMock.mockReturnValue(controller.pty);
+
+    const promise = runPtyCommand("pnpm", ["install"], {
+      maxOutputBytes: 10,
+    });
+
+    controller.emitData("1234567890\u001b[38;");
+    controller.emitData("5;123mFAILURE");
+    controller.emitExit({ exitCode: 1 });
+
+    await expect(promise).rejects.toMatchObject({
+      output: OUTPUT_TRUNCATION_MARKER.trimEnd() + "\n890FAILURE",
+    } satisfies Partial<PtyCommandExecutionError>);
+  });
+
+  it("recovers after an unterminated OSC sequence reaches a new line", async () => {
+    const controller = createMockPtyController();
+    spawnMock.mockReturnValue(controller.pty);
+
+    const promise = runPtyCommand("pnpm", ["install"]);
+
+    controller.emitData("\u001b]0;unterminated title");
+    controller.emitData("\nvisible failure\n");
+    controller.emitExit({ exitCode: 1 });
+
+    await expect(promise).rejects.toMatchObject({
+      output: "visible failure",
+    } satisfies Partial<PtyCommandExecutionError>);
   });
 
   it("rejects with the captured output when the PTY exits non-zero", async () => {
@@ -204,25 +260,27 @@ describe("runPtyCommand", () => {
   });
 
   it("kills the PTY and rejects when the command times out", async () => {
-    vi.useFakeTimers();
-    const controller = createMockPtyController();
-    spawnMock.mockReturnValue(controller.pty);
+    await withPlatform("darwin", async () => {
+      vi.useFakeTimers();
+      const controller = createMockPtyController();
+      spawnMock.mockReturnValue(controller.pty);
 
-    const promise = runPtyCommand("npx", ["sfw"], {
-      timeoutMs: 25,
+      const promise = runPtyCommand("npx", ["sfw"], {
+        timeoutMs: 25,
+      });
+      controller.emitData("still running");
+      const handledPromise = promise.catch((error) => error);
+
+      await vi.advanceTimersByTimeAsync(25);
+      await expect(handledPromise).resolves.toMatchObject({
+        exitCode: null,
+        message:
+          "Command 'npx sfw' timed out after 25 ms. The command may be stuck. Check your network or environment and try again.",
+        output:
+          "still running\nCommand 'npx sfw' timed out after 25 ms. The command may be stuck. Check your network or environment and try again.",
+      } satisfies Partial<PtyCommandExecutionError>);
+      expect(controller.pty.kill).toHaveBeenCalledTimes(1);
     });
-    controller.emitData("still running");
-    const handledPromise = promise.catch((error) => error);
-
-    await vi.advanceTimersByTimeAsync(25);
-    await expect(handledPromise).resolves.toMatchObject({
-      exitCode: null,
-      message:
-        "Command 'npx sfw' timed out after 25 ms. The command may be stuck. Check your network or environment and try again.",
-      output:
-        "still running\nCommand 'npx sfw' timed out after 25 ms. The command may be stuck. Check your network or environment and try again.",
-    } satisfies Partial<PtyCommandExecutionError>);
-    expect(controller.pty.kill).toHaveBeenCalledTimes(1);
   });
 
   it("uses the display-command override in PTY exit errors", async () => {
@@ -271,5 +329,50 @@ describe("runPtyCommand", () => {
       );
       expect(controller.pty.kill).not.toHaveBeenCalled();
     });
+  });
+
+  it("passes args as a pre-built command-line string when useVerbatimArguments is set", async () => {
+    // The Windows batch path hands runPtyCommand the already cmd-quoted
+    // `/d /s /c "..."` payload and asks node-pty to forward it verbatim (as a
+    // string) so node-pty's argsToCommandLine doesn't MSVC-escape it a second
+    // time.
+    const controller = createMockPtyController();
+    spawnMock.mockReturnValue(controller.pty);
+
+    const promise = runPtyCommand(
+      "cmd.exe",
+      ["/d", "/s", "/c", '"npx.cmd playwright test --grep "(a|b) c""'],
+      {
+        useVerbatimArguments: true,
+      },
+    );
+
+    expect(spawnMock).toHaveBeenCalledWith(
+      "cmd.exe",
+      // Joined into a single verbatim command line, NOT an array.
+      '/d /s /c "npx.cmd playwright test --grep "(a|b) c""',
+      expect.objectContaining({ encoding: "utf8" }),
+    );
+
+    controller.emitExit({ exitCode: 0 });
+    await expect(promise).resolves.toEqual({ output: "" });
+  });
+
+  it("passes args as an array (letting node-pty MSVC-quote them) without useVerbatimArguments", async () => {
+    const controller = createMockPtyController();
+    spawnMock.mockReturnValue(controller.pty);
+
+    const promise = runPtyCommand("node.exe", ["script.js", "a b"], {});
+
+    // For a real executable, args stay an array so node-pty applies its
+    // normal argv-quoting (e.g. quoting "a b" for its embedded space).
+    expect(spawnMock).toHaveBeenCalledWith(
+      "node.exe",
+      ["script.js", "a b"],
+      expect.objectContaining({ encoding: "utf8" }),
+    );
+
+    controller.emitExit({ exitCode: 0 });
+    await expect(promise).resolves.toEqual({ output: "" });
   });
 });

@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { DyadErrorKind } from "@/errors/dyad_error";
 import {
   appendAttachmentManifestEntries,
   appendAttachmentManifestEntriesWithLogicalNames,
@@ -96,13 +97,25 @@ describe("sandbox capabilities", () => {
     ).resolves.toBe("hello");
   });
 
-  it("denies protected app paths", async () => {
-    await expect(sandboxReadFile(appPath, ".env")).rejects.toThrow(
-      "protected path",
+  it("redacts dotenv app paths and denies other protected paths", async () => {
+    await fs.writeFile(
+      path.join(appPath, ".env.local"),
+      'API_KEY=sk-123\nEMPTY=\nQUOTED_EMPTY=""',
+      "utf8",
     );
-    await expect(sandboxReadFile(appPath, ".envrc")).rejects.toThrow(
-      "protected path",
+    await expect(sandboxReadFile(appPath, ".env")).resolves.toBe(
+      "SECRET=[redacted]",
     );
+    await expect(sandboxReadFile(appPath, ".env.local")).resolves.toBe(
+      'API_KEY=[redacted]\nEMPTY=\nQUOTED_EMPTY=""',
+    );
+    await expect(sandboxReadFile(appPath, ".envrc")).resolves.toBe(
+      "SECRET=[redacted]",
+    );
+    await expect(sandboxFileStats(appPath, ".env")).resolves.toMatchObject({
+      size: 8,
+      isText: true,
+    });
     await expect(
       sandboxReadFile(appPath, ".environment-setup.md"),
     ).resolves.toBe("docs");
@@ -116,6 +129,44 @@ describe("sandbox capabilities", () => {
       sandboxReadFile(appPath, path.join(appPath, "src", "data.txt")),
     ).rejects.toThrow("Absolute paths");
   });
+
+  it("applies sandbox byte ranges after dotenv values are redacted", async () => {
+    await fs.writeFile(path.join(appPath, ".env"), "SECRET=sk-123\nEMPTY=");
+    const sanitized = "SECRET=[redacted]\nEMPTY=";
+
+    await expect(
+      sandboxReadFile(appPath, ".env", { start: 7, length: 10 }),
+    ).resolves.toBe("[redacted]");
+    await expect(
+      sandboxReadFile(appPath, ".env", { encoding: "base64" }),
+    ).resolves.toBe(Buffer.from(sanitized).toString("base64"));
+  });
+
+  it("redacts supported multiline dotenv syntax", async () => {
+    await fs.writeFile(
+      path.join(appPath, ".env"),
+      "BACKTICK=`first\n# sk-123\nlast`",
+    );
+
+    const result = await sandboxReadFile(appPath, ".env");
+    expect(result).toBe("BACKTICK=[redacted]\n[redacted]\n[redacted]");
+    expect(result).not.toContain("sk-123");
+  });
+
+  it.runIf(process.platform !== "win32")(
+    "redacts sandbox dotenv reads reached through symlink aliases",
+    async () => {
+      await fs.writeFile(path.join(appPath, ".env.local"), "TOKEN=secret");
+      await fs.symlink(
+        path.join(appPath, ".env.local"),
+        path.join(appPath, "config.txt"),
+      );
+
+      await expect(sandboxReadFile(appPath, "config.txt")).resolves.toBe(
+        "TOKEN=[redacted]",
+      );
+    },
+  );
 
   it("rejects sandbox writes that escape the app through symlinks", async () => {
     const outsideDir = await fs.mkdtemp(
@@ -241,6 +292,51 @@ describe("sandbox capabilities", () => {
     ]);
   });
 
+  it("lists unpacked archive entries under attachments:<archive>", async () => {
+    const mediaDir = getDyadMediaDir(appPath);
+    await fs.mkdir(path.join(mediaDir, "hash", "src"), { recursive: true });
+    await fs.writeFile(
+      path.join(mediaDir, "hash", "src", "index.ts"),
+      "export {};",
+      "utf8",
+    );
+    await fs.writeFile(path.join(mediaDir, "hash.zip"), "zipbytes");
+    await appendAttachmentManifestEntriesWithLogicalNames(appPath, [
+      {
+        requestedLogicalName: "proj.zip",
+        originalName: "proj.zip",
+        storedFileName: "hash.zip",
+        mimeType: "application/zip",
+        sizeBytes: 8,
+        createdAt: new Date("2026-04-22T00:00:00.000Z").toISOString(),
+      },
+      {
+        requestedLogicalName: "proj.zip/src/index.ts",
+        nestedLogicalName: true,
+        originalName: "src/index.ts",
+        storedFileName: "hash/src/index.ts",
+        mimeType: "text/typescript",
+        sizeBytes: 12,
+        createdAt: new Date("2026-04-22T00:00:00.000Z").toISOString(),
+        archiveLogicalName: "proj.zip",
+      },
+    ]);
+    await expect(
+      sandboxListFiles(appPath, "attachments:proj.zip"),
+    ).resolves.toEqual(["attachments:proj.zip/src/index.ts"]);
+    await expect(
+      sandboxListFiles(appPath, "attachments:proj.zip/src/"),
+    ).resolves.toEqual(["attachments:proj.zip/src/index.ts"]);
+    await expect(
+      sandboxListFiles(appPath, "attachments:missing.zip"),
+    ).rejects.toMatchObject({ kind: DyadErrorKind.NotFound });
+    // The archive itself is listed at the top level, but not its entries.
+    await expect(sandboxListFiles(appPath, "attachments:")).resolves.toEqual([
+      "attachments:server.log",
+      "attachments:proj.zip",
+    ]);
+  });
+
   it("lists attachment logical paths and returns file stats", async () => {
     await expect(sandboxListFiles(appPath, "attachments:")).resolves.toEqual([
       "attachments:server.log",
@@ -268,12 +364,50 @@ describe("sandbox capabilities", () => {
     ]);
 
     await expect(sandboxReadFile(appPath, "attachments:.env")).resolves.toBe(
-      "ATTACHED=1",
+      "ATTACHED=[redacted]",
     );
     await expect(sandboxListFiles(appPath, "attachments:")).resolves.toEqual([
       "attachments:server.log",
       "attachments:.env",
     ]);
+  });
+
+  it("redacts dotenv attachments even under a suffixed name", async () => {
+    const mediaDir = getDyadMediaDir(appPath);
+    // An ordinary dotenv entry unpacked from an archive, a suffixed archive
+    // entry, and a suffixed plain upload stored without an extension.
+    await fs.mkdir(path.join(mediaDir, "hash", "a"), { recursive: true });
+    await fs.writeFile(path.join(mediaDir, "hash", "a", ".env"), "ZIPPED=1");
+    await fs.mkdir(path.join(mediaDir, "hash", "b"), { recursive: true });
+    await fs.writeFile(path.join(mediaDir, "hash", "b", ".env"), "ALIASED=1");
+    await fs.writeFile(path.join(mediaDir, "plainhash"), "UPLOADED=1");
+    const entry = (
+      logicalName: string,
+      originalName: string,
+      storedFileName: string,
+    ) => ({
+      logicalName,
+      originalName,
+      storedFileName,
+      mimeType: "text/plain",
+      sizeBytes: 8,
+      createdAt: new Date("2026-04-22T00:00:00.000Z").toISOString(),
+    });
+    await appendAttachmentManifestEntries(appPath, [
+      entry("proj.zip/a/.env", "a/.env", "hash/a/.env"),
+      entry("proj.zip/a/.env-2", "b/.env", "hash/b/.env"),
+      entry(".env-2", ".env", "plainhash"),
+    ]);
+
+    await expect(
+      sandboxReadFile(appPath, "attachments:proj.zip/a/.env"),
+    ).resolves.toBe("ZIPPED=[redacted]");
+    await expect(
+      sandboxReadFile(appPath, "attachments:proj.zip/a/.env-2"),
+    ).resolves.toBe("ALIASED=[redacted]");
+    await expect(sandboxReadFile(appPath, "attachments:.env-2")).resolves.toBe(
+      "UPLOADED=[redacted]",
+    );
   });
 
   it("filters stale attachment manifest entries", async () => {
@@ -361,6 +495,171 @@ describe("sandbox capabilities", () => {
       value: "2",
       truncated: false,
     });
+  });
+
+  it("supports the advertised 0.3 data helpers after a host file read", async () => {
+    if (!isSandboxSupportedPlatform()) return;
+
+    await fs.writeFile(
+      path.join(appPath, "src", "rows.json"),
+      JSON.stringify([
+        { name: "z", group: "one", internal: true },
+        { name: "é", group: "one", internal: true },
+        { name: "a", group: "two", internal: true },
+      ]),
+    );
+    const result = await runSandboxScript({
+      appPath,
+      script: `
+        const rows = JSON.parse(await read_file("src/rows.json"), (key, value) => key === "internal" ? undefined : value);
+        const grouped = Object.groupBy(rows, row => row.group);
+        const mapped = Map.groupBy(rows, row => row.group);
+        const sorted = rows.toSorted((a, b) => a.name.localeCompare(b.name, "en-US"));
+        const names = sorted.map(row => { delete row.group; return row.name; });
+        const sparse = [1, 2, 3];
+        delete sparse[1];
+        const date = new Date("2026-09-21T23:30:00-07:00");
+        JSON.stringify({
+          names,
+          firstGroupSize: grouped.one.length,
+          mappedGroupNames: mapped.get("one").map(row => row.name),
+          reversed: names.toReversed(),
+          spliced: names.toSpliced(1, 1, "b"),
+          originalNames: names.join(","),
+          removed: !Object.hasOwn(rows[0], "internal") && !Object.hasOwn(rows[0], "group"),
+          deletedElement: !Object.hasOwn(sparse, 1) && sparse.length === 3,
+          union: Array.from(new Set(["one"]).union(new Set(["two"]))),
+          intersection: Array.from(new Set(["one", "two"]).intersection(new Set(["two", "three"]))),
+          difference: Array.from(new Set(["one", "two"]).difference(new Set(["two"]))),
+          replaced: JSON.stringify({ keep: 1, internal: true }, (key, value) => key === "internal" ? undefined : value, 2),
+          formatted: new Intl.NumberFormat("en-US", { minimumFractionDigits: 2 }).format(1234.5),
+          utcDate: [date.getHours(), date.getDate(), date.getTimezoneOffset()],
+          encoded: encodeURIComponent("a b")
+        }, null, 2);
+      `,
+    });
+    expect(JSON.parse(result.value)).toEqual({
+      names: ["a", "é", "z"],
+      firstGroupSize: 2,
+      mappedGroupNames: ["z", "é"],
+      reversed: ["z", "é", "a"],
+      spliced: ["a", "b", "z"],
+      originalNames: "a,é,z",
+      removed: true,
+      deletedElement: true,
+      union: ["one", "two"],
+      intersection: ["two"],
+      difference: ["one"],
+      replaced: '{\n  "keep": 1\n}',
+      formatted: "1,234.50",
+      utcDate: [6, 22, 0],
+      encoded: "a%20b",
+    });
+  });
+
+  it.each([
+    [
+      '"a".localeCompare("b", "de");',
+      "TypeError: Intl currently supports only the `en-US` locale",
+    ],
+    [
+      'new Intl.NumberFormat("de").format(1);',
+      "TypeError: Intl currently supports only the `en-US` locale",
+    ],
+    [
+      'new Intl.DateTimeFormat("en-US", { timeZone: "America/Los_Angeles" });',
+      "TypeError: Intl.DateTimeFormat currently supports only the `UTC` timeZone",
+    ],
+  ])(
+    "rejects unsupported locale/time-zone arguments: %s",
+    async (script, message) => {
+      if (!isSandboxSupportedPlatform()) return;
+      await expect(runSandboxScript({ appPath, script })).rejects.toThrow(
+        message,
+      );
+    },
+  );
+
+  it.each([
+    ["1n", "BigInt values cannot cross the structured host boundary"],
+    [
+      'new Map([["key", 1]])',
+      "Map and Set values cannot cross the structured host boundary",
+    ],
+    [
+      "new Set([1])",
+      "Map and Set values cannot cross the structured host boundary",
+    ],
+  ])(
+    "rejects non-structured values at return and host-call boundaries: %s",
+    async (expression, message) => {
+      if (!isSandboxSupportedPlatform()) return;
+      await expect(
+        runSandboxScript({ appPath, script: `${expression};` }),
+      ).rejects.toThrow(message);
+      let called = false;
+      await expect(
+        executeSandboxScriptInProcess({
+          appPath,
+          script: `send(${expression});`,
+          capabilities: {
+            send: () => {
+              called = true;
+            },
+          },
+        }),
+      ).rejects.toThrow(message);
+      expect(called).toBe(false);
+    },
+  );
+
+  it("preserves sparse host-call arrays but renders holes as null in final output", async () => {
+    if (!isSandboxSupportedPlatform()) return;
+    const script = "const items = [1, 2, 3]; delete items[1];";
+    const result = await runSandboxScript({
+      appPath,
+      script: `${script} items;`,
+    });
+    expect(result.value).toBe("[\n  1,\n  null,\n  3\n]");
+
+    let received: unknown;
+    await executeSandboxScriptInProcess({
+      appPath,
+      script: `${script} send(items);`,
+      capabilities: {
+        send: (value) => {
+          received = value;
+        },
+      },
+    });
+    const expected = [1, 2, 3];
+    delete expected[1];
+    expect(received).toStrictEqual(expected);
+    expect(Object.hasOwn(received as number[], 1)).toBe(false);
+  });
+
+  it.each(["\ud800", { ["\ud800"]: 1 }])(
+    "rejects lone surrogates in host-returned strings and keys: %j",
+    async (value) => {
+      if (!isSandboxSupportedPlatform()) return;
+      await expect(
+        executeSandboxScriptInProcess({
+          appPath,
+          script: "receive();",
+          capabilities: { receive: () => value },
+        }),
+      ).rejects.toThrow(/lone surrogate/i);
+    },
+  );
+
+  it.each([
+    'JSON.parse("1", () => read_file("src/data.txt"));',
+    'JSON.stringify({ a: 1 }, () => read_file("src/data.txt"));',
+  ])("rejects host calls inside JSON callbacks: %s", async (script) => {
+    if (!isSandboxSupportedPlatform()) return;
+    await expect(runSandboxScript({ appPath, script })).rejects.toThrow(
+      "JSON callbacks do not support synchronous host suspensions",
+    );
   });
 
   it("reports actual attachment host calls from MustardScript", async () => {

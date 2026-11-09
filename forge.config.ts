@@ -44,8 +44,27 @@ const pgRuntimeDependencies = [
   "xtend",
 ] as const;
 
-function isPgRuntimeDependency(file: string): boolean {
-  return pgRuntimeDependencies.some((dependency) => {
+/**
+ * What ssh2 needs at runtime, and only that.
+ *
+ * Its optional native helpers — cpu-features, nan, buildcheck — are left out
+ * on purpose. ssh2 guards those requires and falls back to pure JavaScript,
+ * so leaving them behind costs some speed and avoids shipping a binding
+ * compiled against whatever Node the build machine happened to have.
+ */
+const ssh2RuntimeDependencies = [
+  "ssh2",
+  "asn1",
+  "safer-buffer",
+  "bcrypt-pbkdf",
+  "tweetnacl",
+] as const;
+
+function isRuntimeDependency(
+  file: string,
+  packages: readonly string[],
+): boolean {
+  return packages.some((dependency) => {
     const modulePath = `/node_modules/${dependency}`;
     return file === modulePath || file.startsWith(`${modulePath}/`);
   });
@@ -81,7 +100,13 @@ const ignore = (file: string) => {
   if (file.startsWith("/node_modules/better-sqlite3")) {
     return false;
   }
+  if (file.startsWith("/node_modules/dyad-keychain-reader")) {
+    return false;
+  }
   if (file.startsWith("/node_modules/node-pty")) {
+    return false;
+  }
+  if (isRuntimeDependency(file, ssh2RuntimeDependencies)) {
     return false;
   }
   if (file.startsWith("/node_modules/mustardscript")) {
@@ -99,7 +124,19 @@ const ignore = (file: string) => {
   if (file.startsWith("/node_modules/file-uri-to-path")) {
     return false;
   }
-  if (isPgRuntimeDependency(file)) {
+  if (file === "/node_modules/@typescript") {
+    return false;
+  }
+  if (file.startsWith("/node_modules/@typescript/typescript6")) {
+    return false;
+  }
+  if (file.startsWith("/node_modules/@typescript/old")) {
+    return false;
+  }
+  if (isRuntimeDependency(file, pgRuntimeDependencies)) {
+    return false;
+  }
+  if (file === "/node_modules/ws" || file.startsWith("/node_modules/ws/")) {
     return false;
   }
   if (file.startsWith("/.vite")) {
@@ -112,6 +149,12 @@ const ignore = (file: string) => {
 const isEndToEndTestBuild = process.env.E2E_TEST_BUILD === "true";
 const isWindowsSigningEnabled = process.env.WINDOWS_SIGN === "true";
 const shouldSkipNativeRebuild = process.env.DYAD_SKIP_NATIVE_REBUILD === "true";
+const nativeRebuildModules = [
+  "better-sqlite3",
+  "node-pty",
+  "mustardscript",
+  ...(process.platform === "darwin" ? ["dyad-keychain-reader"] : []),
+];
 
 if (isWindowsSigningEnabled && !process.env.AZURE_CODE_SIGNING_DLIB) {
   throw new Error(
@@ -124,7 +167,9 @@ const config: ForgeConfig = {
   packagerConfig: {
     // E2E test builds install local file: dependencies as links on Windows.
     // Dereference them so packaging does not require symlink privileges in the temp app.
-    derefSymlinks: isEndToEndTestBuild ? true : undefined,
+    // Local file: native packages install as symlinks; dereference them so the
+    // packaged app contains loadable runtime files.
+    derefSymlinks: true,
     windowsSign: isWindowsSigningEnabled ? windowsSign : undefined,
     afterCopy: [
       (buildPath, _electronVersion, platform, arch, callback) => {
@@ -169,9 +214,9 @@ const config: ForgeConfig = {
           teamId: process.env.APPLE_TEAM_ID!,
         },
     asar: {
-      // node-pty loads helper binaries like spawn-helper and winpty-agent from disk.
+      // Native modules and node-pty helper binaries must be loadable from disk.
       unpackDir:
-        "{node_modules/node-pty,node_modules/mustardscript,node_modules/@mustardscript}",
+        "{node_modules/dyad-keychain-reader,node_modules/node-pty,node_modules/mustardscript,node_modules/@mustardscript}",
     },
     ignore,
     extraResource: ["node_modules/dugite/git", "node_modules/@vscode"],
@@ -180,7 +225,7 @@ const config: ForgeConfig = {
   rebuildConfig: shouldSkipNativeRebuild
     ? { onlyModules: [] }
     : {
-        extraModules: ["better-sqlite3", "node-pty", "mustardscript"],
+        extraModules: nativeRebuildModules,
         force: true,
       },
   makers: [
@@ -238,7 +283,7 @@ const config: ForgeConfig = {
       build: [
         {
           // `entry` is just an alias for `build.lib.entry` in the corresponding file of `config`.
-          entry: "src/main.ts",
+          entry: "src/main_bootstrap.ts",
           config: "vite.main.config.mts",
           target: "main",
         },
@@ -248,13 +293,14 @@ const config: ForgeConfig = {
           target: "preload",
         },
         {
-          entry: "workers/tsc/tsc_worker.ts",
-          config: "vite.worker.config.mts",
+          entry: "workers/code_explorer/code_explorer_worker.ts",
+          config: "vite.code-explorer-worker.config.mts",
           target: "main",
         },
         {
-          entry: "workers/code_explorer/code_explorer_worker.ts",
-          config: "vite.code-explorer-worker.config.mts",
+          entry:
+            "workers/supabase_dependency_analysis/supabase_dependency_analysis_worker.ts",
+          config: "vite.supabase-dependency-analysis-worker.config.mts",
           target: "main",
         },
         {

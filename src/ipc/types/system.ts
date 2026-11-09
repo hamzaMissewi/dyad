@@ -2,13 +2,36 @@ import { z } from "zod";
 import {
   defineContract,
   defineEvent,
+  defineSendContract,
   createClient,
   createEventClient,
 } from "../contracts/core";
+import { AppSizeTelemetrySchema } from "../../shared/app_size_telemetry";
+import { PagefileSettingsSchema } from "../../shared/pagefile_telemetry";
 
 // =============================================================================
 // System Schemas
 // =============================================================================
+
+export const SystemResourceUsageSchema = z.object({
+  sampledAt: z.number(),
+  platform: z.string(),
+  cpu: z.object({
+    logicalCores: z.number(),
+    usedPercent: z.number().nullable(),
+  }),
+  memory: z.object({
+    totalBytes: z.number(),
+    usedBytes: z.number(),
+    committedBytes: z.number().nullable(),
+    commitLimitBytes: z.number().nullable(),
+    compressedBytes: z.number().nullable(),
+    swapUsedBytes: z.number().nullable(),
+    source: z.enum(["macos", "linux", "windows", "fallback"]),
+  }),
+});
+
+export type SystemResourceUsage = z.infer<typeof SystemResourceUsageSchema>;
 
 export const NodeSystemInfoSchema = z.object({
   nodeVersion: z.string().nullable(),
@@ -122,6 +145,43 @@ export const UserBudgetInfoSchema = z
 
 export type UserBudgetInfo = z.infer<typeof UserBudgetInfoSchema>;
 
+export const SubscriptionStatusSchema = z
+  .object({
+    alert: z
+      .enum(["subscription_ending", "payment_past_due", "subscription_paused"])
+      .nullable(),
+    effectiveAt: z.string().datetime().nullable(),
+    actionUrl: z.string().url().nullable(),
+  })
+  .strict()
+  .superRefine((status, context) => {
+    if (status.alert === null) {
+      if (status.effectiveAt !== null || status.actionUrl !== null) {
+        context.addIssue({
+          code: "custom",
+          message: "A healthy subscription status cannot include alert data",
+        });
+      }
+      return;
+    }
+    if (status.actionUrl === null) {
+      context.addIssue({
+        code: "custom",
+        path: ["actionUrl"],
+        message: "Billing alerts require an action URL",
+      });
+    }
+    if (status.alert === "subscription_ending" && status.effectiveAt === null) {
+      context.addIssue({
+        code: "custom",
+        path: ["effectiveAt"],
+        message: "Ending subscriptions require an effective date",
+      });
+    }
+  });
+
+export type SubscriptionStatus = z.infer<typeof SubscriptionStatusSchema>;
+
 export const TelemetryEventPayloadSchema = z.object({
   eventName: z.string(),
   properties: z.record(z.string(), z.any()).optional(),
@@ -145,11 +205,32 @@ export const ForceCloseDetectedPayloadSchema = z.object({
   activeChatId: z.number().optional(),
 });
 
+/**
+ * Failures takeScreenshot can raise. The renderer matches on these to bucket
+ * capture failures for telemetry, so both sides move together instead of
+ * drifting apart.
+ */
+export const SCREENSHOT_ERRORS = {
+  noFocusedWindow: "No focused window to capture",
+  emptyImage: "Failed to capture screenshot",
+} as const;
+
+export const NativeThemeStateSchema = z.object({
+  shouldUseDarkColors: z.boolean(),
+});
+
+export type NativeThemeState = z.infer<typeof NativeThemeStateSchema>;
+
 // =============================================================================
 // System Contracts
 // =============================================================================
 
 export const systemContracts = {
+  getSystemResourceUsage: defineContract({
+    channel: "system:get-resource-usage",
+    input: z.void(),
+    output: SystemResourceUsageSchema,
+  }),
   // Window controls
   minimizeWindow: defineContract({
     channel: "window:minimize",
@@ -183,11 +264,21 @@ export const systemContracts = {
     output: z.string(),
   }),
 
+  getNativeThemeState: defineContract({
+    channel: "native-theme:get-state",
+    input: z.void(),
+    output: NativeThemeStateSchema,
+  }),
+
   getInitialLoadTelemetryContext: defineContract({
     channel: "get-initial-load-telemetry-context",
     input: z.void(),
     output: z.object({
       isFirstSession: z.boolean(),
+      // Absent when the previous session never measured an app.
+      previousSessionAppSize: AppSizeTelemetrySchema.nullish(),
+      // Windows pagefile configuration; null elsewhere or when unreadable.
+      pagefile: PagefileSettingsSchema.nullable(),
     }),
   }),
 
@@ -324,6 +415,18 @@ export const systemContracts = {
     output: UserBudgetInfoSchema,
   }),
 
+  getSubscriptionStatus: defineContract({
+    channel: "get-subscription-status",
+    input: z.void(),
+    output: SubscriptionStatusSchema.nullable(),
+  }),
+
+  openBillingAction: defineContract({
+    channel: "open-billing-action",
+    input: z.string(),
+    output: z.void(),
+  }),
+
   // Upload
   uploadToSignedUrl: defineContract({
     channel: "upload-to-signed-url",
@@ -331,15 +434,98 @@ export const systemContracts = {
       url: z.string(),
       contentType: z.string(),
       data: z.any(),
+      /** Names this upload so it can be cancelled while it is in flight. */
+      uploadId: z.string().min(1),
     }),
-    output: z.void(),
+    // False when the upload was cancelled before it finished. A cancel is not
+    // a failure, but nothing may cite an upload that never completed.
+    output: z.object({ uploaded: z.boolean() }),
+  }),
+
+  /**
+   * Sends a capture to the screenshot bucket, so the issue can embed it
+   * instead of asking the reporter to paste. The bytes never pass through the
+   * renderer: main holds the full-resolution image and PUTs it directly.
+   */
+  uploadScreenshot: defineContract({
+    channel: "upload-screenshot",
+    input: z.object({
+      /** Which capture to send. Two reports can be open at once. */
+      captureId: z.string().min(1),
+      /** Signed write URL from the upload service. */
+      url: z.string(),
+      /**
+       * Headers the signature covers. The service names them, main forwards
+       * them; GCS rejects the PUT if any is missing or altered.
+       */
+      headers: z.record(z.string(), z.string()),
+      /** Names this upload so it can be cancelled while it is in flight. */
+      uploadId: z.string().min(1),
+    }),
+    output: z.object({
+      uploaded: z.boolean(),
+      /**
+       * Why not, when not. "cancelled" is the reporter backing out, not a
+       * fault. "missing" means main no longer holds the capture. "too-large"
+       * means the PNG is over the size the signed URL allows, which the
+       * service would reject anyway -- checked here so nothing is sent.
+       * "timeout", "rejected" (storage answered with an error) and "network"
+       * are the PUT not completing. The caller falls back on all of them, so
+       * they are returned rather than thrown: a thrown error would be
+       * reported as an app fault.
+       */
+      reason: z
+        .enum([
+          "cancelled",
+          "missing",
+          "too-large",
+          "timeout",
+          "rejected",
+          "network",
+        ])
+        .optional(),
+      /** What went wrong with the PUT, for the issue body. */
+      detail: z.string().optional(),
+    }),
+  }),
+
+  discardScreenshot: defineContract({
+    channel: "discard-screenshot",
+    // A capture is a full-resolution picture of the window. Once the report it
+    // belongs to is gone, nothing will ever paste it.
+    input: z.object({ captureId: z.string().min(1) }),
+    output: z.object({ discarded: z.boolean() }),
+  }),
+
+  cancelUpload: defineContract({
+    channel: "cancel-upload",
+    // A reporter who backs out has withdrawn consent to send the session, so
+    // the upload has to stop rather than finish unwatched.
+    input: z.object({ uploadId: z.string().min(1) }),
+    output: z.object({ cancelled: z.boolean() }),
   }),
 
   // Screenshot
+  /**
+   * Re-writes the last capture to the clipboard. The reporter pastes it into
+   * GitHub at the end of the flow, by which time anything else they copied
+   * would have replaced it.
+   */
+  recopyScreenshot: defineContract({
+    channel: "recopy-screenshot",
+    // Names the capture to restore. Two reports can be open at once, and the
+    // reporter must never be handed another report's screenshot to paste.
+    input: z.object({ captureId: z.string().min(1) }),
+    output: z.object({ copied: z.boolean() }),
+  }),
+
   takeScreenshot: defineContract({
     channel: "take-screenshot",
     input: z.void(),
-    output: z.void(),
+    // Main keeps the full image under `captureId` until the report is filed.
+    // The data URL is a preview, so the reporter can see what was captured
+    // -- and what they are about to make public -- before it leaves.
+    output: z.object({ dataUrl: z.string(), captureId: z.string() }),
   }),
 
   // Restart
@@ -354,7 +540,27 @@ export const systemContracts = {
 // System Event Contracts
 // =============================================================================
 
+export const RendererHeapReportSchema = z.object({
+  heapUsedMB: z.number().nonnegative(),
+  heapLimitMB: z.number().nonnegative(),
+});
+export type RendererHeapReport = z.infer<typeof RendererHeapReportSchema>;
+
+// One-way renderer -> main. The preload pushes the renderer's V8 heap every
+// 30s so the main-process heartbeat can record it; nothing waits on a reply.
+export const systemSendContracts = {
+  reportRendererHeap: defineSendContract({
+    channel: "performance:report-renderer-heap",
+    input: RendererHeapReportSchema,
+  }),
+} as const;
+
 export const systemEvents = {
+  nativeThemeUpdated: defineEvent({
+    channel: "native-theme:updated",
+    payload: NativeThemeStateSchema,
+  }),
+
   telemetryEvent: defineEvent({
     channel: "telemetry:event",
     payload: TelemetryEventPayloadSchema,

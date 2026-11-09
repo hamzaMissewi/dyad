@@ -6,6 +6,7 @@ import {
 import { expect, type Locator } from "@playwright/test";
 import type { ElectronApplication } from "playwright";
 import * as fs from "fs";
+import path from "path";
 
 const testSetup = testWithConfig({
   showSetupScreen: true,
@@ -21,7 +22,9 @@ testSetup.describe("Setup Flow", () => {
     await expect(
       dialog.getByRole("button", { name: /Start free Dyad Pro trial/ }),
     ).toBeVisible();
-    await expect(dialog.getByRole("button", { name: "Google" })).toBeVisible();
+    await expect(
+      dialog.getByRole("button", { name: "ChatGPT subscription" }),
+    ).toBeVisible();
     await expect(
       dialog.getByRole("button", { name: "OpenRouter" }),
     ).toBeVisible();
@@ -38,7 +41,7 @@ testSetup.describe("Setup Flow", () => {
   testSetup("AI provider setup flow", async ({ po }) => {
     let dialog = await openAiSetupDialog(po);
 
-    await dialog.getByRole("button", { name: "Google" }).click();
+    await openGoogleSettings(po, dialog);
     await expect(
       po.page.getByRole("heading", { name: "Configure Google" }),
     ).toBeVisible({ timeout: Timeout.MEDIUM });
@@ -98,11 +101,13 @@ testSetup.describe("Setup Flow", () => {
   );
 
   testSetup(
-    "OpenRouter API key setup resumes the pending first prompt",
+    "OpenRouter API key setup switches the pending first prompt from Build to Basic Agent",
     async ({ po }) => {
       await seedFakeModelSelection(po);
+      await expectInitialBuildMode(po);
       const prompt = "Build a tiny meal planner";
       const dialog = await openAiSetupDialog(po, prompt);
+      await restoreLocalAgentDefault(po);
 
       await dialog.getByRole("button", { name: "OpenRouter" }).click();
       await expect(
@@ -127,6 +132,7 @@ testSetup.describe("Setup Flow", () => {
       });
       await expect(po.page.getByRole("dialog")).not.toBeVisible();
       await expectSelectedApp(po);
+      await expectLocalAgentMode(po, "Basic Agent");
     },
   );
 
@@ -138,7 +144,7 @@ testSetup.describe("Setup Flow", () => {
       const apiKey = "test-google-clipboard-key-12345";
       const dialog = await openAiSetupDialog(po, prompt);
 
-      await dialog.getByRole("button", { name: "Google" }).click();
+      await openGoogleSettings(po, dialog);
       await expect(
         po.page.getByRole("heading", { name: "Configure Google" }),
       ).toBeVisible({ timeout: Timeout.MEDIUM });
@@ -171,7 +177,7 @@ testSetup.describe("Setup Flow", () => {
       const prompt = "Build a tiny focus timer";
       const dialog = await openAiSetupDialog(po, prompt);
 
-      await dialog.getByRole("button", { name: "Google" }).click();
+      await openGoogleSettings(po, dialog);
       await expect(
         po.page.getByRole("heading", { name: "Configure Google" }),
       ).toBeVisible({ timeout: Timeout.MEDIUM });
@@ -242,15 +248,18 @@ testSetup.describe("Setup Flow", () => {
     "Google API key setup resumes an attachment-only first prompt",
     async ({ po }) => {
       await seedFakeModelSelection(po);
+      // Agentic Build receives attachment logical paths rather than eagerly
+      // inlined contents. The marker in the filename makes the fake model dump
+      // that request while remaining a valid logical attachment path.
       const attachmentPath =
-        "e2e-tests/fixtures/attachment-only-setup-resume.txt";
+        "e2e-tests/fixtures/[dump]-attachment-only-setup-resume.txt";
       const dialog = await openAiSetupDialog(po, "", {
         beforeSubmit: async () => {
           await attachHomeChatContextFile(po, attachmentPath);
         },
       });
 
-      await dialog.getByRole("button", { name: "Google" }).click();
+      await openGoogleSettings(po, dialog);
       await expect(
         po.page.getByRole("heading", { name: "Configure Google" }),
       ).toBeVisible({ timeout: Timeout.MEDIUM });
@@ -271,16 +280,47 @@ testSetup.describe("Setup Flow", () => {
 
       const dump = await readLastServerDump(po);
       const serializedDump = JSON.stringify(dump);
-      expect(serializedDump).toContain("attachment-only-setup-resume.txt");
-      expect(serializedDump).toContain("Attachment-only setup resume fixture.");
+      expect(serializedDump).toContain(
+        "attachments:[dump]-attachment-only-setup-resume.txt",
+      );
+
+      // Prove the resumed turn persisted both the logical mapping and payload
+      // used by attachment-aware agent tools such as read_file.
+      const appPath = await po.appManagement.getCurrentAppPath();
+      const mediaDir = path.join(appPath, ".dyad", "media");
+      const manifest = JSON.parse(
+        fs.readFileSync(
+          path.join(mediaDir, "attachments-manifest.json"),
+          "utf8",
+        ),
+      ) as Array<{
+        logicalName: string;
+        originalName: string;
+        storedFileName: string;
+      }>;
+      const attachment = manifest.find(
+        (entry) =>
+          entry.logicalName === "[dump]-attachment-only-setup-resume.txt",
+      );
+      expect(attachment).toMatchObject({
+        originalName: "[dump]-attachment-only-setup-resume.txt",
+      });
+      expect(
+        fs.readFileSync(
+          path.join(mediaDir, attachment!.storedFileName),
+          "utf8",
+        ),
+      ).toContain("Attachment-only setup resume fixture.");
     },
   );
 
   testSetup(
-    "Dyad Pro return deep link resumes the pending first prompt",
+    "Dyad Pro return deep link switches the pending first prompt from Build to Agent",
     async ({ po, electronApp }) => {
+      await expectInitialBuildMode(po);
       const prompt = "Build a tiny workout planner";
       await openAiSetupDialog(po, prompt);
+      await restoreLocalAgentDefault(po);
 
       await triggerDyadProReturnDeepLink(electronApp);
 
@@ -293,16 +333,54 @@ testSetup.describe("Setup Flow", () => {
       await expect(po.page.getByRole("dialog")).not.toBeVisible();
       await expect(po.page.getByText("Welcome to Dyad Pro!")).not.toBeVisible();
       await expectSelectedApp(po);
+      await expectLocalAgentMode(po, "Agent");
     },
   );
 });
+
+async function expectInitialBuildMode(po: PageObject) {
+  await po.pinBuildChatModeForSetup();
+  await po.navigation.goToAppsTab();
+  await expect(po.page.getByTestId("chat-mode-selector")).toContainText(
+    "Build",
+    { timeout: Timeout.MEDIUM },
+  );
+}
+
+async function restoreLocalAgentDefault(po: PageObject) {
+  await po.page.evaluate(async () => {
+    await (window as any).electron.ipcRenderer.invoke("set-user-settings", {
+      defaultChatMode: "local-agent",
+    });
+  });
+  await expect
+    .poll(() => po.settings.recordSettings().defaultChatMode, {
+      timeout: Timeout.MEDIUM,
+    })
+    .toBe("local-agent");
+}
+
+async function expectLocalAgentMode(
+  po: PageObject,
+  expectedDisplayName: "Basic Agent" | "Agent",
+) {
+  await expect(po.page.getByTestId("chat-mode-selector")).toContainText(
+    expectedDisplayName,
+    { timeout: Timeout.MEDIUM },
+  );
+  await expect
+    .poll(() => po.settings.recordSettings().selectedChatMode, {
+      timeout: Timeout.MEDIUM,
+    })
+    .toBe("local-agent");
+}
 
 async function setupGoogleKeyAndExpectResume(
   po: PageObject,
   dialog: Locator,
   prompt: string,
 ) {
-  await dialog.getByRole("button", { name: "Google" }).click();
+  await openGoogleSettings(po, dialog);
   await expect(
     po.page.getByRole("heading", { name: "Configure Google" }),
   ).toBeVisible({ timeout: Timeout.MEDIUM });
@@ -474,4 +552,11 @@ async function readLastServerDump(po: PageObject) {
   }
 
   return JSON.parse(fs.readFileSync(lastDumpPath, "utf-8"));
+}
+
+async function openGoogleSettings(po: PageObject, dialog: Locator) {
+  await dialog.getByRole("button", { name: "Other providers" }).click();
+  await po.page
+    .getByRole("heading", { name: /^Google\s*(?:Needs Setup|Ready)$/ })
+    .click();
 }

@@ -3,6 +3,7 @@
  */
 
 export { GitHubConnector } from "./GitHubConnector";
+export { GitLabConnector } from "./GitLabConnector";
 export { ChatActions } from "./ChatActions";
 export { PreviewPanel } from "./PreviewPanel";
 export { CodeEditor } from "./CodeEditor";
@@ -14,3 +15,5 @@ export { ModelPicker } from "./ModelPicker";
 export { Settings } from "./Settings";
 export { AppManagement } from "./AppManagement";
 export { PromptLibrary } from "./PromptLibrary";
+export { Plugins } from "./Plugins";
+export { Catalog } from "./Catalog";

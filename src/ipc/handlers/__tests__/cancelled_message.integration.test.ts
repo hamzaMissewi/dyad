@@ -8,8 +8,8 @@
 // renders the "Cancelled" indicator in the message list, and a follow-up
 // request KEEPS the cancelled turn in the context sent to the LLM.
 //
-// The real Cancel click consumes the chat:cancel result, but the bridge keeps
-// the raw invoke envelope so this test can assert both the handler result and
+// The real Cancel click dispatches a main-actor intent; the bridge keeps the
+// remote-machine envelope so this test can assert both actor acceptance and
 // the renderer-observable cancelled end event.
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -45,33 +45,33 @@ describe("cancelled message (integration)", () => {
       { timeout: 15_000 },
     );
 
-    // Start a stream whose fake response is delayed ([sleep=medium]) so we
+    // Start a stream whose fake response is delayed ([sleep=long]) so we
     // can cancel it mid-flight, exactly like the e2e clicked "Cancel
     // generation".
-    const { send } = await harness.typeInChat(
-      "tc=cancelled-test [sleep=medium]",
+    const streamStarted = harness.waitForEvent(
+      "chat:stream:start",
+      (payload) =>
+        !!payload &&
+        typeof payload === "object" &&
+        (payload as { chatId?: number }).chatId === harness.chatId,
+      60_000,
     );
+    const { send } = await harness.typeInChat("tc=cancelled-test [sleep=long]");
     send();
+    await streamStarted;
 
     // While streaming, ChatInput swaps the Send button for the REAL Cancel
-    // control (aria-label "cancelGeneration" via the i18n key).
+    // control (aria-label "Cancel generation" when the i18n mock resolves it).
     const cancelButton = await screen.findByLabelText(
-      "cancelGeneration",
+      /^(cancelGeneration|Cancel generation)$/,
       {},
-      { timeout: 15_000 },
+      { timeout: 60_000 },
     );
 
     // Deterministic pre-cancel gate (replaces a fixed 1.5s sleep): the stream
     // is registered (chat:stream:start fires synchronously at handler entry)
     // and both db rows exist — the user prompt and the assistant placeholder
     // that the cancel path annotates with "[Response cancelled by user]".
-    await harness.waitForEvent(
-      "chat:stream:start",
-      (payload) =>
-        !!payload &&
-        typeof payload === "object" &&
-        (payload as { chatId?: number }).chatId === harness.chatId,
-    );
     await waitFor(
       async () => {
         const messages = await harness.db.query.messages.findMany();
@@ -80,7 +80,7 @@ describe("cancelled message (integration)", () => {
       { timeout: 15_000 },
     );
 
-    // Click the real Cancel control (ChatInput.handleCancel -> chat:cancel).
+    // Click the real Cancel control (ChatInput.handleCancel -> actor CANCEL).
     fireEvent.click(cancelButton);
 
     // The cancel handler notifies the renderer that the stream ended cancelled.
@@ -97,10 +97,29 @@ describe("cancelled message (integration)", () => {
       wasCancelled: true,
     });
     await waitFor(() =>
-      expect(harness.bridge.lastInvoke("chat:cancel")).toMatchObject({
-        channel: "chat:cancel",
+      expect(
+        harness.bridge.invokeLog.find(
+          (entry) =>
+            entry.channel === "distributed-machine:dispatch" &&
+            (
+              entry.args[0] as {
+                encodedEvent?: { type?: string };
+              }
+            )?.encodedEvent?.type === "CANCEL",
+        ),
+      ).toMatchObject({
+        channel: "distributed-machine:dispatch",
+        args: [
+          expect.objectContaining({
+            machineId: "chat_stream",
+            encodedEvent: expect.objectContaining({ type: "CANCEL" }),
+          }),
+        ],
         status: "fulfilled",
-        result: { ok: true, value: true },
+        result: expect.objectContaining({
+          ok: true,
+          value: expect.objectContaining({ kind: "applied" }),
+        }),
       }),
     );
 
@@ -118,7 +137,7 @@ describe("cancelled message (integration)", () => {
         const messages = await harness.db.query.messages.findMany();
         expect(messages).toHaveLength(2);
         expect(messages[0].role).toBe("user");
-        expect(messages[0].content).toBe("tc=cancelled-test [sleep=medium]");
+        expect(messages[0].content).toBe("tc=cancelled-test [sleep=long]");
         expect(messages[1].role).toBe("assistant");
         // This notice is what the UI renders as the "Cancelled" indicator.
         expect(messages[1].content).toContain("[Response cancelled by user]");
@@ -154,5 +173,5 @@ describe("cancelled message (integration)", () => {
     expect(dump.text).toContain("tc=cancelled-test");
     expect(dump.text).toContain("Response cancelled by user");
     expect(dump.text).toContain("[dump] tc=follow-up");
-  }, 60_000);
+  }, 120_000);
 });

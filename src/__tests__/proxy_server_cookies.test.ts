@@ -63,11 +63,39 @@ function startUpstream(
 /** Issues a GET to the proxy and resolves with the raw Set-Cookie header. */
 function getSetCookie(port: number): Promise<string[]> {
   return new Promise((resolve, reject) => {
-    const req = http.get({ host: "localhost", port, path: "/" }, (res) => {
-      // Drain the body so the socket can close.
-      res.on("data", () => {});
-      res.on("end", () => resolve(res.headers["set-cookie"] ?? []));
-    });
+    const req = http.get(
+      {
+        host: "127.0.0.1",
+        port,
+        headers: { Host: `app-42.localhost:${port}` },
+        path: "/",
+      },
+      (res) => {
+        // Drain the body so the socket can close.
+        res.on("data", () => {});
+        res.on("end", () => resolve(res.headers["set-cookie"] ?? []));
+      },
+    );
+    req.once("error", reject);
+  });
+}
+
+/** Issues a GET to the proxy and resolves with the decoded response body. */
+function getBody(port: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const req = http.get(
+      {
+        host: "127.0.0.1",
+        port,
+        headers: { Host: `app-42.localhost:${port}` },
+        path: "/",
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+        res.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+      },
+    );
     req.once("error", reject);
   });
 }
@@ -84,7 +112,9 @@ describe("proxy worker cookie rewriting", () => {
   function startWorker(workerData: Record<string, unknown>): {
     waitForStart: () => Promise<number>;
   } {
-    const worker = new Worker(WORKER_PATH, { workerData });
+    const worker = new Worker(WORKER_PATH, {
+      workerData: { hostname: "app-42.localhost", ...workerData },
+    });
     cleanup.push(async () => {
       await worker.terminate();
     });
@@ -213,5 +243,34 @@ describe("proxy worker cookie rewriting", () => {
     expect(cookie).toMatch(/;\s*SameSite=None/i);
     expect(cookie).not.toMatch(/Partitioned/i);
     expect(cookie).not.toMatch(/SameSite=Lax/i);
+  });
+
+  it("injects the proxy session capability into the auth bootstrap script", async () => {
+    const upstream = await startUpstream([], {
+      contentType: "text/html",
+      body: "<html><head></head><body>hi</body></html>",
+    });
+    cleanup.push(upstream.close);
+
+    const port = await findFreePort();
+    const authBootstrapToken = `token<&"boundary`;
+    const { waitForStart } = startWorker({
+      targetOrigin: upstream.origin,
+      port,
+      fallbackPortStart: await findFreePort(),
+      maxPortAttempts: 20,
+      authBootstrapToken,
+    });
+
+    const body = await getBody(await waitForStart());
+
+    const escapedToken = "token&lt;&amp;&quot;boundary";
+    expect(body).toContain(`data-dyad-auth-token="${escapedToken}"`);
+    expect(body).toContain(`data-dyad-recorder-token="${escapedToken}"`);
+    expect(body).not.toContain(`data-dyad-auth-token="${authBootstrapToken}"`);
+    expect(body).not.toContain(
+      `data-dyad-recorder-token="${authBootstrapToken}"`,
+    );
+    expect(body).toContain('data.type === "dyad-auth-login"');
   });
 });

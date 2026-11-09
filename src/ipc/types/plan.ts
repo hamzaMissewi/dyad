@@ -24,38 +24,14 @@ export const PlanExitSchema = z.object({
 
 export type PlanExitPayload = z.infer<typeof PlanExitSchema>;
 
-export const QuestionSchema = z
+export const PlanHandoffPresentationSchema = z
   .object({
-    id: z.string(),
-    type: z.enum(["text", "radio", "checkbox"]),
-    question: z.string(),
-    options: z.array(z.string()).min(1).optional(),
-    required: z.boolean().optional(),
-    placeholder: z.string().optional(),
+    handoffId: z.string().min(1),
+    sourceChatId: z.number().int().positive(),
+    targetChatId: z.number().int().positive(),
+    appId: z.number().int().positive(),
   })
-  .refine((q) => q.type === "text" || (q.options && q.options.length >= 1), {
-    message: "options are required for radio and checkbox questions",
-    path: ["options"],
-  });
-
-export type Question = z.infer<typeof QuestionSchema>;
-
-export const PlanQuestionnaireSchema = z.object({
-  chatId: z.number(),
-  requestId: z.string(),
-  questions: z.array(QuestionSchema),
-});
-
-export type PlanQuestionnairePayload = z.infer<typeof PlanQuestionnaireSchema>;
-
-export const QuestionnaireResponseSchema = z.object({
-  requestId: z.string(),
-  answers: z.record(z.string(), z.string()).nullable(),
-});
-
-export type QuestionnaireResponsePayload = z.infer<
-  typeof QuestionnaireResponseSchema
->;
+  .strict();
 
 export const PlanSchema = z.object({
   id: z.string(),
@@ -64,9 +40,9 @@ export const PlanSchema = z.object({
   title: z.string(),
   summary: z.string().nullable(),
   content: z.string(),
-  // "draft" while the user is still reviewing the plan, "accepted" once they
-  // choose to implement it. Legacy plans without a status are treated as
-  // "accepted".
+  // "draft" while the user is reviewing and "accepted" only after
+  // implementation admission commits. Legacy plans without a status are
+  // treated as accepted.
   status: z.enum(["draft", "accepted"]),
   createdAt: z.string(),
   updatedAt: z.string(),
@@ -106,10 +82,9 @@ export const planEvents = {
     channel: "plan:exit",
     payload: PlanExitSchema,
   }),
-
-  questionnaire: defineEvent({
-    channel: "plan:questionnaire",
-    payload: PlanQuestionnaireSchema,
+  handoffPresentation: defineEvent({
+    channel: "plan:handoff-presentation",
+    payload: PlanHandoffPresentationSchema,
   }),
 } as const;
 
@@ -143,12 +118,6 @@ export const planContracts = {
   deletePlan: defineContract({
     channel: "plan:delete",
     input: z.object({ appId: z.number(), planId: z.string() }),
-    output: z.void(),
-  }),
-
-  respondToQuestionnaire: defineContract({
-    channel: "plan:questionnaire-response",
-    input: QuestionnaireResponseSchema,
     output: z.void(),
   }),
 } as const;

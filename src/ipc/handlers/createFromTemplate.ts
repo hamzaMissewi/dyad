@@ -21,8 +21,10 @@ export async function createFromTemplate({
   const templateId = requestedTemplateId ?? settings.selectedTemplateId;
 
   if (templateId === "react") {
+    const sourceScaffoldPath = path.join(__dirname, "..", "..", "scaffold");
+    const repoScaffoldPath = path.join(process.cwd(), "scaffold");
     await copyDirectoryRecursive(
-      path.join(__dirname, "..", "..", "scaffold"),
+      fs.existsSync(sourceScaffoldPath) ? sourceScaffoldPath : repoScaffoldPath,
       fullAppPath,
     );
     return;
@@ -91,7 +93,7 @@ async function cloneRepo(repoUrl: string): Promise<string> {
       const apiUrl = `https://api.github.com/repos/${orgName}/${repoName}/commits/HEAD`;
       logger.info(`Fetching remote SHA from ${apiUrl}`);
 
-      // Use native fetch instead of isomorphic-git http.request
+      // Use native fetch for the template archive.
       const response = await fetch(apiUrl, {
         method: "GET",
         headers: {

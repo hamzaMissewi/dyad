@@ -5,12 +5,13 @@ import path from "node:path";
 import log from "electron-log";
 import {
   commitPnpmAllowBuildsConfigIfChanged,
+  getBestEffortPnpmRebuildCommand,
   PNPM_INSTALL_POLICY_ARGS,
   PNPM_PM_ON_FAIL_IGNORE_ARG,
 } from "@/ipc/utils/socket_firewall";
 import { IS_TEST_BUILD } from "./test_utils";
 import { z } from "zod";
-import { gitIsIgnoredIso } from "./git_utils";
+import { isPathIgnoredByGitIgnore } from "./gitignore_utils";
 import { getDyadEngineBaseUrl } from "./dyad_engine_url";
 
 const logger = log.scope("cloud_sandbox_provider");
@@ -136,6 +137,18 @@ function getDefaultInstallCommand(): string {
 
 function getDefaultStartCommand(): string {
   return `pnpm ${PNPM_PM_ON_FAIL_IGNORE_ARG} run dev`;
+}
+
+function appendBestEffortPnpmRebuild(
+  installCommand: string,
+  packageNames: string[],
+): string {
+  const rebuildCommand = getBestEffortPnpmRebuildCommand(packageNames);
+  if (!rebuildCommand) {
+    return installCommand;
+  }
+
+  return `${installCommand} && ${rebuildCommand}`;
 }
 
 function getDefaultCloudSandboxErrorMessage(status: number): string {
@@ -390,18 +403,10 @@ async function isCloudSandboxGitIgnored(
   appPath: string,
   relativePath: string,
 ): Promise<boolean> {
-  try {
-    return await gitIsIgnoredIso({
-      path: appPath,
-      filepath: normalizePath(relativePath),
-    });
-  } catch (error) {
-    logger.warn(
-      `Failed to evaluate gitignore rules for cloud sandbox path ${relativePath}:`,
-      error,
-    );
-    return false;
-  }
+  return isPathIgnoredByGitIgnore({
+    basePath: appPath,
+    filePath: path.join(appPath, normalizePath(relativePath)),
+  });
 }
 
 async function shouldIncludeCloudSandboxPath(
@@ -702,11 +707,18 @@ class DyadEngineCloudSandboxProvider implements CloudSandboxProvider {
     installCommand?: string | null;
     startCommand?: string | null;
   }) {
+    let promotedPackages: string[] = [];
     if (!input.installCommand?.trim()) {
-      await commitPnpmAllowBuildsConfigIfChanged(input.appPath);
+      promotedPackages = (
+        await commitPnpmAllowBuildsConfigIfChanged(input.appPath)
+      ).promotedPackages;
     }
 
-    const { installCommand, startCommand } = resolveCloudSandboxCommands(input);
+    const { installCommand: resolvedInstallCommand, startCommand } =
+      resolveCloudSandboxCommands(input);
+    const installCommand = input.installCommand?.trim()
+      ? resolvedInstallCommand
+      : appendBestEffortPnpmRebuild(resolvedInstallCommand, promotedPackages);
     const response = await cloudSandboxFetch("/sandboxes", {
       method: "POST",
       body: JSON.stringify({
@@ -1004,6 +1016,12 @@ export function queueCloudSandboxSnapshotSync(input: {
 }
 
 export async function reconcileCloudSandboxes(): Promise<string[]> {
+  // Without a Dyad Pro API key there are no cloud sandboxes to reconcile;
+  // skip instead of logging an auth error on every startup.
+  const apiKey = readSettings().providerSettings?.auto?.apiKey?.value;
+  if (!apiKey && !IS_TEST_BUILD) {
+    return [];
+  }
   try {
     const response = await cloudSandboxFetch("/sandboxes/reconcile", {
       method: "POST",

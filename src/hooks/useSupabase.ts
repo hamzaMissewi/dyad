@@ -1,9 +1,13 @@
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { useAtom, useAtomValue, useSetAtom } from "jotai";
-import { useEffect, useRef } from "react";
+import {
+  useQuery,
+  useMutation,
+  useQueryClient,
+  useMutationState,
+} from "@tanstack/react-query";
+import { useAtom, useAtomValue } from "jotai";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { lastLogTimestampAtom } from "@/atoms/supabaseAtoms";
 import { selectedAppIdAtom } from "@/atoms/appAtoms";
-import { appendConsoleEntriesForAppAtom } from "@/atoms/previewRuntimeAtoms";
 import {
   ipc,
   ConsoleEntry,
@@ -12,12 +16,30 @@ import {
   SupabaseOrganizationInfo,
   SupabaseProject,
   SupabaseBranch,
+  SupabaseRedeployProgress,
+  CreateSupabaseProjectParams,
+  SUPABASE_PROJECT_CREATED_BUT_UNLINKED,
 } from "@/ipc/types";
 import { useSettings } from "./useSettings";
 import { isSupabaseConnected } from "@/lib/schemas";
 import { queryKeys } from "@/lib/queryKeys";
+import { appLogForwarder } from "@/lib/app_log_forwarder";
+import { useAppRunRemoteManager } from "@/app_run/AppRunRemoteProvider";
 
 const EDGE_LOGS_POLL_INTERVAL_MS = 5_000;
+
+/**
+ * Did a create fail *after* the project was created? Matched on the code the
+ * handler sets, which survives IPC. Not on the kind: `Internal` is the
+ * catch-all for bugs, so anything else raised on this path would otherwise
+ * tell the user a project was minted when none was.
+ */
+export function isCreatedButUnlinkedError(error: unknown): boolean {
+  return (
+    (error as { code?: unknown } | null)?.code ===
+    SUPABASE_PROJECT_CREATED_BUT_UNLINKED
+  );
+}
 
 export interface UseSupabaseOptions {
   branchesProjectId?: string | null;
@@ -39,7 +61,7 @@ export function useSupabase(options: UseSupabaseOptions = {}) {
   const { settings } = useSettings();
   const isConnected = isSupabaseConnected(settings);
 
-  const appendConsoleEntries = useSetAtom(appendConsoleEntriesForAppAtom);
+  const appRunManager = useAppRunRemoteManager();
   const selectedAppId = useAtomValue(selectedAppIdAtom);
   const [lastLogTimestamp, setLastLogTimestamp] = useAtom(lastLogTimestampAtom);
 
@@ -74,13 +96,71 @@ export function useSupabase(options: UseSupabaseOptions = {}) {
     mutationFn: async (params) => {
       await ipc.supabase.deleteOrganization(params);
     },
-    onSuccess: () => {
-      queryClient.invalidateQueries({
-        queryKey: queryKeys.supabase.organizations,
-      });
-      queryClient.invalidateQueries({ queryKey: queryKeys.supabase.projects });
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: queryKeys.settings.user }),
+        queryClient.invalidateQueries({
+          queryKey: queryKeys.supabase.organizations,
+        }),
+        queryClient.invalidateQueries({
+          queryKey: queryKeys.supabase.projects,
+        }),
+      ]);
     },
     meta: { showErrorToast: true },
+  });
+
+  // Tracked per app rather than read off the mutation: a single observer only
+  // reports its most recent call, so with creates running for two apps the
+  // second one's variables would describe the first app's pending state.
+  // Counted rather than a membership set, so two creates for one app do not
+  // unlock the form as soon as the first settles.
+  const [creatingProjectAppIds, setCreatingProjectAppIds] = useState<
+    ReadonlyMap<number, number>
+  >(new Map());
+
+  // Mutation: Create a Supabase project and link it to an app.
+  // The handler does both, so a success here means the app is already
+  // connected; callers only need to refresh.
+  const createProjectMutation = useMutation<
+    SupabaseProject,
+    Error,
+    CreateSupabaseProjectParams
+  >({
+    mutationFn: async (params) => {
+      return ipc.supabase.createProject(params);
+    },
+    onMutate: ({ appId }) => {
+      setCreatingProjectAppIds((current) =>
+        new Map(current).set(appId, (current.get(appId) ?? 0) + 1),
+      );
+    },
+    onSettled: (_project, _error, { appId }) => {
+      setCreatingProjectAppIds((current) => {
+        const remaining = (current.get(appId) ?? 0) - 1;
+        const next = new Map(current);
+        if (remaining > 0) next.set(appId, remaining);
+        else next.delete(appId);
+        return next;
+      });
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.supabase.projects });
+      queryClient.invalidateQueries({ queryKey: queryKeys.apps.all });
+    },
+    // Only for the created-but-unlinked case, whose error tells the user to
+    // pick the project from a list that is still the pre-create snapshot.
+    // Refetching after an ordinary failure would be worse than nothing:
+    // `listAllProjects` returns a partial list as a success, so an offline
+    // create would also replace a good cached list with an empty one.
+    onError: (error) => {
+      if (!isCreatedButUnlinkedError(error)) return;
+      queryClient.invalidateQueries({ queryKey: queryKeys.supabase.projects });
+      queryClient.invalidateQueries({ queryKey: queryKeys.apps.all });
+    },
+    // The connector renders the failure inline next to the form, and a toast on
+    // top of that would say the same thing twice.
+    meta: { showErrorToast: false },
   });
 
   // Mutation: Associate a Supabase project with an app
@@ -93,6 +173,18 @@ export function useSupabase(options: UseSupabaseOptions = {}) {
       await ipc.supabase.setAppProject(params);
     },
     meta: { showErrorToast: true },
+  });
+
+  // Background link recovery needs mutation pending-state tracking without a
+  // generic global error toast; the connector provides contextual feedback.
+  const recoverAppProjectMutation = useMutation<
+    void,
+    Error,
+    SetSupabaseAppProjectParams
+  >({
+    mutationFn: async (params) => {
+      await ipc.supabase.setAppProject(params);
+    },
   });
 
   // Mutation: Remove a Supabase project association from an app
@@ -198,10 +290,8 @@ export function useSupabase(options: UseSupabaseOptions = {}) {
       : logs;
     if (newLogs.length === 0) return;
 
-    newLogs.forEach((log) => {
-      ipc.misc.addLog(log);
-    });
-    appendConsoleEntries({ appId, entries: newLogs });
+    appLogForwarder.enqueue(newLogs);
+    appRunManager.previewConsole.append(appId, newLogs);
 
     const latestLog = newLogs.reduce((latest, log) =>
       log.timestamp > latest.timestamp ? log : latest,
@@ -237,8 +327,11 @@ export function useSupabase(options: UseSupabaseOptions = {}) {
     branchesError: branchesQuery.error,
 
     // Mutation states
+    isCreatingProjectForApp: (appId: number) =>
+      (creatingProjectAppIds.get(appId) ?? 0) > 0,
     isDeletingOrganization: deleteOrganizationMutation.isPending,
-    isSettingAppProject: setAppProjectMutation.isPending,
+    isSettingAppProject:
+      setAppProjectMutation.isPending || recoverAppProjectMutation.isPending,
     isUnsettingAppProject: unsetAppProjectMutation.isPending,
     isLoadingEdgeLogs: edgeLogsQuery.isFetching,
 
@@ -247,7 +340,62 @@ export function useSupabase(options: UseSupabaseOptions = {}) {
     refetchProjects: projectsQuery.refetch,
     refetchBranches: branchesQuery.refetch,
     deleteOrganization: deleteOrganizationMutation.mutateAsync,
+    createProject: createProjectMutation.mutateAsync,
     setAppProject: setAppProjectMutation.mutateAsync,
+    recoverAppProject: recoverAppProjectMutation.mutateAsync,
     unsetAppProject: unsetAppProjectMutation.mutateAsync,
+  };
+}
+
+export function useRedeploySupabaseFunctions(appId: number) {
+  const [progress, setProgress] = useState<SupabaseRedeployProgress | null>(
+    null,
+  );
+  const mutationKey = queryKeys.supabase.redeploy({ appId });
+  const activeOperationIds = useMutationState<string | null>({
+    filters: { mutationKey, status: "pending" },
+    select: (pendingMutation) => {
+      const variables = pendingMutation.state.variables as
+        | { appId: number; operationId: string }
+        | undefined;
+      return variables?.operationId ?? null;
+    },
+  });
+  const cachedOperationId = activeOperationIds.at(-1) ?? null;
+  const activeOperationIdRef = useRef<string | null>(cachedOperationId);
+
+  useEffect(() => {
+    activeOperationIdRef.current = cachedOperationId;
+  }, [cachedOperationId]);
+
+  useEffect(() => {
+    return ipc.events.supabase.onRedeployProgress((nextProgress) => {
+      if (nextProgress.operationId === activeOperationIdRef.current) {
+        setProgress(nextProgress);
+      }
+    });
+  }, []);
+
+  const mutation = useMutation({
+    mutationKey,
+    mutationFn: (params: { appId: number; operationId: string }) =>
+      ipc.supabase.redeployAllFunctions(params),
+  });
+
+  const redeployAllFunctions = useCallback(async () => {
+    const operationId = `supabase-redeploy:${globalThis.crypto.randomUUID()}`;
+    activeOperationIdRef.current = operationId;
+    setProgress(null);
+    try {
+      return await mutation.mutateAsync({ appId, operationId });
+    } finally {
+      activeOperationIdRef.current = null;
+    }
+  }, [appId, mutation]);
+
+  return {
+    redeployAllFunctions,
+    redeployProgress: progress,
+    isRedeployingFunctions: activeOperationIds.length > 0,
   };
 }

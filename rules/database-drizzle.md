@@ -2,6 +2,12 @@
 
 This app uses SQLite and drizzle ORM.
 
+When logic depends on conversation insertion adjacency (for example, finding
+the assistant response immediately after a user message), order messages by
+`messages.id`, not `createdAt`. Compaction summaries may be inserted later with
+an older logical timestamp, so timestamp ordering can move them ahead of the
+response they followed in storage.
+
 Generate SQL migrations by running this:
 
 ```sh
@@ -9,6 +15,13 @@ npm run db:generate
 ```
 
 IMPORTANT: Do NOT generate SQL migration files by hand! This is wrong.
+
+For SQL that drizzle cannot model (FTS5 virtual tables, triggers), generate a correctly numbered scaffold with `npm run db:generate -- --custom --name <slug>` and put the hand-written SQL inside it (statements separated by `--> statement-breakpoint`). Model any ordinary companion tables in `schema.ts` and generate their migration normally first. `createInMemoryTestDb()` applies the real `./drizzle` migrations, so virtual tables and triggers are exercised in unit tests automatically.
+
+## Loading chat messages
+
+- A nested relational query (`db.query.chats.findFirst({ with: { messages: ... } })`) compiles to `json_group_array` on SQLite: the whole child list comes back as one JSON string that is then parsed. For chats with large `content` / `ai_messages_json`, load messages with a top-level `db.query.messages.findMany` or `db.select` and an explicit column subset (`rendererMessageColumns` for display), and compute sizes with `length(...)` in SQL instead of loading payloads.
+- Agent model history goes through `src/ipc/utils/chat_history_loader.ts` (post-compaction boundary, bounded by `MAX_AGENT_HISTORY_CHARS`). `chat:count-tokens` runs on every chat open and turn end, so it estimates from stored lengths; do not build or `JSON.stringify` the history there.
 
 ## Neon migration preview
 
@@ -27,6 +40,8 @@ When rebasing a branch that has drizzle migrations conflicting with upstream (e.
 5. Commit the regenerated migration. Either as a separate commit (e.g., `chore(db): renumber migration to 00YY after rebase`), or — to keep each commit's schema and migration self-consistent — fold it back into the commit that introduced the schema change: `git add drizzle/ && git commit --fixup=<schema-commit-sha>` then `GIT_SEQUENCE_EDITOR=true GIT_EDITOR=true git rebase -i --autosquash upstream/main`. The autosquash is conflict-free since the regenerated files are new.
 
 This avoids manual snapshot/journal editing and `prevId` mistakes. Verify afterward with `npm run db:generate` — it should report `No schema changes, nothing to migrate` if the snapshot is cumulative and consistent.
+
+**When the branch has a _chain_ of migration commits** (multiple migrations added and/or a "consolidate migrations" commit), the same `00XX_snapshot.json`/`_journal.json` conflicts recur on nearly every commit during rebase — don't try to hand-merge each one. Instead resolve each intermediate conflict just enough to proceed (e.g. `git checkout --theirs` the meta files, `git rm -f` orphaned renamed `.sql`), let the whole rebase finish, then do one clean reset: `rm` every extra `drizzle/00XX_*.sql` your branch added beyond upstream's set, `rm -rf drizzle/meta && git checkout upstream/main -- drizzle/meta`, and run a single `npm run db:generate`. drizzle-kit emits one cumulative migration for all your schema additions. Confirm with `git diff upstream/main --stat -- drizzle/` (should show only the new migration) and a second `db:generate` reporting `No schema changes`.
 
 ### Local dev DB breaks after renumbering (`Failed to run the query 'ALTER TABLE ... ADD ...'`)
 

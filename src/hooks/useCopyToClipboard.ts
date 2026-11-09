@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from "react";
 import { getLanguage } from "@/utils/get_language";
 import { unescapeXmlAttr, unescapeXmlContent } from "../../shared/xmlEscape";
+import { closeUnclosedSuggestedPrompts } from "@/lib/streamingMessageParser";
 
 const CUSTOM_TAG_NAMES = [
   "dyad-write",
@@ -9,9 +10,11 @@ const CUSTOM_TAG_NAMES = [
   "dyad-add-dependency",
   "dyad-execute-sql",
   "dyad-add-integration",
+  "dyad-suggest-plugin",
   "dyad-output",
   "dyad-problem-report",
   "dyad-chat-summary",
+  "dyad-suggested-prompts",
   "dyad-edit",
   "dyad-codebase-context",
   "dyad-script",
@@ -72,10 +75,39 @@ export const useCopyToClipboard = () => {
       }
     });
 
-    // Clean up the final result
-    return result
-      .replace(/\n{3,}/g, "\n\n") // Max 2 consecutive newlines
-      .trim();
+    // Clean up the final result. Only collapse runs of newlines OUTSIDE
+    // fenced code blocks so that verbatim file content inside ``` fences
+    // (e.g. PEP-8 blank lines, or fences containing nested ``` sequences)
+    // round-trips to the clipboard unchanged.
+    // Track fence boundaries line-by-line. The closing fence is the bare
+    // ``` line (no info string) that follows an opening ```<lang> line, so
+    // we record the opening delimiter and only close on an exact bare match.
+    const lines = result.split("\n");
+    let collapsed = "";
+    let openingFence: string | null = null; // null means not inside a fence
+    let consecutiveBlankLines = 0;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (openingFence === null && line.startsWith("```")) {
+        // Opening fence — record the bare ``` prefix so we close correctly.
+        openingFence = line.match(/^(`+)/)![1];
+      } else if (openingFence !== null && line === openingFence) {
+        // Closing fence — must exactly match the opening backtick run.
+        openingFence = null;
+      }
+      const inFence = openingFence !== null;
+      if (!inFence && line === "") {
+        consecutiveBlankLines++;
+        if (consecutiveBlankLines >= 2) {
+          // Would produce 3+ consecutive newlines (2+ blank lines) — skip it.
+          continue;
+        }
+      } else {
+        consecutiveBlankLines = 0;
+      }
+      collapsed += (i === 0 ? "" : "\n") + line;
+    }
+    return collapsed.trim();
   };
 
   // Convert individual custom tags to markdown (reuse the same logic from DyadMarkdownParser)
@@ -142,6 +174,22 @@ export const useCopyToClipboard = () => {
         return `### Add Database Integration\n\n`;
       }
 
+      case "dyad-suggest-plugin": {
+        // Only settled outcomes appear in a transcript: a pending card is
+        // superseded by its terminal card, and a dismissed one never
+        // rendered.
+        if (
+          attributes.outcome !== "connected" &&
+          attributes.outcome !== "declined" &&
+          attributes.outcome !== "never"
+        ) {
+          return "";
+        }
+        const pluginName = attributes.name || attributes.slug || "";
+        const reason = attributes.reason || "";
+        return `### Suggested plugin: ${pluginName}\n\n${reason ? `${reason}\n\n` : ""}`;
+      }
+
       case "dyad-codebase-context": {
         const files = attributes.files || "";
         let contextResult = `### Codebase Context\n\n`;
@@ -198,6 +246,7 @@ export const useCopyToClipboard = () => {
       }
 
       case "dyad-chat-summary":
+      case "dyad-suggested-prompts":
       case "dyad-command":
         // Don't include these in copy
         return "";
@@ -267,7 +316,7 @@ export const useCopyToClipboard = () => {
 
   // Simplified version of preprocessUnclosedTags
   const preprocessUnclosedTags = (content: string) => {
-    let processedContent = content;
+    let processedContent = closeUnclosedSuggestedPrompts(content);
 
     for (const tagName of CUSTOM_TAG_NAMES) {
       const openTagPattern = new RegExp(`<${tagName}(?:\\s[^>]*)?>`, "g");

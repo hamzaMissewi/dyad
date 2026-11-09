@@ -1,5 +1,5 @@
-import { useAtom, useAtomValue } from "jotai";
-import { selectedAppIdAtom, selectedVersionIdAtom } from "@/atoms/appAtoms";
+import { useAtomValue } from "jotai";
+import { selectedAppIdAtom } from "@/atoms/appAtoms";
 import { useVersions } from "@/hooks/useVersions";
 import { formatDistanceToNow } from "date-fns";
 import {
@@ -17,8 +17,6 @@ import { cn } from "@/lib/utils";
 import { queryKeys } from "@/lib/queryKeys";
 import { useQuery } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useCheckoutVersion } from "@/hooks/useCheckoutVersion";
-import { useLoadApp } from "@/hooks/useLoadApp";
 import { Textarea } from "@/components/ui/textarea";
 import {
   Tooltip,
@@ -27,7 +25,11 @@ import {
 } from "@/components/ui/tooltip";
 import { Virtuoso } from "react-virtuoso";
 
-import { useRunApp } from "@/hooks/useRunApp";
+import { useVersionPreview } from "@/hooks/useVersionPreview";
+import {
+  diffVersionIdForState,
+  isRestoreRecoveryFlowState,
+} from "@/version_preview/state";
 
 function HighlightMatch({
   text,
@@ -48,11 +50,6 @@ function HighlightMatch({
       {text.slice(index + query.length)}
     </>
   );
-}
-
-interface VersionPaneProps {
-  isVisible: boolean;
-  onClose: () => void;
 }
 
 type SaveVersionNote = (
@@ -85,7 +82,10 @@ interface VersionRowProps {
   searchQuery: string;
   selectedVersionId: string | null;
   isCheckingOutVersion: boolean;
+  isResolvingPreviewBranch: boolean;
   isRevertingVersion: boolean;
+  isAnyVersionMutationPending: boolean;
+  canSelectVersion: boolean;
   showNoteEditor: boolean;
   shouldAutoFocusNote: boolean;
   versionNumberByOid: Map<string, number>;
@@ -105,7 +105,10 @@ function VersionRow({
   searchQuery,
   selectedVersionId,
   isCheckingOutVersion,
+  isResolvingPreviewBranch,
   isRevertingVersion,
+  isAnyVersionMutationPending,
+  canSelectVersion,
   showNoteEditor,
   shouldAutoFocusNote,
   versionNumberByOid,
@@ -117,6 +120,11 @@ function VersionRow({
   onExpandNote,
   onRestoreVersion,
 }: VersionRowProps) {
+  const isRestoreDisabled =
+    isRevertingVersion ||
+    isCheckingOutVersion ||
+    isResolvingPreviewBranch ||
+    isAnyVersionMutationPending;
   const trimmedSearchQuery = searchQuery.trim();
   const displayMessage =
     version.message &&
@@ -143,7 +151,7 @@ function VersionRow({
           "opacity-50 cursor-not-allowed",
       )}
       onClick={() => {
-        if (!isCheckingOutVersion) {
+        if (canSelectVersion) {
           onVersionClick(version);
         }
       }}
@@ -303,17 +311,19 @@ function VersionRow({
                   e.stopPropagation();
                   onRestoreVersion(version);
                 }}
-                disabled={isRevertingVersion}
+                disabled={isRestoreDisabled}
                 className={cn(
                   "invisible mt-1 flex items-center gap-1 px-2 py-0.5 text-sm font-medium bg-(--primary) text-(--primary-foreground) hover:bg-background-lightest rounded-md transition-colors",
                   selectedVersionId === version.oid && "visible",
-                  isRevertingVersion && "opacity-50 cursor-not-allowed",
+                  isRestoreDisabled && "opacity-50 cursor-not-allowed",
                 )}
                 aria-label="Restore to this version"
                 title={
                   isRevertingVersion
                     ? "Restoring to this version..."
-                    : "Restore to this version"
+                    : isCheckingOutVersion || isResolvingPreviewBranch
+                      ? "Preparing version preview..."
+                      : "Restore to this version"
                 }
               >
                 {isRevertingVersion ? (
@@ -331,27 +341,34 @@ function VersionRow({
   );
 }
 
-export function VersionPane({ isVisible, onClose }: VersionPaneProps) {
+export function VersionPane() {
   const appId = useAtomValue(selectedAppIdAtom);
   const currentAppIdRef = useRef(appId);
   const previousAppIdRef = useRef(appId);
   currentAppIdRef.current = appId;
-  const { refreshApp, app } = useLoadApp(appId);
-  const { restartApp } = useRunApp();
   const {
     versions: liveVersions,
     refreshVersions,
-    revertVersion,
-    isRevertingVersion,
     setVersionFavorite,
     setVersionNote,
   } = useVersions(appId);
 
-  const [selectedVersionId, setSelectedVersionId] = useAtom(
-    selectedVersionIdAtom,
-  );
-  const { checkoutVersion, isCheckingOutVersion } = useCheckoutVersion();
-  const wasVisibleRef = useRef(false);
+  // Repository state lives in the version preview machine; this component
+  // only renders it and sends events.
+  const {
+    state: previewState,
+    projection: previewProjection,
+    isPaneVisible: isVisible,
+    send,
+  } = useVersionPreview(appId);
+  const isResolvingPreviewBranch = previewState.type === "resolving-origin";
+  const isCheckingOutVersion = previewState.type === "checking-out";
+  const isRevertingVersion = previewState.type === "restoring";
+  const isAnyVersionMutationPending =
+    !previewProjection.capabilities.canRestore;
+  const { canSelectVersion } = previewProjection.capabilities;
+  const selectedVersionId = diffVersionIdForState(previewState);
+
   const [cachedVersions, setCachedVersions] = useState<Version[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
   const [showFavoritesOnly, setShowFavoritesOnly] = useState(false);
@@ -466,46 +483,31 @@ export function VersionPane({ isVisible, onClose }: VersionPaneProps) {
     return map;
   }, [versions]);
 
+  // Pane-local UI state follows visibility transitions. Repository recovery
+  // does NOT: the machine handles close/return independently of this effect.
+  const wasVisibleRef = useRef(false);
   useEffect(() => {
-    async function updatePaneState() {
-      // When pane becomes visible after being closed
-      if (isVisible && !wasVisibleRef.current) {
-        if (appId) {
-          const result = await refreshVersions();
+    const wasVisible = wasVisibleRef.current;
+    wasVisibleRef.current = isVisible;
+
+    if (isVisible && !wasVisible) {
+      if (appId) {
+        void refreshVersions().then((result) => {
           setCachedVersions(result.data ?? liveVersionsRef.current);
-        }
+        });
       }
-
-      // Reset when closing
-      if (!isVisible && wasVisibleRef.current) {
-        flushPendingNoteSaves();
-        setSearchQuery("");
-        setShowFavoritesOnly(false);
-        setExpandedNoteVersionIds(new Set());
-        setAutoFocusNoteVersionIds(new Set());
-        if (selectedVersionId && appId) {
-          setSelectedVersionId(null);
-          await checkoutVersion({ appId, versionId: "main" });
-          if (app?.neonProjectId) {
-            await restartApp();
-          }
-        }
-      }
-
-      wasVisibleRef.current = isVisible;
+      return;
     }
-    updatePaneState();
-  }, [
-    isVisible,
-    selectedVersionId,
-    setSelectedVersionId,
-    appId,
-    app?.neonProjectId,
-    checkoutVersion,
-    flushPendingNoteSaves,
-    refreshVersions,
-    restartApp,
-  ]);
+
+    if (!isVisible && wasVisible) {
+      flushPendingNoteSaves();
+      setSearchQuery("");
+      setShowFavoritesOnly(false);
+      setExpandedNoteVersionIds(new Set());
+      setAutoFocusNoteVersionIds(new Set());
+      setCachedVersions([]);
+    }
+  }, [isVisible, appId, refreshVersions, flushPendingNoteSaves]);
 
   useEffect(() => {
     if (previousAppIdRef.current === appId) {
@@ -537,20 +539,47 @@ export function VersionPane({ isVisible, onClose }: VersionPaneProps) {
     return null;
   }
 
-  const handleVersionClick = async (version: Version) => {
-    if (appId) {
-      setSelectedVersionId(version.oid);
-      try {
-        await checkoutVersion({ appId, versionId: version.oid });
-      } catch (error) {
-        console.error("Could not checkout version, unselecting version", error);
-        setSelectedVersionId(null);
-      }
-      await refreshApp();
-      if (version.dbTimestamp) {
-        await restartApp();
-      }
-    }
+  if (isRestoreRecoveryFlowState(previewState)) {
+    return (
+      <div className="h-full border-t border-2 border-border w-full flex flex-col">
+        <div className="p-2 border-b border-border flex items-center justify-between">
+          <h2 className="text-base font-medium pl-2">Version History</h2>
+          <button
+            onClick={() => send({ type: "CLOSE" })}
+            className="p-1 hover:bg-(--background-lightest) rounded-md"
+            aria-label="Close version pane"
+          >
+            <X size={20} />
+          </button>
+        </div>
+        <div className="flex-1 flex items-center justify-center p-6">
+          <div className="max-w-sm text-center">
+            <h3 className="text-sm font-medium">
+              Version History is temporarily unavailable
+            </h3>
+            <p className="mt-2 text-sm text-muted-foreground">
+              Resolve the version recovery notice to continue.
+            </p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const handleVersionClick = (version: Version) => {
+    send({
+      type: "SELECT_VERSION",
+      versionId: version.oid,
+    });
+  };
+
+  const handleRestoreVersion = (version: Version) => {
+    if (appId === null) return;
+    send({
+      type: "RESTORE",
+      appId,
+      versionId: version.oid,
+    });
   };
 
   const favoriteFilteredVersions = showFavoritesOnly
@@ -694,27 +723,13 @@ export function VersionPane({ isVisible, onClose }: VersionPaneProps) {
     });
   };
 
-  const handleRestoreVersion = (version: Version) => {
-    void (async () => {
-      await revertVersion({
-        versionId: version.oid,
-      });
-      setSelectedVersionId(null);
-      // Close the pane after revert to force a refresh on next open
-      onClose();
-      if (version.dbTimestamp) {
-        await restartApp();
-      }
-    })();
-  };
-
   return (
     <div className="h-full border-t border-2 border-border w-full flex flex-col">
       <div className="p-2 border-b border-border flex items-center justify-between">
         <h2 className="text-base font-medium pl-2">Version History</h2>
         <div className="flex items-center gap-2">
           <button
-            onClick={onClose}
+            onClick={() => send({ type: "CLOSE" })}
             className="p-1 hover:bg-(--background-lightest) rounded-md  "
             aria-label="Close version pane"
           >
@@ -801,15 +816,16 @@ export function VersionPane({ isVisible, onClose }: VersionPaneProps) {
                   searchQuery={searchQuery}
                   selectedVersionId={selectedVersionId}
                   isCheckingOutVersion={isCheckingOutVersion}
+                  isResolvingPreviewBranch={isResolvingPreviewBranch}
                   isRevertingVersion={isRevertingVersion}
+                  isAnyVersionMutationPending={isAnyVersionMutationPending}
+                  canSelectVersion={canSelectVersion}
                   showNoteEditor={
                     expandedNoteVersionIds.has(version.oid) || !!version.note
                   }
                   shouldAutoFocusNote={autoFocusNoteVersionIds.has(version.oid)}
                   versionNumberByOid={versionNumberByOid}
-                  onVersionClick={(clickedVersion) => {
-                    void handleVersionClick(clickedVersion);
-                  }}
+                  onVersionClick={handleVersionClick}
                   onToggleFavorite={handleToggleFavorite}
                   onNoteFocus={handleNoteFocus}
                   onNoteChange={handleNoteChange}

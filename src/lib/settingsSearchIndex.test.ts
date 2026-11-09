@@ -6,6 +6,29 @@ import {
 } from "./settingsSearchIndex";
 
 describe("SETTINGS_SEARCH_INDEX", () => {
+  it("describes shared Build and Agent permissions", () => {
+    expect(
+      SETTINGS_SEARCH_INDEX.find(
+        (item) => item.id === SECTION_IDS.agentPermissions,
+      ),
+    ).toEqual({
+      id: SECTION_IDS.agentPermissions,
+      label: "Build and Agent Permissions",
+      description: "Configure permissions for Build and Agent built-in tools",
+      keywords: [
+        "build",
+        "agent",
+        "permissions",
+        "tools",
+        "approve",
+        "allow",
+        "consent",
+      ],
+      sectionId: SECTION_IDS.agentPermissions,
+      sectionLabel: "Build and Agent Permissions",
+    });
+  });
+
   it("includes the cloud sandbox experiment", () => {
     expect(
       SETTINGS_SEARCH_INDEX.find(
@@ -24,6 +47,78 @@ describe("SETTINGS_SEARCH_INDEX", () => {
         "pro",
         "credits",
         "secure",
+      ],
+      sectionId: SECTION_IDS.experiments,
+      sectionLabel: "Experiments",
+    });
+  });
+
+  it("includes the multi-window experiment", () => {
+    expect(
+      SETTINGS_SEARCH_INDEX.find(
+        (item) => item.id === SETTING_IDS.enableMultiWindow,
+      ),
+    ).toEqual({
+      id: SETTING_IDS.enableMultiWindow,
+      label: "Enable multiple windows",
+      description:
+        'Show the experimental "Open in New Window" action in app context menus',
+      keywords: [
+        "window",
+        "multiple",
+        "multi-window",
+        "app",
+        "context menu",
+        "experiment",
+      ],
+      sectionId: SECTION_IDS.experiments,
+      sectionLabel: "Experiments",
+    });
+  });
+
+  it("includes the run-tests-in-preview experiment", () => {
+    expect(
+      SETTINGS_SEARCH_INDEX.find(
+        (item) => item.id === SETTING_IDS.enableTestRunInPreview,
+      ),
+    ).toEqual({
+      id: SETTING_IDS.enableTestRunInPreview,
+      label: "Run tests in preview panel",
+      description:
+        "Send the Tests panel's headed runs to a native browser view inside the preview panel so you can watch them",
+      keywords: [
+        "tests",
+        "preview",
+        "playwright",
+        "cdp",
+        "debugging",
+        "native",
+        "webcontentsview",
+        "experiment",
+      ],
+      sectionId: SECTION_IDS.experiments,
+      sectionLabel: "Experiments",
+    });
+  });
+
+  it("includes the whole-project TypeScript experiment", () => {
+    expect(
+      SETTINGS_SEARCH_INDEX.find(
+        (item) => item.id === SETTING_IDS.runTypeScriptForWholeProject,
+      ),
+    ).toEqual({
+      id: SETTING_IDS.runTypeScriptForWholeProject,
+      label: "Run TypeScript for whole project",
+      description:
+        "Make the local agent's type-check tool report diagnostics for the whole project instead of selected paths",
+      keywords: [
+        "typescript",
+        "type check",
+        "project",
+        "agent",
+        "tool",
+        "diagnostics",
+        "experiment",
       ],
       sectionId: SECTION_IDS.experiments,
       sectionLabel: "Experiments",
@@ -104,6 +199,31 @@ describe("SETTINGS_SEARCH_INDEX", () => {
       description:
         "When many MCP tools are enabled, let the agent search for the tools on demand instead of listing every tool in its context. Requires sandbox script execution",
       keywords: ["mcp", "search", "tools", "agent", "sandbox", "context"],
+      sectionId: SECTION_IDS.experiments,
+      sectionLabel: "Experiments",
+    });
+  });
+
+  it("includes the advanced sub-agents experiment", () => {
+    expect(
+      SETTINGS_SEARCH_INDEX.find(
+        (item) => item.id === SETTING_IDS.enableAdvancedSubagents,
+      ),
+    ).toEqual({
+      id: SETTING_IDS.enableAdvancedSubagents,
+      label: "Advanced sub-agents",
+      description: "Let Agent manage and message existing sub-agent threads",
+      keywords: [
+        "sub-agent",
+        "advanced",
+        "agent",
+        "list",
+        "wait",
+        "cancel",
+        "message",
+        "follow-up",
+        "pro",
+      ],
       sectionId: SECTION_IDS.experiments,
       sectionLabel: "Experiments",
     });

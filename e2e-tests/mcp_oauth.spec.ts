@@ -1,7 +1,19 @@
 import path from "path";
 import { spawn } from "child_process";
-import { testSkipIfWindows } from "./helpers/test_helper";
+import { test, testSkipIfWindows } from "./helpers/test_helper";
 import { expect } from "@playwright/test";
+
+test.beforeEach(async ({ po }) => {
+  // These scenarios exercise manual consent, not Pro's safe-tool auto-approval.
+  await po.page.evaluate(async () => {
+    await (window as any).electron.ipcRenderer.invoke("set-user-settings", {
+      autoApproveSafeMcpTools: false,
+    });
+  });
+  await expect
+    .poll(() => po.settings.recordSettings().autoApproveSafeMcpTools)
+    .toBe(false);
+});
 
 testSkipIfWindows("mcp - oauth connects and calls a tool", async ({ po }) => {
   const fakePath = path.join(
@@ -19,7 +31,8 @@ testSkipIfWindows("mcp - oauth connects and calls a tool", async ({ po }) => {
   });
 
   // Wait for the fake server to be ready by checking stdout for the
-  // ready message. Mirrors the pattern in mcp.spec.ts.
+  // ready message. Mirrors the MCP HTTP fake-server startup pattern used by
+  // the hybrid MCP integration tests.
   await new Promise<void>((resolve, reject) => {
     const timeout = setTimeout(() => {
       reject(new Error("fake-oauth-mcp-server failed to start within timeout"));
@@ -44,7 +57,7 @@ testSkipIfWindows("mcp - oauth connects and calls a tool", async ({ po }) => {
   });
 
   try {
-    await po.setUp();
+    await po.setUpDyadPro({ localAgent: true });
 
     // Drive the OAuth authorize URL via fetch (redirect:follow) so
     // the test doesn't open the OS browser. The fake's /authorize
@@ -56,33 +69,29 @@ testSkipIfWindows("mcp - oauth connects and calls a tool", async ({ po }) => {
       };
     });
 
-    await po.navigation.goToSettingsTab();
-    await po.settings.scrollToSettingsSection("experiments");
-    await po.settings.toggleEnableMcpServersForBuildMode();
-    await po.settings.scrollToSettingsSection("tools-mcp");
+    await po.navigation.goToPluginsTab();
+    await po.plugins.openAddPluginDialog();
 
     await po.page
       .getByRole("textbox", { name: "My MCP Server" })
       .fill("testing-mcp-server");
     await po.page.getByTestId("mcp-transport-select").selectOption("http");
     await po.page.getByPlaceholder("http://localhost:3000").fill(`${base}/mcp`);
-    await po.page.getByRole("button", { name: "Add Server" }).click();
+    await po.plugins.submitAddPluginDialog();
     await expect(po.page.getByText("OAuth: connected")).toBeVisible({
       timeout: 15_000,
     });
 
     await po.navigation.goToAppsTab();
-    await po.chatActions.selectChatMode("build");
-    await po.sendPrompt("[call_tool=calculator_add]", {
+    await po.chatActions.selectChatMode("local-agent");
+    await po.sendPrompt("tc=local-agent/mcp-calculator", {
       skipWaitForCompletion: true,
     });
     await po.agentConsent.waitForAgentConsentBanner();
     await po.snapshotMessages();
     await po.agentConsent.clickAgentConsentAlwaysAllow();
-    await po.approveProposal();
-
-    await po.sendPrompt("[dump]");
-    await po.snapshotServerDump("all-messages");
+    await po.chatActions.waitForChatCompletion();
+    await expect(po.page.getByText(/The sum of 5 and 3 is 8/)).toBeVisible();
   } finally {
     fake.kill();
     await new Promise<void>((resolve) => {
@@ -148,7 +157,7 @@ testSkipIfWindows(
     });
 
     try {
-      await po.setUp();
+      await po.setUpDyadPro({ localAgent: true });
 
       await po.electronApp.evaluate(({ shell }) => {
         shell.openExternal = async (url) => {
@@ -156,10 +165,8 @@ testSkipIfWindows(
         };
       });
 
-      await po.navigation.goToSettingsTab();
-      await po.settings.scrollToSettingsSection("experiments");
-      await po.settings.toggleEnableMcpServersForBuildMode();
-      await po.settings.scrollToSettingsSection("tools-mcp");
+      await po.navigation.goToPluginsTab();
+      await po.plugins.openAddPluginDialog();
 
       await po.page
         .getByRole("textbox", { name: "My MCP Server" })
@@ -176,24 +183,22 @@ testSkipIfWindows(
       await po.page
         .getByPlaceholder("Pre-registered client secret")
         .fill(clientSecret);
-      await po.page.getByRole("button", { name: "Add Server" }).click();
+      await po.plugins.submitAddPluginDialog();
 
       await expect(po.page.getByText("OAuth: connected")).toBeVisible({
         timeout: 15_000,
       });
 
       await po.navigation.goToAppsTab();
-      await po.chatActions.selectChatMode("build");
-      await po.sendPrompt("[call_tool=calculator_add]", {
+      await po.chatActions.selectChatMode("local-agent");
+      await po.sendPrompt("tc=local-agent/mcp-calculator", {
         skipWaitForCompletion: true,
       });
       await po.agentConsent.waitForAgentConsentBanner();
       await po.snapshotMessages();
       await po.agentConsent.clickAgentConsentAlwaysAllow();
-      await po.approveProposal();
-
-      await po.sendPrompt("[dump]");
-      await po.snapshotServerDump("all-messages");
+      await po.chatActions.waitForChatCompletion();
+      await expect(po.page.getByText(/The sum of 5 and 3 is 8/)).toBeVisible();
     } finally {
       fake.kill();
       await new Promise<void>((resolve) => {
@@ -249,7 +254,7 @@ testSkipIfWindows(
     });
 
     try {
-      await po.setUp();
+      await po.setUpDyadPro({ localAgent: true });
       // Stub openExternal so an unintended browser pop is harmless; the
       // discovery 404 should bail before any redirect would happen.
       await po.electronApp.evaluate(({ shell }) => {
@@ -258,10 +263,8 @@ testSkipIfWindows(
         };
       });
 
-      await po.navigation.goToSettingsTab();
-      await po.settings.scrollToSettingsSection("experiments");
-      await po.settings.toggleEnableMcpServersForBuildMode();
-      await po.settings.scrollToSettingsSection("tools-mcp");
+      await po.navigation.goToPluginsTab();
+      await po.plugins.openAddPluginDialog();
 
       await po.page
         .getByRole("textbox", { name: "My MCP Server" })
@@ -270,7 +273,7 @@ testSkipIfWindows(
       await po.page
         .getByPlaceholder("http://localhost:3000")
         .fill(`${base}/mcp`);
-      await po.page.getByRole("button", { name: "Add Server" }).click();
+      await po.plugins.submitAddPluginDialog();
 
       // Toast fires once at registration and auto-dismisses; assert it
       // before the persistent panel below.
@@ -278,6 +281,8 @@ testSkipIfWindows(
         "OAuth connection failed. This server doesn't support OAuth.",
       );
 
+      // The full alert with the retry action lives on the detail page.
+      await po.plugins.openPluginDetail("testing-mcp-server");
       await expect(
         po.page.getByText("Server doesn't support OAuth", { exact: true }),
       ).toBeVisible({ timeout: 15_000 });
@@ -292,17 +297,15 @@ testSkipIfWindows(
 
       // Drive a tool call to prove the server is actually usable now.
       await po.navigation.goToAppsTab();
-      await po.chatActions.selectChatMode("build");
-      await po.sendPrompt("[call_tool=calculator_add]", {
+      await po.chatActions.selectChatMode("local-agent");
+      await po.sendPrompt("tc=local-agent/mcp-calculator", {
         skipWaitForCompletion: true,
       });
       await po.agentConsent.waitForAgentConsentBanner();
       await po.snapshotMessages();
       await po.agentConsent.clickAgentConsentAlwaysAllow();
-      await po.approveProposal();
-
-      await po.sendPrompt("[dump]");
-      await po.snapshotServerDump("all-messages");
+      await po.chatActions.waitForChatCompletion();
+      await expect(po.page.getByText(/The sum of 5 and 3 is 8/)).toBeVisible();
     } finally {
       fake.kill();
       await new Promise<void>((resolve) => {
@@ -358,17 +361,15 @@ testSkipIfWindows(
     });
 
     try {
-      await po.setUp();
+      await po.setUpDyadPro({ localAgent: true });
       await po.electronApp.evaluate(({ shell }) => {
         shell.openExternal = async (url) => {
           await fetch(url, { redirect: "follow" });
         };
       });
 
-      await po.navigation.goToSettingsTab();
-      await po.settings.scrollToSettingsSection("experiments");
-      await po.settings.toggleEnableMcpServersForBuildMode();
-      await po.settings.scrollToSettingsSection("tools-mcp");
+      await po.navigation.goToPluginsTab();
+      await po.plugins.openAddPluginDialog();
 
       await po.page
         .getByRole("textbox", { name: "My MCP Server" })
@@ -381,12 +382,14 @@ testSkipIfWindows(
       // of auto-connect; this is the entry point for the unauthorized
       // retry flow.
       await po.page.getByRole("switch", { name: "Use OAuth" }).click();
-      await po.page.getByRole("button", { name: "Add Server" }).click();
+      await po.plugins.submitAddPluginDialog();
 
       await po.toastNotifications.waitForToastWithText(
         "Server connection failed. This server requires authentication. Try enabling OAuth.",
       );
 
+      // The full alert with the retry action lives on the detail page.
+      await po.plugins.openPluginDetail("testing-mcp-server");
       await expect(
         po.page.getByText("Server requires authentication", { exact: true }),
       ).toBeVisible({ timeout: 15_000 });

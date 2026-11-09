@@ -1,4 +1,4 @@
-import fs from "node:fs";
+import fs from "node:fs/promises";
 import { z } from "zod";
 import { ToolDefinition, AgentContext, escapeXmlAttr } from "./types";
 import { safeJoin } from "@/ipc/utils/path_utils";
@@ -8,8 +8,19 @@ import {
   resolveTargetAppPath,
 } from "./resolve_app_context";
 import { resolveAttachmentLogicalPath } from "@/ipc/utils/media_path_utils";
-
-const readFile = fs.promises.readFile;
+import {
+  AGENT_READ_FILE_TRUNCATION_NOTICE,
+  boundAgentReadFileContent,
+  readContainedTextFile,
+  readTextFileLines,
+} from "@/ipc/utils/bounded_text_file";
+import { SANDBOX_READ_FILE_LIMIT_BYTES } from "@/ipc/utils/sandbox/limits";
+import {
+  isDotenvAttachment,
+  isDotenvFilePath,
+  redactDotenvValues,
+  selectTextLineRange,
+} from "@/utils/dotenv_redaction";
 
 const readFileSchema = z
   .object({
@@ -56,8 +67,8 @@ const readFileSchema = z
 export const readFileTool: ToolDefinition<z.infer<typeof readFileSchema>> = {
   name: "read_file",
   description: `Read the content of a file from the codebase or an attachment path such as attachments:notes.txt.
-  
-- You have the capability to call multiple tools in a single response. It is always better to speculatively read multiple files as a batch that are potentially useful.`,
+
+- Batch independent file reads when several files are concretely likely to be useful.`,
   inputSchema: readFileSchema,
   defaultConsent: "always",
 
@@ -99,6 +110,7 @@ export const readFileTool: ToolDefinition<z.infer<typeof readFileSchema>> = {
   execute: async (args, ctx: AgentContext) => {
     const targetAppPath = resolveTargetAppPath(ctx, args.app_name);
     let fullFilePath: string;
+    let attachmentIsDotenv = false;
     if (args.path.startsWith("attachments:")) {
       const attachment = await resolveAttachmentLogicalPath(
         targetAppPath,
@@ -112,6 +124,7 @@ export const readFileTool: ToolDefinition<z.infer<typeof readFileSchema>> = {
         );
       }
       fullFilePath = attachment.filePath;
+      attachmentIsDotenv = isDotenvAttachment(attachment);
     } else {
       fullFilePath = safeJoin(targetAppPath, args.path);
     }
@@ -122,33 +135,61 @@ export const readFileTool: ToolDefinition<z.infer<typeof readFileSchema>> = {
       appName: args.app_name,
     });
 
-    if (!fs.existsSync(fullFilePath)) {
-      const appContext = args.app_name ? ` (in app: ${args.app_name})` : "";
-      throw new DyadError(
-        `File does not exist: ${args.path}${appContext}`,
-        DyadErrorKind.NotFound,
+    const displayPath = args.app_name
+      ? `${args.path} (in app: ${args.app_name})`
+      : args.path;
+
+    let canonicalFilePath = fullFilePath;
+    try {
+      canonicalFilePath = await fs.realpath(fullFilePath);
+    } catch {
+      // The bounded reader below provides the user-facing filesystem error.
+    }
+    const shouldRedactDotenv =
+      attachmentIsDotenv ||
+      isDotenvFilePath(args.path) ||
+      isDotenvFilePath(canonicalFilePath);
+
+    if (shouldRedactDotenv) {
+      const source = await readContainedTextFile({
+        rootPath: targetAppPath,
+        filePath: canonicalFilePath,
+        displayPath,
+        maxBytes: SANDBOX_READ_FILE_LIMIT_BYTES,
+        validateRealPath: (realPath, realRootPath) =>
+          assertDyadInternalAccessAllowed({
+            targetAppPath: realRootPath,
+            fullFilePath: realPath,
+            appName: args.app_name,
+          }),
+      });
+      const selected = selectTextLineRange(
+        redactDotenvValues(source),
+        args.start_line_one_indexed,
+        args.end_line_one_indexed_inclusive,
       );
+      const bounded = boundAgentReadFileContent(selected);
+      return bounded.truncated
+        ? bounded.content + AGENT_READ_FILE_TRUNCATION_NOTICE
+        : bounded.content;
     }
 
-    const content = await readFile(fullFilePath, "utf8");
-    if (!content) return "";
+    const result = await readTextFileLines({
+      rootPath: targetAppPath,
+      filePath: fullFilePath,
+      displayPath,
+      startLine: args.start_line_one_indexed,
+      endLineInclusive: args.end_line_one_indexed_inclusive,
+      validateRealPath: (realPath, realRootPath) =>
+        assertDyadInternalAccessAllowed({
+          targetAppPath: realRootPath,
+          fullFilePath: realPath,
+          appName: args.app_name,
+        }),
+    });
 
-    const start = args.start_line_one_indexed;
-    const end = args.end_line_one_indexed_inclusive;
-
-    if (start == null && end == null) {
-      return content;
-    }
-
-    const hasTrailingNewline = content.endsWith("\n");
-    const lines = (hasTrailingNewline ? content.slice(0, -1) : content).split(
-      "\n",
-    );
-    const startIdx = Math.max(0, (start ?? 1) - 1);
-    const endIdx = Math.min(lines.length, end ?? lines.length);
-    const result = lines.slice(startIdx, endIdx).join("\n");
-    return endIdx >= lines.length && hasTrailingNewline
-      ? result + "\n"
-      : result;
+    return result.truncated
+      ? result.content + AGENT_READ_FILE_TRUNCATION_NOTICE
+      : result.content;
   },
 };

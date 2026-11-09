@@ -1,17 +1,24 @@
-import { BrowserWindow, clipboard } from "electron";
+import { app as electronApp, BrowserWindow, clipboard } from "electron";
+import {
+  discardCapture,
+  getCapture,
+  retainCapture,
+} from "@/ipc/utils/screenshot_captures";
 import { platform, arch } from "os";
-import { readSettings } from "../../main/settings";
+import { randomUUID } from "node:crypto";
+import { readEffectiveSettings, readSettings } from "../../main/settings";
 import { createTypedHandler } from "./base";
-import { systemContracts } from "../types/system";
+import { SCREENSHOT_ERRORS, systemContracts } from "../types/system";
 import { miscContracts, SESSION_DEBUG_SCHEMA_VERSION } from "../types/misc";
 import type { SystemDebugInfo } from "../types/system";
 import type { SessionDebugBundle } from "../types/misc";
-import type { UserSettings } from "@/lib/schemas";
+import { getSessionDebugSettings } from "@/lib/settingsDiagnostics";
 import type { AiMessagesJsonV6 } from "../../db/schema";
 
 import log from "electron-log";
 import path from "path";
 import fs from "fs";
+import { readRecentLogLines } from "../utils/log_level_filter";
 import { runShellCommand } from "../utils/runShellCommand";
 import { extractCodebase } from "../../utils/codebase";
 import { db } from "../../db";
@@ -31,6 +38,12 @@ import {
   PNPM_PM_ON_FAIL_IGNORE_ARG,
 } from "@/ipc/utils/socket_firewall";
 import { getLastUpdaterError } from "../../main/updater_state";
+import { getPreviousSessionCrashDump } from "../../main/previous_session_crash";
+import { RETAINED_DUMPS_DIR } from "../../utils/crash_dumps";
+import { collectCrashDumps } from "../../utils/crash_dump_report";
+import { collectProcessMemoryDiagnostics } from "../../utils/process_memory_diagnostics";
+import { resolveDefaultModelSelection } from "@/ipc/utils/model_effort";
+import { LAST_UPDATER_ERROR_HEADER } from "@/lib/debugLogFormatting";
 
 /**
  * Collects auto-updater failure details: the last updater error seen this
@@ -42,7 +55,7 @@ function readUpdaterLogs(): string | null {
 
   const lastError = getLastUpdaterError();
   if (lastError) {
-    sections.push(`Last updater error (this session):\n${lastError}`);
+    sections.push(`${LAST_UPDATER_ERROR_HEADER}\n${lastError}`);
   }
 
   if (process.platform === "win32") {
@@ -120,38 +133,7 @@ async function getSystemDebugInfo({
   const settings = readSettings();
   const telemetryId = settings.telemetryUserId || "unknown";
 
-  // Get logs from electron-log
-  let logs = "";
-  try {
-    const logPath = log.transports.file.getFile().path;
-    if (fs.existsSync(logPath)) {
-      const logContent = fs.readFileSync(logPath, "utf8");
-
-      const logLines = logContent.split("\n").filter((line) => {
-        if (level === "info") {
-          return true;
-        }
-        // Example line:
-        // [2025-06-09 13:55:05.209] [debug] (runShellCommand) Command "which node" succeeded with code 0: /usr/local/bin/node
-        const logLevelRegex = /\[.*?\] \[(\w+)\]/;
-        const match = line.match(logLevelRegex);
-        if (!match) {
-          // Include non-matching lines (like stack traces) when filtering for warnings
-          return true;
-        }
-        const logLevel = match[1];
-        if (level === "warn") {
-          return logLevel === "warn" || logLevel === "error";
-        }
-        return true;
-      });
-
-      logs = logLines.slice(-linesOfLogs).join("\n");
-    }
-  } catch (err) {
-    console.error("Failed to read log file:", err);
-    logs = `Error reading logs: ${err}`;
-  }
+  const logs = readAppLogs(linesOfLogs, level);
 
   return {
     nodeVersion,
@@ -176,62 +158,6 @@ function serializeModelForDebug(model: {
   customModelId?: number;
 }): string {
   return `${model.provider}:${model.name} | customId: ${model.customModelId}`;
-}
-
-/**
- * Extracts non-sensitive settings for the debug bundle.
- * All Secret fields (API keys, OAuth tokens) are excluded.
- * Provider setup status is derived as boolean flags only.
- */
-function sanitizeSettingsForDebug(settings: UserSettings) {
-  // Build provider setup status: { providerName: hasApiKey }
-  const providerSetupStatus: Record<string, boolean> = {};
-  if (settings.providerSettings) {
-    for (const [provider, providerSetting] of Object.entries(
-      settings.providerSettings,
-    )) {
-      providerSetupStatus[provider] = !!providerSetting?.apiKey?.value;
-    }
-  }
-
-  return {
-    selectedModel: {
-      name: settings.selectedModel.name,
-      provider: settings.selectedModel.provider,
-      customModelId: settings.selectedModel.customModelId,
-    },
-    selectedChatMode: settings.selectedChatMode ?? null,
-    defaultChatMode: settings.defaultChatMode ?? null,
-    autoApproveChanges: settings.autoApproveChanges ?? null,
-    enableDyadPro: settings.enableDyadPro ?? null,
-    thinkingBudget: settings.thinkingBudget ?? null,
-    maxChatTurnsInContext: settings.maxChatTurnsInContext ?? null,
-    enableAutoFixProblems: settings.enableAutoFixProblems ?? null,
-    enableNativeGit: settings.enableNativeGit ?? null,
-    enableAutoUpdate: settings.enableAutoUpdate,
-    releaseChannel: settings.releaseChannel,
-    runtimeMode2: settings.runtimeMode2 ?? null,
-    zoomLevel: settings.zoomLevel ?? null,
-    previewDeviceMode: settings.previewDeviceMode ?? null,
-    enableProLazyEditsMode: settings.enableProLazyEditsMode ?? null,
-    proLazyEditsMode: settings.proLazyEditsMode ?? null,
-    enableProSmartFilesContextMode:
-      settings.enableProSmartFilesContextMode ?? null,
-    enableProWebSearch: settings.enableProWebSearch ?? null,
-    proSmartContextOption: settings.proSmartContextOption ?? null,
-    enableSupabaseWriteSqlMigration:
-      settings.enableSupabaseWriteSqlMigration ?? null,
-    agentToolConsents: settings.agentToolConsents ?? null,
-    experiments: settings.experiments
-      ? Object.fromEntries(
-          Object.entries(settings.experiments).filter(
-            ([, v]) => typeof v === "boolean",
-          ),
-        )
-      : null,
-    customNodePath: settings.customNodePath ?? null,
-    providerSetupStatus,
-  };
 }
 
 /**
@@ -277,32 +203,20 @@ function stripImagesFromAiMessagesJson(json: AiMessagesJsonV6 | null): unknown {
 }
 
 /**
- * Reads application logs from the electron-log file.
+ * Reads application logs from the electron-log file and its rotated archive.
  */
 function readAppLogs(linesOfLogs: number, level: "warn" | "info"): string {
   try {
     const logPath = log.transports.file.getFile().path;
-    if (!fs.existsSync(logPath)) return "";
-
-    const logContent = fs.readFileSync(logPath, "utf8");
-    const logLines = logContent.split("\n").filter((line) => {
-      if (level === "info") return true;
-      const logLevelRegex = /\[.*?\] \[(\w+)\]/;
-      const match = line.match(logLevelRegex);
-      if (!match) return true;
-      const logLevel = match[1];
-      if (level === "warn") {
-        return logLevel === "warn" || logLevel === "error";
-      }
-      return true;
-    });
-
-    return logLines.slice(-linesOfLogs).join("\n");
+    return readRecentLogLines(logPath, linesOfLogs, level).join("\n");
   } catch (err) {
     console.error("Failed to read log file:", err);
     return `Error reading logs: ${err}`;
   }
 }
+
+/** Twice the preview's max-h-72, so it stays sharp on a HiDPI display. */
+const PREVIEW_MAX_HEIGHT = 576;
 
 export function registerDebugHandlers() {
   createTypedHandler(systemContracts.getSystemDebugInfo, async () => {
@@ -313,11 +227,12 @@ export function registerDebugHandlers() {
     });
   });
 
-  createTypedHandler(miscContracts.getSessionDebugBundle, async (_, chatId) => {
+  createTypedHandler(miscContracts.getSessionDebugBundle, async (_, req) => {
+    const { chatId, fromCrash } = req;
     console.log(`IPC: get-session-debug-bundle called for chat ${chatId}`);
 
     try {
-      const settings = readSettings();
+      const settings = await readEffectiveSettings();
 
       // Get Dyad version
       const packageJsonPath = path.resolve(
@@ -337,7 +252,13 @@ export function registerDebugHandlers() {
       }
 
       // Get runtime info in parallel
-      const [nodeVersion, pnpmVersion, nodePathResult] = await Promise.all([
+      const [
+        nodeVersion,
+        pnpmVersion,
+        nodePathResult,
+        memoryDiagnostics,
+        crashDumps,
+      ] = await Promise.all([
         runShellCommand("node --version").catch(() => null),
         runShellCommand(`pnpm ${PNPM_PM_ON_FAIL_IGNORE_ARG} --version`, {
           env: getPackageManagerCommandEnv(),
@@ -346,6 +267,19 @@ export function registerDebugHandlers() {
           ? runShellCommand("where.exe node")
           : runShellCommand("which node")
         ).catch(() => null),
+        // Best-effort: never throws, but guard anyway — diagnostics must
+        // not be able to break the session export.
+        collectProcessMemoryDiagnostics().catch((err) => {
+          console.error("Failed to collect memory diagnostics:", err);
+          return null;
+        }),
+        collectCrashDumps(
+          path.join(electronApp.getPath("userData"), RETAINED_DUMPS_DIR),
+          electronApp.getPath("crashDumps"),
+        ).catch((err) => {
+          console.error("Failed to collect crash dumps:", err);
+          return null;
+        }),
       ]);
 
       // Get chat with full messages from database
@@ -353,7 +287,10 @@ export function registerDebugHandlers() {
         where: eq(chats.id, chatId),
         with: {
           messages: {
-            orderBy: (messages, { asc }) => [asc(messages.createdAt)],
+            orderBy: (messages, { asc }) => [
+              asc(messages.createdAt),
+              asc(messages.id),
+            ],
           },
         },
       });
@@ -411,7 +348,11 @@ export function registerDebugHandlers() {
               : settings.telemetryUserId || "unknown",
         },
 
-        settings: sanitizeSettingsForDebug(settings),
+        settings: getSessionDebugSettings(
+          settings,
+          chatRecord.modelSelection ??
+            (await resolveDefaultModelSelection(settings)),
+        ),
 
         app: {
           id: app.id,
@@ -490,6 +431,17 @@ export function registerDebugHandlers() {
         codebase,
         logs,
         updaterLogs: readUpdaterLogs(),
+        memoryDiagnostics,
+        // Left out when the dumps could not be read, so nothing reports
+        // there being none.
+        ...(crashDumps && {
+          crashDumps: {
+            dumps: crashDumps,
+            ...(fromCrash && {
+              triggeringDump: getPreviousSessionCrashDump() ?? null,
+            }),
+          },
+        }),
       };
 
       return bundle;
@@ -499,22 +451,55 @@ export function registerDebugHandlers() {
     }
   });
 
-  console.log("Registered debug IPC handlers");
+  log.debug("Registered debug IPC handlers");
 
   createTypedHandler(systemContracts.takeScreenshot, async () => {
     const win = BrowserWindow.getFocusedWindow();
-    if (!win) throw new Error("No focused window to capture");
+    if (!win) {
+      throw new DyadError(
+        SCREENSHOT_ERRORS.noFocusedWindow,
+        DyadErrorKind.Precondition,
+      );
+    }
 
     // Capture the window's current contents as a NativeImage
     const image = await win.capturePage();
     // Validate image
     if (!image || image.isEmpty()) {
-      throw new DyadError(
-        "Failed to capture screenshot",
-        DyadErrorKind.External,
-      );
+      throw new DyadError(SCREENSHOT_ERRORS.emptyImage, DyadErrorKind.External);
     }
-    // Write the image to the clipboard
+    // Held here, not written to the clipboard: the report uploads it when it
+    // is filed, and only falls back to the clipboard if that fails. Writing
+    // it now would replace whatever the reporter had copied for nothing.
+    const captureId = randomUUID();
+    retainCapture(captureId, image);
+
+    // Main keeps the full-resolution capture; the returned data URL only ever
+    // feeds a preview 288 CSS pixels tall. Encoding the untouched image
+    // blocks this process for the whole PNG pass and ships megabytes over
+    // IPC.
+    const preview =
+      image.getSize().height > PREVIEW_MAX_HEIGHT
+        ? image.resize({ height: PREVIEW_MAX_HEIGHT, quality: "good" })
+        : image;
+
+    return { dataUrl: preview.toDataURL(), captureId };
+  });
+
+  createTypedHandler(systemContracts.discardScreenshot, async (_, params) => {
+    return { discarded: discardCapture(params.captureId) };
+  });
+
+  // The fallback when the upload fails: the reporter pastes into GitHub
+  // instead, so the image goes on the clipboard right before the browser
+  // opens, when nothing they copied since can have replaced it.
+  createTypedHandler(systemContracts.recopyScreenshot, async (_, params) => {
+    const image = getCapture(params.captureId);
+    if (!image) return { copied: false };
     clipboard.writeImage(image);
+    // A full-resolution picture of the window can show source, paths or an
+    // open .env, and the clipboard is its last stop. Nothing reads it again.
+    discardCapture(params.captureId);
+    return { copied: true };
   });
 }

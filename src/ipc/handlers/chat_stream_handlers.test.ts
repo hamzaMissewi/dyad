@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { MCP_TRANSCRIPT_PAYLOAD_MAX_CHARS } from "@/ipc/utils/mcp_transcript_preview";
 
 import {
   getDyadWriteTags,
@@ -9,14 +10,238 @@ import {
 
 import { processFullResponseActions } from "@/ipc/processors/response_processor";
 import {
+  addTrackedValue,
+  markStreamAdmitted,
   removeDyadTags,
+  removeTrackedValue,
+  setPartialResponseForStream,
   hasUnclosedDyadWrite,
+  processStreamChunks,
+  resolveImplementerCapabilityState,
+  takePartialResponseForStream,
 } from "@/ipc/handlers/chat_stream_handlers";
+import { resolveRootDatabasePromptState } from "@/shared/database_provider";
+import type { AsyncIterableStream, TextStreamPart, ToolSet } from "ai";
 import fs from "node:fs";
+import path from "node:path";
 import { db } from "@/db";
 import { cleanFullResponse } from "@/ipc/utils/cleanFullResponse";
 import { gitAdd, gitRemove, gitCommit } from "@/ipc/utils/git_utils";
 import { DyadError, DyadErrorKind } from "@/errors/dyad_error";
+
+const MOCK_APP_PATH = "/mock/user/data/path/mock-app-path";
+const appPath = (...segments: string[]) =>
+  path.join(MOCK_APP_PATH, ...segments);
+
+describe("stream invocation tracking", () => {
+  it("keeps a newer invocation tracked when an older one finishes", () => {
+    const trackedInvocations = new Map<number, Set<object>>();
+    const olderInvocation = {};
+    const newerInvocation = {};
+
+    addTrackedValue(trackedInvocations, 42, olderInvocation);
+    addTrackedValue(trackedInvocations, 42, newerInvocation);
+    removeTrackedValue(trackedInvocations, 42, olderInvocation);
+
+    expect(trackedInvocations.get(42)).toEqual(new Set([newerInvocation]));
+  });
+
+  it("reports concurrency only when a distinct second chat is admitted", () => {
+    const admittedStreams = new Map<number, Set<object>>();
+    const firstChatStream = {};
+    const duplicateFirstChatStream = {};
+    const secondChatStream = {};
+
+    expect(markStreamAdmitted(admittedStreams, 42, firstChatStream)).toBeNull();
+    expect(
+      markStreamAdmitted(admittedStreams, 42, duplicateFirstChatStream),
+    ).toBeNull();
+    expect(markStreamAdmitted(admittedStreams, 84, secondChatStream)).toBe(2);
+  });
+
+  it("keeps partial responses isolated between concurrent streams", () => {
+    const olderStream = new AbortController();
+    const newerStream = new AbortController();
+
+    setPartialResponseForStream(olderStream, "older partial response");
+    setPartialResponseForStream(newerStream, "newer partial response");
+
+    expect(takePartialResponseForStream(olderStream)).toBe(
+      "older partial response",
+    );
+    expect(takePartialResponseForStream(newerStream)).toBe(
+      "newer partial response",
+    );
+  });
+});
+
+describe("root database prompt selection", () => {
+  it("handles a legacy dual-linked row deterministically", () => {
+    expect(
+      resolveRootDatabasePromptState({
+        hasSupabaseProject: true,
+        supabaseCredentialsAvailable: false,
+        hasNeonProject: true,
+        neonCredentialsAvailable: true,
+      }),
+    ).toBe("neon");
+  });
+
+  it("selects usable Neon when the app is not linked to Supabase", () => {
+    expect(
+      resolveRootDatabasePromptState({
+        hasSupabaseProject: false,
+        supabaseCredentialsAvailable: false,
+        hasNeonProject: true,
+        neonCredentialsAvailable: true,
+      }),
+    ).toBe("neon");
+  });
+
+  it("reports a retained Neon association as disconnected without credentials", () => {
+    expect(
+      resolveRootDatabasePromptState({
+        hasSupabaseProject: false,
+        supabaseCredentialsAvailable: false,
+        hasNeonProject: true,
+        neonCredentialsAvailable: false,
+      }),
+    ).toBe("neon-disconnected");
+  });
+
+  it("prefers usable Neon even when Supabase credentials exist", () => {
+    expect(
+      resolveRootDatabasePromptState({
+        hasSupabaseProject: true,
+        supabaseCredentialsAvailable: true,
+        hasNeonProject: true,
+        neonCredentialsAvailable: true,
+      }),
+    ).toBe("neon");
+  });
+
+  it("keeps dual-linked prompts on disconnected Neon instead of usable Supabase", () => {
+    expect(
+      resolveRootDatabasePromptState({
+        hasSupabaseProject: true,
+        supabaseCredentialsAvailable: true,
+        hasNeonProject: true,
+        neonCredentialsAvailable: false,
+      }),
+    ).toBe("neon-disconnected");
+  });
+
+  it("keeps a dual-linked Neon association when neither provider is usable", () => {
+    expect(
+      resolveRootDatabasePromptState({
+        hasSupabaseProject: true,
+        supabaseCredentialsAvailable: false,
+        hasNeonProject: true,
+        neonCredentialsAvailable: false,
+      }),
+    ).toBe("neon-disconnected");
+  });
+
+  it("preserves a disconnected Supabase association", () => {
+    expect(
+      resolveRootDatabasePromptState({
+        hasSupabaseProject: true,
+        supabaseCredentialsAvailable: false,
+        hasNeonProject: false,
+        neonCredentialsAvailable: false,
+      }),
+    ).toBe("supabase-disconnected");
+  });
+
+  it("returns none when the app has no provider association", () => {
+    expect(
+      resolveRootDatabasePromptState({
+        hasSupabaseProject: false,
+        supabaseCredentialsAvailable: false,
+        hasNeonProject: false,
+        neonCredentialsAvailable: false,
+      }),
+    ).toBe("none");
+  });
+});
+
+describe("Implementer capability state", () => {
+  const app = {
+    supabaseProjectId: null,
+    supabaseOrganizationSlug: null,
+    neonProjectId: null,
+    neonActiveBranchId: null,
+    neonDevelopmentBranchId: null,
+  };
+
+  it("tracks Supabase metadata and schema consent independently", () => {
+    const state = resolveImplementerCapabilityState(
+      {
+        ...app,
+        supabaseProjectId: "supabase-project",
+        supabaseOrganizationSlug: "org",
+      },
+      {
+        supabase: {
+          accessToken: { value: "token" },
+          organizations: { org: { accessToken: { value: "token" } } },
+        },
+        agentToolConsents: { get_database_table_schema: "never" },
+      } as any,
+    );
+
+    expect(state.provider).toBe("supabase");
+    expect(state.providerMetadataReadAvailable).toBe(true);
+    expect(state.databaseSchemaReadAvailable).toBe(false);
+  });
+
+  it("fails Supabase capabilities closed without organization credentials", () => {
+    const state = resolveImplementerCapabilityState(
+      {
+        ...app,
+        supabaseProjectId: "supabase-project",
+        supabaseOrganizationSlug: "missing-org",
+      },
+      { supabase: { accessToken: { value: "legacy-token" } } } as any,
+    );
+
+    expect(state.provider).toBe("supabase");
+    expect(state.supabaseConnected).toBe(false);
+    expect(state.providerMetadataReadAvailable).toBe(false);
+    expect(state.databaseSchemaReadAvailable).toBe(false);
+  });
+
+  it("fails Neon capabilities closed without a branch", () => {
+    const state = resolveImplementerCapabilityState(
+      { ...app, neonProjectId: "neon-project" },
+      { neon: { accessToken: { value: "token" } } } as any,
+    );
+
+    expect(state.provider).toBe("neon");
+    expect(state.neonToolsAvailable).toBe(false);
+    expect(state.providerMetadataReadAvailable).toBe(false);
+    expect(state.databaseSchemaReadAvailable).toBe(false);
+  });
+
+  it("keeps root and Implementer on Neon when dual-linked providers are unavailable", () => {
+    const state = resolveImplementerCapabilityState(
+      {
+        ...app,
+        supabaseProjectId: "supabase-project",
+        supabaseOrganizationSlug: "missing-org",
+        neonProjectId: "neon-project",
+      },
+      {
+        supabase: { accessToken: { value: "legacy-token" } },
+        neon: { accessToken: { value: "token" } },
+      } as any,
+    );
+
+    expect(state.provider).toBe("neon");
+    expect(state.neonToolsAvailable).toBe(false);
+    expect(state.supabaseConnected).toBe(false);
+  });
+});
 
 // Mock fs with default export
 vi.mock("node:fs", async () => {
@@ -26,20 +251,34 @@ vi.mock("node:fs", async () => {
       writeFileSync: vi.fn(),
       existsSync: vi.fn().mockReturnValue(false), // Default to false to avoid creating temp directory
       renameSync: vi.fn(),
+      realpathSync: vi.fn((filePath: string) => filePath),
+      rmdirSync: vi.fn(),
       unlinkSync: vi.fn(),
-      lstatSync: vi.fn().mockReturnValue({ isDirectory: () => false }),
+      lstatSync: vi.fn().mockReturnValue({
+        isDirectory: () => false,
+        isSymbolicLink: () => false,
+      }),
       promises: {
         readFile: vi.fn().mockResolvedValue(""),
+        realpath: vi.fn(async (filePath: string) => filePath),
+        lstat: vi.fn(),
       },
     },
     existsSync: vi.fn().mockReturnValue(false), // Also mock the named export
     mkdirSync: vi.fn(),
     writeFileSync: vi.fn(),
     renameSync: vi.fn(),
+    realpathSync: vi.fn((filePath: string) => filePath),
+    rmdirSync: vi.fn(),
     unlinkSync: vi.fn(),
-    lstatSync: vi.fn().mockReturnValue({ isDirectory: () => false }),
+    lstatSync: vi.fn().mockReturnValue({
+      isDirectory: () => false,
+      isSymbolicLink: () => false,
+    }),
     promises: {
       readFile: vi.fn().mockResolvedValue(""),
+      realpath: vi.fn(async (filePath: string) => filePath),
+      lstat: vi.fn(),
     },
   };
 });
@@ -87,6 +326,169 @@ vi.mock("@/db", () => ({
   },
 }));
 
+describe("processStreamChunks", () => {
+  it("replaces partial output with an inline warning for Fable refusals", async () => {
+    async function* refusalParts(): AsyncGenerator<TextStreamPart<ToolSet>> {
+      yield {
+        type: "text-delta",
+        id: "text-1",
+        text: "Partial response that must not be shown",
+      };
+      yield {
+        type: "finish",
+        finishReason: "content-filter",
+        rawFinishReason: "refusal",
+        totalUsage: {
+          inputTokens: 10,
+          inputTokenDetails: {
+            noCacheTokens: 10,
+            cacheReadTokens: 0,
+            cacheWriteTokens: 0,
+          },
+          outputTokens: 5,
+          outputTokenDetails: {
+            textTokens: 5,
+            reasoningTokens: 0,
+          },
+          totalTokens: 15,
+        },
+      };
+      yield {
+        type: "text-delta",
+        id: "text-after-finish",
+        text: "Spurious output after finish",
+      };
+    }
+
+    const updates: string[] = [];
+    const result = await processStreamChunks({
+      fullStream: refusalParts() as unknown as AsyncIterableStream<
+        TextStreamPart<ToolSet>
+      >,
+      fullResponse: "Existing response.\n",
+      abortController: new AbortController(),
+      chatId: 1,
+      processResponseChunkUpdate: async ({ fullResponse }) => {
+        updates.push(fullResponse);
+        return fullResponse;
+      },
+    });
+
+    expect(result.fullResponse).not.toContain("Partial response");
+    expect(result.fullResponse).not.toContain("Spurious output");
+    expect(result.fullResponse).toContain("Existing response.");
+    expect(result.fullResponse).toContain(
+      '<dyad-output type="warning" message="Model refused to respond for safety reasons">',
+    );
+    expect(result.incrementalResponse).toContain("<dyad-output");
+    expect(result.modelRefused).toBe(true);
+    expect(updates.at(-1)).toBe(result.fullResponse);
+  });
+
+  it("does not label other content filters as Fable refusals", async () => {
+    async function* filteredParts(): AsyncGenerator<TextStreamPart<ToolSet>> {
+      yield {
+        type: "finish",
+        finishReason: "content-filter",
+        rawFinishReason: "content_filter",
+        totalUsage: {
+          inputTokens: 10,
+          inputTokenDetails: {
+            noCacheTokens: 10,
+            cacheReadTokens: 0,
+            cacheWriteTokens: 0,
+          },
+          outputTokens: 0,
+          outputTokenDetails: {
+            textTokens: 0,
+            reasoningTokens: 0,
+          },
+          totalTokens: 10,
+        },
+      };
+    }
+
+    const result = await processStreamChunks({
+      fullStream: filteredParts() as unknown as AsyncIterableStream<
+        TextStreamPart<ToolSet>
+      >,
+      fullResponse: "Existing response.",
+      abortController: new AbortController(),
+      chatId: 1,
+      processResponseChunkUpdate: async ({ fullResponse }) => fullResponse,
+    });
+
+    expect(result.fullResponse).toBe("Existing response.");
+    expect(result.incrementalResponse).toBe("");
+    expect(result.modelRefused).toBe(false);
+  });
+
+  it("caps the transcript copy of large MCP inputs and outputs", async () => {
+    const bigInput = { payload: "i".repeat(MCP_TRANSCRIPT_PAYLOAD_MAX_CHARS) };
+    const bigOutput = "o".repeat(MCP_TRANSCRIPT_PAYLOAD_MAX_CHARS * 2);
+    async function* mcpParts(): AsyncGenerator<TextStreamPart<ToolSet>> {
+      yield {
+        type: "tool-call",
+        toolCallId: "call-1",
+        toolName: "srv__ingest",
+        input: bigInput,
+      } as unknown as TextStreamPart<ToolSet>;
+      yield {
+        type: "tool-result",
+        toolCallId: "call-1",
+        toolName: "srv__ingest",
+        input: bigInput,
+        output: bigOutput,
+      } as unknown as TextStreamPart<ToolSet>;
+    }
+
+    const result = await processStreamChunks({
+      fullStream: mcpParts() as unknown as AsyncIterableStream<
+        TextStreamPart<ToolSet>
+      >,
+      fullResponse: "",
+      abortController: new AbortController(),
+      chatId: 1,
+      processResponseChunkUpdate: async ({ fullResponse }) => fullResponse,
+    });
+
+    expect(result.fullResponse).toMatch(
+      /<dyad-mcp-tool-call [^>]*truncated-from="\d+">/,
+    );
+    expect(result.fullResponse).toMatch(
+      /<dyad-mcp-tool-result [^>]*truncated-from="\d+">/,
+    );
+    expect(result.fullResponse).not.toContain(bigInput.payload);
+    expect(result.fullResponse).not.toContain(bigOutput);
+  });
+
+  it("writes a non-string MCP output as text", async () => {
+    async function* mcpParts(): AsyncGenerator<TextStreamPart<ToolSet>> {
+      yield {
+        type: "tool-result",
+        toolCallId: "call-1",
+        toolName: "srv__count",
+        input: {},
+        output: 42,
+      } as unknown as TextStreamPart<ToolSet>;
+    }
+
+    const result = await processStreamChunks({
+      fullStream: mcpParts() as unknown as AsyncIterableStream<
+        TextStreamPart<ToolSet>
+      >,
+      fullResponse: "",
+      abortController: new AbortController(),
+      chatId: 1,
+      processResponseChunkUpdate: async ({ fullResponse }) => fullResponse,
+    });
+
+    expect(result.fullResponse).toContain(
+      `call-id="call-1">\n42\n</dyad-mcp-tool-result>`,
+    );
+  });
+});
+
 describe("getDyadAddDependencyTags", () => {
   it("should return an empty array when no dyad-add-dependency tags are found", () => {
     const result = getDyadAddDependencyTags("No dyad-add-dependency tags here");
@@ -119,6 +521,13 @@ describe("getDyadAddDependencyTags", () => {
       `txt before<dyad-add-dependency packages="pkg1 pkg2"></dyad-add-dependency>txt between<dyad-add-dependency packages="pkg3"></dyad-add-dependency>text after`,
     );
     expect(result).toEqual(["pkg1", "pkg2", "pkg3"]);
+  });
+
+  it("preserves scoped version specs and ignores extra whitespace", () => {
+    const result = getDyadAddDependencyTags(
+      `<dyad-add-dependency packages="  foo@latest   @scope/bar@^2.0.0 "></dyad-add-dependency>`,
+    );
+    expect(result).toEqual(["foo@latest", "@scope/bar@^2.0.0"]);
   });
 });
 describe("getDyadWriteTags", () => {
@@ -670,6 +1079,16 @@ describe("processFullResponse", () => {
 
     // Default mock for existsSync to return true
     vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.realpathSync).mockImplementation((filePath) =>
+      String(filePath),
+    );
+    vi.mocked(fs.promises.realpath).mockImplementation(async (filePath) =>
+      String(filePath),
+    );
+    vi.mocked(fs.lstatSync).mockReturnValue({
+      isDirectory: () => false,
+      isSymbolicLink: () => false,
+    } as any);
   });
 
   it("should return empty object when no dyad-write tags are found", async () => {
@@ -702,14 +1121,11 @@ describe("processFullResponse", () => {
       messageId: 1,
     });
 
-    expect(fs.mkdirSync).toHaveBeenCalledWith(
-      "/mock/user/data/path/mock-app-path/src",
-      {
-        recursive: true,
-      },
-    );
+    expect(fs.mkdirSync).toHaveBeenCalledWith(appPath("src"), {
+      recursive: true,
+    });
     expect(fs.writeFileSync).toHaveBeenCalledWith(
-      "/mock/user/data/path/mock-app-path/src/file1.js",
+      appPath("src/file1.js"),
       "console.log('Hello');",
     );
     expect(gitAdd).toHaveBeenCalledWith(
@@ -761,39 +1177,30 @@ describe("processFullResponse", () => {
     });
 
     // Check that directories were created for each file path
-    expect(fs.mkdirSync).toHaveBeenCalledWith(
-      "/mock/user/data/path/mock-app-path/src",
-      {
-        recursive: true,
-      },
-    );
-    expect(fs.mkdirSync).toHaveBeenCalledWith(
-      "/mock/user/data/path/mock-app-path/src/utils",
-      {
-        recursive: true,
-      },
-    );
-    expect(fs.mkdirSync).toHaveBeenCalledWith(
-      "/mock/user/data/path/mock-app-path/src/components",
-      {
-        recursive: true,
-      },
-    );
+    expect(fs.mkdirSync).toHaveBeenCalledWith(appPath("src"), {
+      recursive: true,
+    });
+    expect(fs.mkdirSync).toHaveBeenCalledWith(appPath("src/utils"), {
+      recursive: true,
+    });
+    expect(fs.mkdirSync).toHaveBeenCalledWith(appPath("src/components"), {
+      recursive: true,
+    });
 
     // Using toHaveBeenNthCalledWith to check each specific call
     expect(fs.writeFileSync).toHaveBeenNthCalledWith(
       1,
-      "/mock/user/data/path/mock-app-path/src/file1.js",
+      appPath("src/file1.js"),
       "console.log('First file');",
     );
     expect(fs.writeFileSync).toHaveBeenNthCalledWith(
       2,
-      "/mock/user/data/path/mock-app-path/src/utils/file2.js",
+      appPath("src/utils/file2.js"),
       "export const add = (a, b) => a + b;",
     );
     expect(fs.writeFileSync).toHaveBeenNthCalledWith(
       3,
-      "/mock/user/data/path/mock-app-path/src/components/Button.tsx",
+      appPath("src/components/Button.tsx"),
       "import React from 'react';\n    export const Button = ({ children }) => <button>{children}</button>;",
     );
 
@@ -832,15 +1239,12 @@ describe("processFullResponse", () => {
       messageId: 1,
     });
 
-    expect(fs.mkdirSync).toHaveBeenCalledWith(
-      "/mock/user/data/path/mock-app-path/src/components",
-      {
-        recursive: true,
-      },
-    );
+    expect(fs.mkdirSync).toHaveBeenCalledWith(appPath("src/components"), {
+      recursive: true,
+    });
     expect(fs.renameSync).toHaveBeenCalledWith(
-      "/mock/user/data/path/mock-app-path/src/components/OldComponent.jsx",
-      "/mock/user/data/path/mock-app-path/src/components/NewComponent.jsx",
+      appPath("src/components/OldComponent.jsx"),
+      appPath("src/components/NewComponent.jsx"),
     );
     expect(gitAdd).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -890,7 +1294,7 @@ describe("processFullResponse", () => {
     });
 
     expect(fs.unlinkSync).toHaveBeenCalledWith(
-      "/mock/user/data/path/mock-app-path/src/components/Unused.jsx",
+      appPath("src/components/Unused.jsx"),
     );
     expect(gitRemove).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -901,9 +1305,104 @@ describe("processFullResponse", () => {
     expect(result).toEqual({ updatedFiles: true });
   });
 
+  it.each([
+    ".",
+    "./",
+    ".\\",
+    "foo/..",
+    "foo\\..",
+    "../mock-app-path",
+    "..\\mock-app-path",
+    "../../path/mock-app-path",
+    "../../path/MOCK-APP-PATH",
+  ])(
+    "should reject project-root-equivalent delete path %s before deleting",
+    async (deletePath) => {
+      const response = `<dyad-delete path="${deletePath}"></dyad-delete>`;
+
+      const result = await processFullResponseActions(response, 1, {
+        chatSummary: undefined,
+        messageId: 1,
+      });
+
+      expect(result.error).toContain("Refusing to delete project root");
+      expect(fs.existsSync).not.toHaveBeenCalledWith(MOCK_APP_PATH);
+      expect(fs.unlinkSync).not.toHaveBeenCalled();
+      expect(fs.rmdirSync).not.toHaveBeenCalled();
+      expect(gitRemove).not.toHaveBeenCalled();
+      expect(gitCommit).not.toHaveBeenCalled();
+    },
+  );
+
+  it("should preflight all deletes before applying any of them", async () => {
+    vi.mocked(fs.existsSync).mockImplementation(
+      (filePath) => filePath === appPath("src/keep.jsx"),
+    );
+
+    const response = `
+      <dyad-write path="src/new.jsx">export default {};</dyad-write>
+      <dyad-rename from="src/old.jsx" to="src/renamed.jsx"></dyad-rename>
+      <dyad-delete path="src/keep.jsx"></dyad-delete>
+      <dyad-delete path="foo/.."></dyad-delete>
+    `;
+
+    const result = await processFullResponseActions(response, 1, {
+      chatSummary: undefined,
+      messageId: 1,
+    });
+
+    expect(result.error).toBe(
+      'Refusing to delete project root for path: "foo/.." No actions from this response were applied. Skipped: 1 write, 1 rename, 2 deletes.',
+    );
+    expect(fs.lstatSync).not.toHaveBeenCalled();
+    expect(fs.unlinkSync).not.toHaveBeenCalled();
+    expect(fs.rmdirSync).not.toHaveBeenCalled();
+    expect(fs.existsSync).not.toHaveBeenCalled();
+    expect(gitRemove).not.toHaveBeenCalled();
+  });
+
+  it.each(["../sibling", "..\\sibling"])(
+    "should reject sibling escape path %s without deleting",
+    async (deletePath) => {
+      const result = await processFullResponseActions(
+        `<dyad-delete path="${deletePath}"></dyad-delete>`,
+        1,
+        { chatSummary: undefined, messageId: 1 },
+      );
+
+      expect(result.error).toContain("Unsafe path");
+      expect(fs.unlinkSync).not.toHaveBeenCalled();
+      expect(fs.rmdirSync).not.toHaveBeenCalled();
+      expect(gitRemove).not.toHaveBeenCalled();
+    },
+  );
+
+  it("unlinks a slash-terminated final symlink instead of following it", async () => {
+    vi.mocked(fs.lstatSync).mockReturnValue({
+      isDirectory: () => false,
+      isSymbolicLink: () => true,
+    } as any);
+
+    const result = await processFullResponseActions(
+      `<dyad-delete path="self/"></dyad-delete>`,
+      1,
+      { chatSummary: undefined, messageId: 1 },
+    );
+
+    expect(result).toEqual({ updatedFiles: true });
+    expect(fs.unlinkSync).toHaveBeenCalledWith(appPath("self"));
+    expect(fs.rmdirSync).not.toHaveBeenCalled();
+    expect(gitRemove).toHaveBeenCalledWith({
+      path: MOCK_APP_PATH,
+      filepath: "self",
+    });
+  });
+
   it("should handle non-existent files during delete gracefully", async () => {
-    // Set up the mock to return false for existsSync
     vi.mocked(fs.existsSync).mockReturnValue(false);
+    vi.mocked(fs.lstatSync).mockImplementation(() => {
+      throw Object.assign(new Error("missing"), { code: "ENOENT" });
+    });
 
     const response = `<dyad-delete path="src/components/NonExistent.jsx"></dyad-delete>`;
 
@@ -925,9 +1424,7 @@ describe("processFullResponse", () => {
   it("should process mixed operations (write, rename, delete) in one response", async () => {
     // Set up fs mocks to succeed
     vi.mocked(fs.existsSync).mockImplementation(
-      (filePath) =>
-        String(filePath) !==
-        "/mock/user/data/path/mock-app-path/pnpm-workspace.yaml",
+      (filePath) => String(filePath) !== appPath("pnpm-workspace.yaml"),
     );
     vi.mocked(fs.mkdirSync).mockImplementation(() => undefined);
     vi.mocked(fs.writeFileSync).mockImplementation(() => undefined);
@@ -947,19 +1444,19 @@ describe("processFullResponse", () => {
 
     // Check write operation happened
     expect(fs.writeFileSync).toHaveBeenCalledWith(
-      "/mock/user/data/path/mock-app-path/src/components/NewComponent.jsx",
+      appPath("src/components/NewComponent.jsx"),
       "import React from 'react'; export default () => <div>New</div>;",
     );
 
     // Check rename operation happened
     expect(fs.renameSync).toHaveBeenCalledWith(
-      "/mock/user/data/path/mock-app-path/src/components/OldComponent.jsx",
-      "/mock/user/data/path/mock-app-path/src/components/RenamedComponent.jsx",
+      appPath("src/components/OldComponent.jsx"),
+      appPath("src/components/RenamedComponent.jsx"),
     );
 
     // Check delete operation happened
     expect(fs.unlinkSync).toHaveBeenCalledWith(
-      "/mock/user/data/path/mock-app-path/src/components/Unused.jsx",
+      appPath("src/components/Unused.jsx"),
     );
 
     // Check git operations
@@ -980,9 +1477,7 @@ describe("processFullResponse", () => {
 
   it("should stage pnpm-workspace.yaml when it exists alongside response changes", async () => {
     vi.mocked(fs.existsSync).mockImplementation(
-      (filePath) =>
-        String(filePath) ===
-        "/mock/user/data/path/mock-app-path/pnpm-workspace.yaml",
+      (filePath) => String(filePath) === appPath("pnpm-workspace.yaml"),
     );
     vi.mocked(fs.mkdirSync).mockImplementation(() => undefined);
     vi.mocked(fs.writeFileSync).mockImplementation(() => undefined);

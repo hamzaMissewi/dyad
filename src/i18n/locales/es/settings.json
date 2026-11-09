@@ -80,9 +80,7 @@
     "defaultChatModeDescription": "Controla el modo de chat predeterminado cuando abres un nuevo chat.",
     "selectDefaultChatMode": "Seleccionar modo de chat predeterminado",
     "autoApprove": "Aprobar cambios automáticamente",
-    "autoApproveDescription": "Esto aprobará y ejecutará automáticamente los cambios de código.",
-    "autoFixProblems": "Arreglar problemas automáticamente",
-    "autoFixProblemsDescription": "Esto solucionará automáticamente los errores de TypeScript."
+    "autoApproveDescription": "Esto aprobará y ejecutará automáticamente los cambios de código."
   },
   "ai": {
     "title": "Configuración de IA",
@@ -149,8 +147,8 @@
     "title": "Integraciones"
   },
   "agentPermissions": {
-    "title": "Permisos del Agente (Pro)",
-    "description": "Configura los permisos para las herramientas integradas del Agente.",
+    "title": "Permisos de Build y Agente",
+    "description": "Configura los permisos para las herramientas integradas de Build y Agente.",
     "defaultAllowedTools": "Herramientas permitidas por defecto ({{count}})",
     "ask": "Preguntar",
     "alwaysAllow": "Permitir siempre",
@@ -186,8 +184,12 @@
   },
   "experiments": {
     "title": "Experimentos",
-    "enableNativeGit": "Habilitar Git Nativo",
-    "enableNativeGitDescription": "Esto no requiere ninguna instalación externa de Git y ofrece un rendimiento de Git nativo más rápido."
+    "previewCookieIsolation": {
+      "label": "Aislar las cookies de inicio de sesión de la vista previa",
+      "description": "Mantén separadas las cookies HttpOnly de inicio de sesión de cada aplicación en localhost compartido. Activado de forma predeterminada. Reinicia Dyad para aplicar los cambios a todas las vistas previas.",
+      "loading": "Cargando ajuste…",
+      "loadError": "No se pudo cargar el ajuste"
+    }
   },
   "dangerZone": {
     "title": "Zona de Peligro",

@@ -7,6 +7,8 @@ import {
   detectNextJsMajorVersion,
 } from "../ipc/utils/framework_utils";
 import type { AppFrameworkType } from "@/lib/framework_constants";
+import { isLocalAgentBackedMode, type ChatMode } from "@/lib/schemas";
+import { readSettings } from "@/main/settings";
 
 interface BuildNeonPromptAdditionsParams {
   projectId: string;
@@ -27,18 +29,10 @@ export async function buildNeonPromptAdditions({
 }: BuildNeonPromptAdditionsParams): Promise<string> {
   const neonClientCode = getNeonClientCode(frameworkType);
 
-  let emailVerificationEnabled = false;
-  if (branchId) {
-    try {
-      const emailConfig = await getCachedEmailPasswordConfig(
-        projectId,
-        branchId,
-      );
-      emailVerificationEnabled = emailConfig.require_email_verification;
-    } catch {
-      // Best-effort: proceed without email verification guidance.
-    }
-  }
+  const emailVerificationEnabled = await getNeonEmailVerificationEnabled(
+    projectId,
+    branchId,
+  );
 
   let neonPromptAddition = getNeonAvailableSystemPrompt(
     neonClientCode,
@@ -47,8 +41,16 @@ export async function buildNeonPromptAdditions({
       emailVerificationEnabled,
       nextjsMajorVersion,
       isLocalAgentMode,
+      providerToolsAvailable: Boolean(branchId),
+      enableAppPreviewDomains: readSettings().enableAppPreviewDomains,
     },
   );
+
+  if (emailVerificationEnabled === undefined) {
+    neonPromptAddition += branchId
+      ? `\n\n<neon-provider-state>\nEmail-verification state could not be read. Do not assume it is disabled; inspect the live Neon Auth configuration before changing sign-up or verification behavior.\n</neon-provider-state>`
+      : `\n\n<neon-provider-state>\nEmail-verification state is unavailable until a Neon branch is selected. Do not assume it is disabled; report the missing branch context before changing sign-up or verification behavior.\n</neon-provider-state>`;
+  }
 
   if (includeContext && branchId) {
     try {
@@ -64,6 +66,21 @@ export async function buildNeonPromptAdditions({
   }
 
   return neonPromptAddition;
+}
+
+export async function getNeonEmailVerificationEnabled(
+  projectId: string,
+  branchId?: string | null,
+): Promise<boolean | undefined> {
+  if (!branchId) return undefined;
+  try {
+    const emailConfig = await getCachedEmailPasswordConfig(projectId, branchId);
+    return emailConfig.require_email_verification;
+  } catch {
+    // Preserve the distinction between disabled and unavailable. Callers must
+    // not build a non-verification flow from a failed provider lookup.
+    return undefined;
+  }
 }
 
 /**
@@ -82,20 +99,20 @@ export async function buildNeonPromptForApp({
   neonProjectId: string;
   neonActiveBranchId?: string | null;
   neonDevelopmentBranchId?: string | null;
-  selectedChatMode: string;
+  selectedChatMode: ChatMode;
 }): Promise<string> {
   const resolvedPath = getDyadAppPath(appPath);
   const frameworkType = detectFrameworkType(resolvedPath);
   const nextjsMajorVersion =
     frameworkType === "nextjs" ? detectNextJsMajorVersion(resolvedPath) : null;
   const branchId = neonActiveBranchId ?? neonDevelopmentBranchId;
-  const isLocalAgent = selectedChatMode === "local-agent";
+  const isToolBackedMode = isLocalAgentBackedMode(selectedChatMode);
   return buildNeonPromptAdditions({
     projectId: neonProjectId,
     branchId,
     frameworkType,
     nextjsMajorVersion,
-    includeContext: !isLocalAgent,
-    isLocalAgentMode: isLocalAgent,
+    includeContext: !isToolBackedMode,
+    isLocalAgentMode: isToolBackedMode,
   });
 }

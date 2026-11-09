@@ -1,79 +1,210 @@
+import {
+  claudeStatus,
+  listClaudeModels,
+} from "@/ipc/services/claude_code/runtime";
+import { getClaudeUsageLimits } from "@/ipc/services/claude_code/usage_limits";
 import { db } from "../../db";
-import { apps, chats, messages } from "../../db/schema";
+import { chats, messages } from "../../db/schema";
 import { desc, eq, and, like } from "drizzle-orm";
 import type { ChatSearchResult, ChatSummary } from "../../lib/schemas";
 
 import log from "electron-log";
 import { DyadError, DyadErrorKind } from "@/errors/dyad_error";
-import { getDyadAppPath } from "../../paths/paths";
-import { getCurrentCommitHash } from "../utils/git_utils";
 import { createTypedHandler } from "./base";
+import { getHandlerContext } from "./handler_context";
+import { entityDisposalBus } from "@/window_infrastructure/main/entity_disposal_bus";
 import { chatContracts } from "../types/chat";
+import { normalizeStoredChatMode } from "./chat_mode_resolution";
 import {
-  getInitialChatModeForNewChat,
-  normalizeStoredChatMode,
-} from "./chat_mode_resolution";
+  blockNewStreamsForChat,
+  cancelActiveStreamsForChat,
+} from "./chat_stream_handlers";
+import type { WebContents } from "electron";
+import {
+  rendererMessageColumns,
+  toRendererMessages,
+} from "../utils/renderer_chat_message";
+import {
+  executionBackendForModel,
+  requiresNewChatForModel,
+  BACKEND_SWITCH_MESSAGE,
+} from "@/shared/execution_backend";
+import { createChatForApp } from "../utils/chat_creation_utils";
+import {
+  getReferencedAppsForDisplay,
+  readStoredReferencedAppIds,
+} from "../utils/mention_apps";
+import { firstPromptCreationRegistry } from "../services/first_prompt_creation_service";
+import { userInputRegistry } from "@/user_input/main";
+import { deleteChatJournals } from "@/ipc/services/chat_journal_cleanup";
+import {
+  beginChatActorMutation,
+  settleChatActorsForDeletion,
+} from "@/ipc/services/chat_actor_deletion_service";
+import {
+  observeChatSubmissionStopPolicy,
+  waitForChatActorIdle,
+} from "@/ipc/services/chat_actor_service";
+import { appOperationCoordinator } from "@/ipc/services/app_operation_coordinator";
+import { withChatQueueLock } from "@/chat_stream/queue_lock";
+import {
+  blockSubagentAdmissionsForChat,
+  settleSubagentsForChatDeletion,
+} from "@/pro/main/ipc/handlers/local_agent/subagents/subagent_manager";
+import type { CancellationCause } from "@/shared/cancellation_reason";
 
 const logger = log.scope("chat_handlers");
 
+async function mutateChatAfterDrainingStreams({
+  chatId,
+  sender,
+  cancellationCause,
+  beforeLock,
+  mutation,
+}: {
+  chatId: number;
+  sender: WebContents;
+  /**
+   * Why the chat's in-flight turn is cancelled, reported to nested work.
+   * Omitted where the UI already refuses the mutation while the chat streams;
+   * a turn that races in anyway reports the user's Stop.
+   */
+  cancellationCause?: CancellationCause;
+  beforeLock?: () => Promise<void | (() => void)>;
+  mutation: () => Promise<void>;
+}): Promise<void> {
+  const releaseActorAdmissionBlock = beginChatActorMutation(chatId);
+  let releaseBeforeLock: (() => void) | undefined;
+  try {
+    const chat = await db.query.chats.findFirst({
+      columns: { appId: true },
+      where: eq(chats.id, chatId),
+    });
+    if (!chat) {
+      return;
+    }
+
+    const releaseStreamAdmissionBlock = blockNewStreamsForChat(chatId);
+    try {
+      const beforeLockResult = beforeLock ? await beforeLock() : undefined;
+      releaseBeforeLock =
+        typeof beforeLockResult === "function" ? beforeLockResult : undefined;
+      // Drain outside the app lock: an aborted stream may need the same lock to
+      // finish a file write. The admission blocks close the gaps before and
+      // after draining so another turn cannot enter around the mutation.
+      await waitForChatActorIdle(chatId, {
+        cancelActive: true,
+        cancellationCause,
+      });
+      await cancelActiveStreamsForChat(
+        chatId,
+        sender,
+        undefined,
+        cancellationCause,
+      );
+      await appOperationCoordinator.run(
+        {
+          appId: chat.appId,
+          operation: "mutate-chat-content",
+          resources: ["chat-content"],
+        },
+        mutation,
+      );
+    } finally {
+      releaseBeforeLock?.();
+      releaseStreamAdmissionBlock();
+    }
+  } finally {
+    releaseActorAdmissionBlock();
+  }
+}
+
 export function registerChatHandlers() {
-  createTypedHandler(chatContracts.createChat, async (_, input) => {
-    const { appId, initialChatMode } =
+  const assertClaudeExperiment = () => {
+    if (!getHandlerContext().readSettings().enableClaudeCodeSubscription)
+      throw new DyadError(
+        'Turn on "Enable Claude Code subscription" in Settings → Experiments.',
+        DyadErrorKind.Precondition,
+      );
+  };
+  createTypedHandler(chatContracts.claudeCodeModels, () => {
+    assertClaudeExperiment();
+    return listClaudeModels();
+  });
+  createTypedHandler(chatContracts.claudeCodeUsage, async () => {
+    assertClaudeExperiment();
+    return getClaudeUsageLimits();
+  });
+  createTypedHandler(chatContracts.claudeCodeStatus, async (_, options) => {
+    assertClaudeExperiment();
+    return claudeStatus(options);
+  });
+  createTypedHandler(
+    chatContracts.observeSubmissionStopPolicy,
+    async (_, chatId) => observeChatSubmissionStopPolicy(chatId),
+  );
+  createTypedHandler(chatContracts.createChat, async (event, input) => {
+    const { appId, initialChatMode, firstPromptCreationOperationId } =
       typeof input === "number"
-        ? { appId: input, initialChatMode: undefined }
+        ? {
+            appId: input,
+            initialChatMode: undefined,
+            firstPromptCreationOperationId: undefined,
+          }
         : input;
 
-    // Get the app's path first
-    const app = await db.query.apps.findFirst({
-      where: eq(apps.id, appId),
-      columns: {
-        path: true,
-      },
-    });
-
-    if (!app) {
-      throw new DyadError("App not found", DyadErrorKind.NotFound);
+    if (firstPromptCreationOperationId) {
+      firstPromptCreationRegistry.track(
+        firstPromptCreationOperationId,
+        event.sender,
+      );
     }
-
-    let initialCommitHash = null;
+    let chatId: number | undefined;
     try {
-      // Get the current git revision of the currently checked-out branch
-      initialCommitHash = await getCurrentCommitHash({
-        path: getDyadAppPath(app.path),
-      });
-    } catch (error) {
-      logger.error("Error getting git revision:", error);
-      // Continue without the git revision
-    }
-
-    const chatMode = await getInitialChatModeForNewChat(initialChatMode);
-
-    // Create a new chat
-    const [chat] = await db
-      .insert(chats)
-      .values({
+      chatId = await createChatForApp({
         appId,
-        initialCommitHash,
-        chatMode,
-      })
-      .returning();
-    logger.info(
-      "Created chat:",
-      chat.id,
-      "for app:",
-      appId,
-      "with initial commit hash:",
-      initialCommitHash,
-    );
-    return chat.id;
+        initialChatMode,
+        modelSelection:
+          typeof input === "number" ? undefined : input.modelSelection,
+      });
+      return chatId;
+    } finally {
+      if (firstPromptCreationOperationId) {
+        if (chatId === undefined) {
+          firstPromptCreationRegistry.commit(firstPromptCreationOperationId);
+        } else {
+          const createdChatId = chatId;
+          await firstPromptCreationRegistry.complete(
+            firstPromptCreationOperationId,
+            async () => {
+              await db.delete(chats).where(eq(chats.id, createdChatId));
+            },
+          );
+        }
+      }
+    }
   });
 
   createTypedHandler(chatContracts.getChat, async (_, chatId) => {
     const chat = await db.query.chats.findFirst({
       where: eq(chats.id, chatId),
+      columns: {
+        id: true,
+        appId: true,
+        title: true,
+        initialCommitHash: true,
+        chatMode: true,
+        modelSelection: true,
+        executionBackend: true,
+        referencedAppIds: true,
+      },
       with: {
         messages: {
-          orderBy: (messages, { asc }) => [asc(messages.createdAt)],
+          columns: rendererMessageColumns,
+          orderBy: (messages, { asc }) => [
+            asc(messages.createdAt),
+            asc(messages.id),
+          ],
         },
       },
     });
@@ -83,15 +214,62 @@ export function registerChatHandlers() {
     }
 
     return {
-      ...chat,
+      id: chat.id,
+      appId: chat.appId,
       title: chat.title ?? "",
+      initialCommitHash: chat.initialCommitHash,
       chatMode: normalizeStoredChatMode(chat.chatMode),
-      messages: chat.messages.map((m) => ({
-        ...m,
-        role: m.role as "user" | "assistant",
-      })),
+      modelSelection: chat.modelSelection ?? null,
+      executionBackend: chat.executionBackend,
+      referencedApps: await getReferencedAppsForDisplay(chat.referencedAppIds),
+      messages: toRendererMessages(chat.messages),
     };
   });
+
+  createTypedHandler(
+    chatContracts.removeChatReferencedApp,
+    async (event, { chatId, appId }) => {
+      const chat = await db.query.chats.findFirst({
+        where: eq(chats.id, chatId),
+        columns: { id: true },
+      });
+
+      if (!chat) {
+        throw new DyadError("Chat not found", DyadErrorKind.NotFound);
+      }
+
+      // Detaching revokes read access, so it has to reach the turn that is
+      // already running: an in-flight agent resolved this chat's references
+      // into its tool context up front and would keep reading the app until
+      // the turn ended. Draining cancels that turn and blocks new ones until
+      // the write lands, which also stops the stream's whole-array union
+      // (computed before the removal) from putting the id back.
+      await mutateChatAfterDrainingStreams({
+        chatId,
+        sender: event.sender,
+        mutation: async () => {
+          // Re-read inside the mutation: the drained stream may have persisted
+          // its own union on the way out.
+          const drainedChat = await db.query.chats.findFirst({
+            where: eq(chats.id, chatId),
+            columns: { referencedAppIds: true },
+          });
+          if (!drainedChat) {
+            return;
+          }
+
+          const remaining = readStoredReferencedAppIds(
+            drainedChat.referencedAppIds,
+          ).filter((id) => id !== appId);
+
+          await db
+            .update(chats)
+            .set({ referencedAppIds: remaining })
+            .where(eq(chats.id, chatId));
+        },
+      });
+    },
+  );
 
   createTypedHandler(chatContracts.getChatMetadata, async (_, chatId) => {
     const chat = await db.query.chats.findFirst({
@@ -102,6 +280,7 @@ export function registerChatHandlers() {
         title: true,
         createdAt: true,
         chatMode: true,
+        isFavorite: true,
       },
     });
 
@@ -115,6 +294,7 @@ export function registerChatHandlers() {
       title: chat.title,
       createdAt: chat.createdAt,
       chatMode: normalizeStoredChatMode(chat.chatMode),
+      isFavorite: chat.isFavorite,
     };
   });
 
@@ -129,6 +309,7 @@ export function registerChatHandlers() {
             createdAt: true,
             appId: true,
             chatMode: true,
+            isFavorite: true,
           },
           orderBy: [desc(chats.createdAt)],
         })
@@ -139,6 +320,7 @@ export function registerChatHandlers() {
             createdAt: true,
             appId: true,
             chatMode: true,
+            isFavorite: true,
           },
           orderBy: [desc(chats.createdAt)],
         });
@@ -150,12 +332,44 @@ export function registerChatHandlers() {
     })) satisfies ChatSummary[];
   });
 
-  createTypedHandler(chatContracts.deleteChat, async (_, chatId) => {
-    await db.delete(chats).where(eq(chats.id, chatId));
+  createTypedHandler(chatContracts.deleteChat, async (event, chatId) => {
+    // Sweep due follow-ups before closing chat admission. Starting both fences
+    // in this synchronous turn prevents either new sub-agents or a deletion
+    // race from changing the follow-up outcome from swept to rejected.
+    const userInputSettlement = userInputRegistry.settleChat(chatId);
+    const releaseSubagentAdmission = blockSubagentAdmissionsForChat(chatId);
+    try {
+      await mutateChatAfterDrainingStreams({
+        chatId,
+        sender: event.sender,
+        cancellationCause: "chat-deleted",
+        beforeLock: async () => {
+          await userInputSettlement;
+          const releaseSubagents = await settleSubagentsForChatDeletion(
+            chatId,
+            "chat-deleted",
+          );
+          try {
+            await settleChatActorsForDeletion(chatId, "chat-deleted");
+            return releaseSubagents;
+          } catch (error) {
+            releaseSubagents();
+            throw error;
+          }
+        },
+        mutation: async () => {
+          await deleteChatJournals(chatId);
+          await db.delete(chats).where(eq(chats.id, chatId));
+          entityDisposalBus.publish({ kind: "chat", id: chatId });
+        },
+      });
+    } finally {
+      releaseSubagentAdmission();
+    }
   });
 
   createTypedHandler(chatContracts.updateChat, async (_, params) => {
-    const { chatId, title, chatMode } = params;
+    const { chatId, title, chatMode, modelSelection } = params;
     const updates: Partial<typeof chats.$inferInsert> = {};
     if (title !== undefined) {
       updates.title = title;
@@ -163,14 +377,61 @@ export function registerChatHandlers() {
     if (chatMode !== undefined) {
       updates.chatMode = chatMode;
     }
+    if (modelSelection !== undefined) {
+      updates.modelSelection = modelSelection;
+    }
     if (Object.keys(updates).length === 0) {
       return;
     }
-    await db.update(chats).set(updates).where(eq(chats.id, chatId));
+    if (chatMode !== undefined || modelSelection !== undefined) {
+      await withChatQueueLock(chatId, async () => {
+        const current = await db.query.chats.findFirst({
+          where: eq(chats.id, chatId),
+        });
+        if (!current)
+          throw new DyadError("Chat not found", DyadErrorKind.NotFound);
+        if (modelSelection) {
+          const history = await db.query.messages.findMany({
+            where: eq(messages.chatId, chatId),
+            columns: { id: true },
+            limit: 1,
+          });
+          if (
+            requiresNewChatForModel(
+              { ...current, messages: history },
+              modelSelection,
+            )
+          ) {
+            throw new DyadError(
+              BACKEND_SWITCH_MESSAGE,
+              DyadErrorKind.Precondition,
+            );
+          }
+          updates.executionBackend = executionBackendForModel(modelSelection);
+          if (updates.executionBackend !== current.executionBackend) {
+            updates.claudeSessionId = null;
+            updates.claudeSessionState = null;
+          }
+        }
+        await db.update(chats).set(updates).where(eq(chats.id, chatId));
+      });
+    } else {
+      await db.update(chats).set(updates).where(eq(chats.id, chatId));
+    }
   });
 
-  createTypedHandler(chatContracts.deleteMessages, async (_, chatId) => {
-    await db.delete(messages).where(eq(messages.chatId, chatId));
+  createTypedHandler(chatContracts.setChatFavorite, async (_, params) => {
+    const updated = await db
+      .update(chats)
+      .set({ isFavorite: params.isFavorite })
+      .where(eq(chats.id, params.chatId))
+      .returning({ isFavorite: chats.isFavorite });
+
+    if (updated.length === 0) {
+      throw new DyadError("Chat not found", DyadErrorKind.NotFound);
+    }
+
+    return updated[0];
   });
 
   createTypedHandler(chatContracts.searchChats, async (_, params) => {

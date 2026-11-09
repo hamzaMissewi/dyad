@@ -1,5 +1,6 @@
-import { useAtomValue } from "jotai";
+import { useAtomValue, useSetAtom } from "jotai";
 import { selectedAppIdAtom } from "@/atoms/appAtoms";
+import { isChatPanelHiddenAtom } from "@/atoms/viewAtoms";
 import { useSecurityReview } from "@/hooks/useSecurityReview";
 import { ipc } from "@/ipc/types";
 import { queryKeys } from "@/lib/queryKeys";
@@ -14,24 +15,63 @@ import {
   DialogTitle,
   DialogClose,
 } from "@/components/ui/dialog";
-import { Shield, ChevronDown, Pencil, Wrench } from "lucide-react";
+import {
+  Shield,
+  ChevronDown,
+  ExternalLink,
+  Pencil,
+  Wrench,
+} from "lucide-react";
 import { getSeverityIcon, SeverityBadge } from "@/components/security/severity";
 import { useStreamChat } from "@/hooks/useStreamChat";
 import { showError } from "@/lib/toast";
-import { Badge } from "@/components/ui/badge";
 import { Checkbox } from "@/components/ui/checkbox";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import type {
   SecurityFinding,
+  SecurityReviewFinding,
   SecurityReviewResult,
 } from "@/ipc/types/security";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { VanillaMarkdownParser } from "@/components/chat/DyadMarkdownParser";
-import { showSuccess, showWarning } from "@/lib/toast";
+import { showSuccess, showWarning, toast } from "@/lib/toast";
 import { useLoadAppFile } from "@/hooks/useLoadAppFile";
 import { useQueryClient } from "@tanstack/react-query";
 import { useSelectChat } from "@/hooks/useSelectChat";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 
 const DESCRIPTION_PREVIEW_LENGTH = 150;
+
+const buildFixPrompt = (findings: SecurityFinding[]): string => {
+  if (findings.length === 1) {
+    const finding = findings[0];
+    return `Please fix the following security issue in a simple and effective way:
+
+**${finding.title}** (${finding.level} severity)
+
+${finding.description}`;
+  }
+
+  const issuesList = findings
+    .map(
+      (finding, index) =>
+        `${index + 1}. **${finding.title}** (${finding.level} severity)\n${finding.description}`,
+    )
+    .join("\n\n");
+
+  return `Please fix the following ${findings.length} security issues in a simple and effective way:
+
+${issuesList}`;
+};
 
 const createFindingKey = (finding: {
   title: string;
@@ -80,15 +120,36 @@ const getSeverityOrder = (level: SecurityFinding["level"]): number => {
   }
 };
 
+const getSeveritySummaryColor = (level: SecurityFinding["level"]): string => {
+  switch (level) {
+    case "critical":
+      return "border-red-500/20 bg-red-500/8 text-red-700 dark:border-red-400/20 dark:bg-red-400/10 dark:text-red-300";
+    case "high":
+      return "border-orange-500/20 bg-orange-500/8 text-orange-700 dark:border-orange-400/20 dark:bg-orange-400/10 dark:text-orange-300";
+    case "medium":
+      return "border-amber-500/20 bg-amber-500/8 text-amber-800 dark:border-amber-400/20 dark:bg-amber-400/10 dark:text-amber-300";
+    case "low":
+      return "border-slate-500/15 bg-slate-500/8 text-slate-700 dark:border-slate-400/20 dark:bg-slate-400/10 dark:text-slate-300";
+  }
+};
+
 function RunReviewButton({
   isRunning,
   onRun,
+  secondary = false,
 }: {
   isRunning: boolean;
   onRun: () => void;
+  secondary?: boolean;
 }) {
   return (
-    <Button onClick={onRun} className="gap-2" disabled={isRunning}>
+    <Button
+      onClick={onRun}
+      className="gap-2"
+      disabled={isRunning}
+      variant={secondary ? "outline" : "default"}
+      data-variant={secondary ? "secondary" : "primary"}
+    >
       {isRunning ? (
         <>
           <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
@@ -106,12 +167,12 @@ function RunReviewButton({
               d="m4 12a8 8 0 0 1 8-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 0 1 4 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
             />
           </svg>
-          Running Security Review...
+          Running review...
         </>
       ) : (
         <>
           <Shield className="w-4 h-4" />
-          Run Security Review
+          Run review
         </>
       )}
     </Button>
@@ -135,22 +196,24 @@ function ReviewSummary({ data }: { data: SecurityReviewResult }) {
   ];
 
   return (
-    <div className="space-y-1 mt-1">
-      <div className="text-sm text-gray-600 dark:text-gray-400">
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+      <div className="text-xs text-muted-foreground">
         Last reviewed {formatTimeAgo(data.timestamp)}
       </div>
-      <div className="flex items-center gap-3 text-sm">
+      <div className="flex flex-wrap items-center gap-1.5 text-xs">
         {severityLevels
           .filter((level) => counts[level] > 0)
           .map((level) => (
-            <span key={level} className="flex items-center gap-1.5">
+            <span
+              key={level}
+              className={cn(
+                "flex items-center gap-1.5 rounded-md border px-2 py-1 font-medium",
+                getSeveritySummaryColor(level),
+              )}
+            >
               <span className="flex-shrink-0">{getSeverityIcon(level)}</span>
-              <span className="font-medium text-gray-900 dark:text-gray-100">
-                {counts[level]}
-              </span>
-              <span className="text-gray-600 dark:text-gray-400 capitalize">
-                {level}
-              </span>
+              <span>{counts[level]}</span>
+              <span className="capitalize">{level}</span>
             </span>
           ))}
       </div>
@@ -165,7 +228,10 @@ function SecurityHeader({
   onOpenEditRules,
   selectedCount,
   onFixSelected,
+  onShowSelectedFix,
+  onRerunSelectedFix,
   isFixingSelected,
+  selectedFixCount,
 }: {
   isRunning: boolean;
   onRun: () => void;
@@ -173,72 +239,121 @@ function SecurityHeader({
   onOpenEditRules: () => void;
   selectedCount: number;
   onFixSelected: () => void;
+  onShowSelectedFix: () => void;
+  onRerunSelectedFix: () => void;
   isFixingSelected: boolean;
+  selectedFixCount?: number;
 }) {
-  const [isButtonVisible, setIsButtonVisible] = useState(false);
-  const [shouldRender, setShouldRender] = useState(false);
-
-  useEffect(() => {
-    if (selectedCount > 0) {
-      // Show immediately
-      setShouldRender(true);
-      // Trigger animation after render
-      setTimeout(() => setIsButtonVisible(true), 10);
-    } else {
-      // Trigger exit animation
-      setIsButtonVisible(false);
-      // Hide after animation completes
-      const timer = setTimeout(() => setShouldRender(false), 300);
-      return () => clearTimeout(timer);
-    }
-  }, [selectedCount]);
+  const hasFindings = Boolean(data?.findings.length);
+  const totalFindingCount = data?.findings.length ?? 0;
+  const selectedIssueLabel =
+    selectedCount > 0
+      ? `${selectedCount} issue${selectedCount === 1 ? "" : "s"}`
+      : "all issues";
+  const existingFixIssueLabel =
+    selectedFixCount === undefined
+      ? ""
+      : selectedFixCount === totalFindingCount
+        ? "all issues"
+        : `${selectedFixCount} issue${selectedFixCount === 1 ? "" : "s"}`;
+  const hasSelectedFix = selectedFixCount !== undefined;
+  const showSelectedFixActions = hasSelectedFix && !isFixingSelected;
+  const activeIssueLabel = hasSelectedFix
+    ? existingFixIssueLabel
+    : selectedIssueLabel;
 
   return (
-    <div className="sticky top-0 z-10 bg-background pt-3 pb-3 space-y-2">
-      <div className="flex items-center justify-between gap-2">
-        <div>
-          <h1 className="text-xl font-bold text-gray-900 dark:text-gray-100 mb-1 flex items-center gap-2">
-            <Shield className="w-5 h-5" />
+    <div className="sticky top-0 z-10 space-y-2.5 bg-background py-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="flex min-w-48 flex-1 items-center gap-1">
+          <Shield className="size-5 shrink-0" />
+          <h1 className="truncate text-lg font-semibold text-foreground">
             Security Review
-            <Badge variant="secondary" className="uppercase tracking-wide">
-              experimental
-            </Badge>
           </h1>
-          <div className="text-sm">
-            <p>
-              <a
-                className="text-blue-600 dark:text-blue-400 hover:underline cursor-pointer"
-                onClick={() =>
-                  ipc.system.openExternalUrl(
-                    "https://www.dyad.sh/docs/guides/security-review",
-                  )
-                }
-              >
-                Open Security Review docs
-              </a>
-            </p>
-          </div>
-          {data && data.findings.length > 0 && <ReviewSummary data={data} />}
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="size-8 text-muted-foreground"
+                  aria-label="Open Security Review documentation"
+                  onClick={() =>
+                    ipc.system.openExternalUrl(
+                      "https://www.dyad.sh/docs/guides/security-review",
+                    )
+                  }
+                />
+              }
+            >
+              <ExternalLink className="size-4" />
+            </TooltipTrigger>
+            <TooltipContent>Open Security Review docs</TooltipContent>
+          </Tooltip>
         </div>
-        <div className="flex flex-col items-end gap-2">
-          <Button variant="outline" onClick={onOpenEditRules}>
-            <Pencil className="w-4 h-4" />
-            Edit Security Rules
-          </Button>
-          <div className="flex items-center gap-2">
+        <div className="ml-auto flex flex-wrap items-center justify-end gap-2">
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="text-muted-foreground"
+                  aria-label="Edit security rules"
+                  onClick={onOpenEditRules}
+                />
+              }
+            >
+              <Pencil className="size-4" />
+              Edit rules
+            </TooltipTrigger>
+            <TooltipContent>Edit security rules</TooltipContent>
+          </Tooltip>
+          {showSelectedFixActions && (
+            <div className="inline-flex">
+              <Button
+                onClick={onShowSelectedFix}
+                variant="outline"
+                className="rounded-r-none"
+                disabled={isRunning}
+              >
+                Show fix for {existingFixIssueLabel}
+              </Button>
+              <DropdownMenu>
+                <DropdownMenuTrigger
+                  render={
+                    <Button
+                      variant="outline"
+                      className="rounded-l-none border-l-0 px-2"
+                      aria-label={`More fix actions for ${existingFixIssueLabel}`}
+                      disabled={isRunning}
+                    />
+                  }
+                >
+                  <ChevronDown className="size-4" />
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end">
+                  <DropdownMenuItem
+                    onClick={onRerunSelectedFix}
+                    disabled={isRunning}
+                  >
+                    <Wrench className="size-4" />
+                    Re-run fix
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
+          )}
+          <RunReviewButton
+            isRunning={isRunning}
+            onRun={onRun}
+            secondary={hasFindings && !showSelectedFixActions}
+          />
+          {hasFindings && !showSelectedFixActions && (
             <Button
-              variant="outline"
               onClick={onFixSelected}
-              className="gap-2 transition-all duration-300"
-              disabled={isFixingSelected}
-              style={{
-                visibility: shouldRender ? "visible" : "hidden",
-                opacity: isButtonVisible ? 1 : 0,
-                transform: isButtonVisible
-                  ? "translateY(0)"
-                  : "translateY(-8px)",
-                pointerEvents: shouldRender ? "auto" : "none",
-              }}
+              className="gap-2"
+              disabled={isRunning || isFixingSelected}
             >
               {isFixingSelected ? (
                 <>
@@ -261,20 +376,19 @@ function SecurityHeader({
                       d="m4 12a8 8 0 0 1 8-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 0 1 4 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
                     />
                   </svg>
-                  Fixing {selectedCount} Issue{selectedCount !== 1 ? "s" : ""}
-                  ...
+                  Fixing {activeIssueLabel}...
                 </>
               ) : (
                 <>
                   <Wrench className="w-4 h-4" />
-                  Fix {selectedCount} Issue{selectedCount !== 1 ? "s" : ""}
+                  Fix {selectedIssueLabel}
                 </>
               )}
             </Button>
-            <RunReviewButton isRunning={isRunning} onRun={onRun} />
-          </div>
+          )}
         </div>
       </div>
+      {hasFindings && data && <ReviewSummary data={data} />}
     </div>
   );
 }
@@ -417,18 +531,104 @@ function NoIssuesCard({ data }: { data?: SecurityReviewResult }) {
   );
 }
 
+function FindingFixActions({
+  finding,
+  isFixing,
+  onFix,
+  onShowFix,
+  onRerunFix,
+  compact = false,
+}: {
+  finding: SecurityReviewFinding;
+  isFixing: boolean;
+  onFix: (finding: SecurityFinding) => void;
+  onShowFix: (finding: SecurityReviewFinding) => void;
+  onRerunFix: (finding: SecurityReviewFinding) => void;
+  compact?: boolean;
+}) {
+  const size = compact ? "sm" : "default";
+
+  if (isFixing) {
+    return (
+      <Button size={size} disabled className="gap-2">
+        <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+          <circle
+            className="opacity-25"
+            cx="12"
+            cy="12"
+            r="10"
+            stroke="currentColor"
+            strokeWidth="4"
+          />
+          <path
+            className="opacity-75"
+            fill="currentColor"
+            d="m4 12a8 8 0 0 1 8-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 0 1 4 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
+          />
+        </svg>
+        Fixing Issue...
+      </Button>
+    );
+  }
+
+  if (!finding.fixChatId) {
+    return (
+      <Button onClick={() => onFix(finding)} size={size} variant="default">
+        Fix Issue
+      </Button>
+    );
+  }
+
+  return (
+    <div className="inline-flex">
+      <Button
+        onClick={() => onShowFix(finding)}
+        size={size}
+        variant="outline"
+        className="rounded-r-none"
+      >
+        Show fix
+      </Button>
+      <DropdownMenu>
+        <DropdownMenuTrigger
+          render={
+            <Button
+              size={size}
+              variant="outline"
+              className={cn("rounded-l-none border-l-0 px-2", compact && "w-8")}
+              aria-label={`More fix actions for ${finding.title}`}
+            />
+          }
+        >
+          <ChevronDown className="w-4 h-4" />
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end">
+          <DropdownMenuItem onClick={() => onRerunFix(finding)}>
+            <Wrench className="w-4 h-4" />
+            Re-run fix
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </div>
+  );
+}
+
 function FindingsTable({
   findings,
   onOpenDetails,
   onFix,
+  onShowFix,
+  onRerunFix,
   fixingFindingKey,
   selectedFindings,
   onToggleSelection,
   onToggleSelectAll,
 }: {
-  findings: SecurityFinding[];
-  onOpenDetails: (finding: SecurityFinding) => void;
+  findings: SecurityReviewFinding[];
+  onOpenDetails: (finding: SecurityReviewFinding) => void;
   onFix: (finding: SecurityFinding) => void;
+  onShowFix: (finding: SecurityReviewFinding) => void;
+  onRerunFix: (finding: SecurityReviewFinding) => void;
   fixingFindingKey?: string | null;
   selectedFindings: Set<string>;
   onToggleSelection: (findingKey: string) => void;
@@ -534,40 +734,14 @@ function FindingsTable({
                   </div>
                 </td>
                 <td className="px-4 py-4 align-top text-right">
-                  <Button
-                    onClick={() => onFix(finding)}
-                    size="sm"
-                    variant="default"
-                    className="gap-2"
-                    disabled={isFixing}
-                  >
-                    {isFixing ? (
-                      <>
-                        <svg
-                          className="w-4 h-4 animate-spin"
-                          fill="none"
-                          viewBox="0 0 24 24"
-                        >
-                          <circle
-                            className="opacity-25"
-                            cx="12"
-                            cy="12"
-                            r="10"
-                            stroke="currentColor"
-                            strokeWidth="4"
-                          />
-                          <path
-                            className="opacity-75"
-                            fill="currentColor"
-                            d="m4 12a8 8 0 0 1 8-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 0 1 4 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
-                          />
-                        </svg>
-                        Fixing Issue...
-                      </>
-                    ) : (
-                      <>Fix Issue</>
-                    )}
-                  </Button>
+                  <FindingFixActions
+                    finding={finding}
+                    isFixing={isFixing}
+                    onFix={onFix}
+                    onShowFix={onShowFix}
+                    onRerunFix={onRerunFix}
+                    compact
+                  />
                 </td>
               </tr>
             );
@@ -583,12 +757,16 @@ function FindingDetailsDialog({
   finding,
   onClose,
   onFix,
+  onShowFix,
+  onRerunFix,
   fixingFindingKey,
 }: {
   open: boolean;
-  finding: SecurityFinding | null;
+  finding: SecurityReviewFinding | null;
   onClose: (open: boolean) => void;
   onFix: (finding: SecurityFinding) => void;
+  onShowFix: (finding: SecurityReviewFinding) => void;
+  onRerunFix: (finding: SecurityReviewFinding) => void;
   fixingFindingKey?: string | null;
 }) {
   return (
@@ -604,44 +782,24 @@ function FindingDetailsDialog({
           {finding && <VanillaMarkdownParser content={finding.description} />}
         </div>
         <DialogFooter>
-          <Button
-            onClick={() => {
-              if (finding) {
-                onFix(finding);
+          {finding && (
+            <FindingFixActions
+              finding={finding}
+              isFixing={fixingFindingKey === createFindingKey(finding)}
+              onFix={(selectedFinding) => {
+                onFix(selectedFinding);
                 onClose(false);
-              }
-            }}
-            disabled={
-              finding ? fixingFindingKey === createFindingKey(finding) : false
-            }
-          >
-            {finding && fixingFindingKey === createFindingKey(finding) ? (
-              <>
-                <svg
-                  className="w-4 h-4 animate-spin mr-2"
-                  fill="none"
-                  viewBox="0 0 24 24"
-                >
-                  <circle
-                    className="opacity-25"
-                    cx="12"
-                    cy="12"
-                    r="10"
-                    stroke="currentColor"
-                    strokeWidth="4"
-                  />
-                  <path
-                    className="opacity-75"
-                    fill="currentColor"
-                    d="m4 12a8 8 0 0 1 8-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 0 1 4 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
-                  />
-                </svg>
-                Fixing Issue...
-              </>
-            ) : (
-              <>Fix Issue</>
-            )}
-          </Button>
+              }}
+              onShowFix={(selectedFinding) => {
+                onShowFix(selectedFinding);
+                onClose(false);
+              }}
+              onRerunFix={(selectedFinding) => {
+                onRerunFix(selectedFinding);
+                onClose(false);
+              }}
+            />
+          )}
           <DialogClose className={cn(buttonVariants({ variant: "outline" }))}>
             Close
           </DialogClose>
@@ -653,15 +811,15 @@ function FindingDetailsDialog({
 
 export const SecurityPanel = () => {
   const selectedAppId = useAtomValue(selectedAppIdAtom);
+  const setIsChatPanelHidden = useSetAtom(isChatPanelHiddenAtom);
   const { selectChat } = useSelectChat();
   const queryClient = useQueryClient();
   const { streamMessage } = useStreamChat({ hasChatId: false });
   const { data, isLoading, error, refetch } = useSecurityReview(selectedAppId);
   const [isRunningReview, setIsRunningReview] = useState(false);
   const [detailsOpen, setDetailsOpen] = useState(false);
-  const [detailsFinding, setDetailsFinding] = useState<SecurityFinding | null>(
-    null,
-  );
+  const [detailsFinding, setDetailsFinding] =
+    useState<SecurityReviewFinding | null>(null);
   const [isEditRulesOpen, setIsEditRulesOpen] = useState(false);
   const [rulesContent, setRulesContent] = useState("");
   const [fixingFindingKey, setFixingFindingKey] = useState<string | null>(null);
@@ -670,6 +828,13 @@ export const SecurityPanel = () => {
     new Set(),
   );
   const [isFixingSelected, setIsFixingSelected] = useState(false);
+  const [selectedFixChat, setSelectedFixChat] = useState<{
+    chatId: number;
+    findings: SecurityFinding[];
+  } | null>(null);
+  const activeFixStreamChatIdsRef = useRef<Set<number>>(new Set());
+  const selectionScope = `${selectedAppId ?? "no-app"}:${data?.chatId ?? "no-review"}`;
+  const previousSelectionScopeRef = useRef(selectionScope);
 
   const {
     content: fetchedRules,
@@ -686,10 +851,15 @@ export const SecurityPanel = () => {
     }
   }, [fetchedRules]);
 
-  // Clear selections when data changes (e.g., after a new review)
+  // Fix-chat metadata updates also refetch this query. Only a different app or
+  // review should discard the selection for the review currently being fixed.
   useEffect(() => {
-    setSelectedFindings(new Set());
-  }, [data]);
+    if (previousSelectionScopeRef.current !== selectionScope) {
+      setSelectedFindings(new Set());
+      setSelectedFixChat(null);
+      previousSelectionScopeRef.current = selectionScope;
+    }
+  }, [selectionScope]);
 
   const handleSaveRules = async () => {
     if (!selectedAppId) {
@@ -721,7 +891,7 @@ export const SecurityPanel = () => {
     }
   };
 
-  const openFindingDetails = (finding: SecurityFinding) => {
+  const openFindingDetails = (finding: SecurityReviewFinding) => {
     setDetailsFinding(finding);
     setDetailsOpen(true);
   };
@@ -739,6 +909,7 @@ export const SecurityPanel = () => {
       const chatId = await ipc.chat.createChat(selectedAppId);
 
       // Select the new chat (updates session/recent tracking and navigates)
+      setIsChatPanelHidden(false);
       selectChat({ chatId, appId: selectedAppId });
       queryClient.invalidateQueries({ queryKey: queryKeys.chats.all });
 
@@ -758,43 +929,142 @@ export const SecurityPanel = () => {
     }
   };
 
-  const handleFixIssue = async (finding: SecurityFinding) => {
+  const showFixChat = (chatId: number) => {
     if (!selectedAppId) {
       showError("No app selected");
       return;
     }
+    setIsChatPanelHidden(false);
+    selectChat({ chatId, appId: selectedAppId });
+  };
 
+  const streamFixPrompt = async ({
+    chatId,
+    findingsToFix,
+    setFixing,
+    onFixSettled,
+  }: {
+    chatId: number;
+    findingsToFix: SecurityFinding[];
+    setFixing: (fixing: boolean) => void;
+    onFixSettled?: () => void;
+  }) => {
+    if (!selectedAppId || activeFixStreamChatIdsRef.current.has(chatId)) {
+      return;
+    }
+
+    setFixing(true);
+    showFixChat(chatId);
+    activeFixStreamChatIdsRef.current.add(chatId);
     try {
-      const key = createFindingKey(finding);
-      setFixingFindingKey(key);
-
-      const chatId = await ipc.chat.createChat(selectedAppId);
-
-      // Select the new chat (updates session/recent tracking and navigates)
-      selectChat({ chatId, appId: selectedAppId });
-      queryClient.invalidateQueries({ queryKey: queryKeys.chats.all });
-
-      const prompt = `Please fix the following security issue in a simple and effective way:
-
-**${finding.title}** (${finding.level} severity)
-
-${finding.description}`;
-
       await streamMessage({
-        prompt,
+        prompt: buildFixPrompt(findingsToFix),
         chatId,
         appId: selectedAppId,
         onSettled: () => {
-          setFixingFindingKey(null);
+          activeFixStreamChatIdsRef.current.delete(chatId);
+          setFixing(false);
+          onFixSettled?.();
         },
       });
     } catch (err) {
-      showError(`Failed to create fix chat: ${err}`);
-      setFixingFindingKey(null);
+      activeFixStreamChatIdsRef.current.delete(chatId);
+      showError(`Failed to run fix: ${err}`);
+      setFixing(false);
     }
   };
 
+  // Opens the fix chat for the given findings, creating it (and sending the
+  // fix prompt) only if one doesn't already exist for this review + findings.
+  const openFixChat = async ({
+    findingsToFix,
+    setFixing,
+    onFixSettled,
+  }: {
+    findingsToFix: SecurityFinding[];
+    setFixing: (fixing: boolean) => void;
+    onFixSettled?: () => void;
+  }): Promise<{ chatId: number; created: boolean } | null> => {
+    if (!selectedAppId) {
+      showError("No app selected");
+      return null;
+    }
+    if (!data) {
+      showError("No security review loaded");
+      return null;
+    }
+    if (findingsToFix.length === 0) {
+      showError("No valid issues selected");
+      return null;
+    }
+
+    setFixing(true);
+    try {
+      const { chatId, created } = await ipc.security.getOrCreateSecurityFixChat(
+        {
+          appId: selectedAppId,
+          reviewChatId: data.chatId,
+          findings: findingsToFix,
+        },
+      );
+
+      showFixChat(chatId);
+      await queryClient.invalidateQueries({
+        queryKey: queryKeys.securityReview.byApp({ appId: selectedAppId }),
+      });
+
+      if (created) {
+        queryClient.invalidateQueries({ queryKey: queryKeys.chats.all });
+        await streamFixPrompt({
+          chatId,
+          findingsToFix,
+          setFixing,
+          onFixSettled,
+        });
+      } else {
+        setFixing(false);
+      }
+      return { chatId, created };
+    } catch (err) {
+      showError(`Failed to create fix chat: ${err}`);
+      setFixing(false);
+      return null;
+    }
+  };
+
+  const handleFixIssue = async (finding: SecurityFinding) => {
+    const key = createFindingKey(finding);
+    await openFixChat({
+      findingsToFix: [finding],
+      setFixing: (fixing) => {
+        setFixingFindingKey(fixing ? key : null);
+      },
+    });
+  };
+
+  const handleShowFix = (finding: SecurityReviewFinding) => {
+    if (finding.fixChatId) {
+      showFixChat(finding.fixChatId);
+      toast.info("Opened fix chat");
+    }
+  };
+
+  const handleRerunFix = async (finding: SecurityReviewFinding) => {
+    if (!finding.fixChatId) {
+      return;
+    }
+    const key = createFindingKey(finding);
+    await streamFixPrompt({
+      chatId: finding.fixChatId,
+      findingsToFix: [finding],
+      setFixing: (fixing) => {
+        setFixingFindingKey(fixing ? key : null);
+      },
+    });
+  };
+
   const handleToggleSelection = (findingKey: string) => {
+    setSelectedFixChat(null);
     setSelectedFindings((prev) => {
       const newSet = new Set(prev);
       if (newSet.has(findingKey)) {
@@ -808,6 +1078,8 @@ ${finding.description}`;
 
   const handleToggleSelectAll = () => {
     if (!data?.findings) return;
+
+    setSelectedFixChat(null);
 
     const sortedFindings = [...data.findings].sort(
       (a, b) => getSeverityOrder(a.level) - getSeverityOrder(b.level),
@@ -824,51 +1096,55 @@ ${finding.description}`;
   };
 
   const handleFixSelected = async () => {
-    if (!selectedAppId || selectedFindings.size === 0 || !data?.findings) {
-      showError("No issues selected");
+    if (!selectedAppId) {
+      showError("No app selected");
+      return;
+    }
+    if (!data?.findings) {
+      showError("No security review loaded");
       return;
     }
 
-    try {
-      setIsFixingSelected(true);
-
-      // Get the selected findings
-      const findingsToFix = data.findings.filter((finding) =>
-        selectedFindings.has(createFindingKey(finding)),
-      );
-
-      // Create a new chat
-      const chatId = await ipc.chat.createChat(selectedAppId);
-
-      // Select the new chat (updates session/recent tracking and navigates)
-      selectChat({ chatId, appId: selectedAppId });
-      queryClient.invalidateQueries({ queryKey: queryKeys.chats.all });
-
-      // Build a comprehensive prompt for all selected issues
-      const issuesList = findingsToFix
-        .map(
-          (finding, index) =>
-            `${index + 1}. **${finding.title}** (${finding.level} severity)\n${finding.description}`,
-        )
-        .join("\n\n");
-
-      const prompt = `Please fix the following ${findingsToFix.length} security issue${findingsToFix.length !== 1 ? "s" : ""} in a simple and effective way:
-
-${issuesList}`;
-
-      await streamMessage({
-        prompt,
-        chatId,
-        appId: selectedAppId,
-        onSettled: () => {
-          setIsFixingSelected(false);
-          setSelectedFindings(new Set());
-        },
-      });
-    } catch (err) {
-      showError(`Failed to create fix chat: ${err}`);
-      setIsFixingSelected(false);
+    const findingsToFix =
+      selectedFindings.size > 0
+        ? data.findings.filter((finding) =>
+            selectedFindings.has(createFindingKey(finding)),
+          )
+        : data.findings;
+    if (findingsToFix.length === 0) {
+      showError("No valid issues selected");
+      return;
     }
+
+    const result = await openFixChat({
+      findingsToFix,
+      setFixing: setIsFixingSelected,
+      onFixSettled: () => {
+        setSelectedFindings(new Set());
+      },
+    });
+    if (result) {
+      setSelectedFixChat({ chatId: result.chatId, findings: findingsToFix });
+    }
+  };
+
+  const handleShowSelectedFix = () => {
+    if (!selectedFixChat) {
+      return;
+    }
+    showFixChat(selectedFixChat.chatId);
+    toast.info("Opened fix chat");
+  };
+
+  const handleRerunSelectedFix = async () => {
+    if (!selectedFixChat) {
+      return;
+    }
+    await streamFixPrompt({
+      chatId: selectedFixChat.chatId,
+      findingsToFix: selectedFixChat.findings,
+      setFixing: setIsFixingSelected,
+    });
   };
 
   if (isLoading) {
@@ -894,7 +1170,10 @@ ${issuesList}`;
           }}
           selectedCount={selectedFindings.size}
           onFixSelected={handleFixSelected}
+          onShowSelectedFix={handleShowSelectedFix}
+          onRerunSelectedFix={handleRerunSelectedFix}
           isFixingSelected={isFixingSelected}
+          selectedFixCount={selectedFixChat?.findings.length}
         />
 
         {isRunningReview ? (
@@ -909,6 +1188,8 @@ ${issuesList}`;
             findings={data.findings}
             onOpenDetails={openFindingDetails}
             onFix={handleFixIssue}
+            onShowFix={handleShowFix}
+            onRerunFix={handleRerunFix}
             fixingFindingKey={fixingFindingKey}
             selectedFindings={selectedFindings}
             onToggleSelection={handleToggleSelection}
@@ -922,6 +1203,8 @@ ${issuesList}`;
           finding={detailsFinding}
           onClose={setDetailsOpen}
           onFix={handleFixIssue}
+          onShowFix={handleShowFix}
+          onRerunFix={handleRerunFix}
           fixingFindingKey={fixingFindingKey}
         />
         <Dialog open={isEditRulesOpen} onOpenChange={setIsEditRulesOpen}>

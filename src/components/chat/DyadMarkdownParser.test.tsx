@@ -1,4 +1,6 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { createStore, Provider } from "jotai";
+import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as parserModule from "@/lib/streamingMessageParser";
@@ -6,6 +8,11 @@ import type {
   Block as ParserBlock,
   ParserState,
 } from "@/lib/streamingMessageParser";
+import { selectedChatIdAtom } from "@/atoms/chatAtoms";
+
+const mockStreamState = vi.hoisted(() => ({
+  current: { type: "idle" } as { type: string },
+}));
 
 // Track every render of the inner ReactMarkdown component keyed by the
 // content string it received. The DyadMarkdownParser wraps ReactMarkdown
@@ -27,10 +34,25 @@ vi.mock("../preview_panel/FileEditor", () => ({
   FileEditor: () => null,
 }));
 
+vi.mock("./CodeHighlight", () => ({
+  CodeHighlight: ({ children }: { children: ReactNode }) => (
+    <pre>{children}</pre>
+  ),
+}));
+
+vi.mock("@/hooks/useStreamChat", () => ({
+  useStreamChat: () => ({ streamMessage: vi.fn() }),
+}));
+
+vi.mock("@/hooks/useChatStream", () => ({
+  useChatStreamState: () => mockStreamState.current,
+}));
+
 import { DyadMarkdownParser } from "./DyadMarkdownParser";
 
 describe("DyadMarkdownParser dyad-status", () => {
   afterEach(() => {
+    mockStreamState.current = { type: "idle" };
     cleanup();
   });
 
@@ -47,6 +69,161 @@ describe("DyadMarkdownParser dyad-status", () => {
 
     expect(screen.getByText("Supabase functions failed")).toBeTruthy();
     expect(statusCard.className).toContain("border-l-red-500");
+  });
+
+  it("renders incomplete type checks as amber warnings", () => {
+    const { container } = render(
+      <DyadMarkdownParser
+        content={
+          '<dyad-status title="Type check incomplete" state="warning">Fix the configuration error, then rerun type checking.</dyad-status>'
+        }
+      />,
+    );
+
+    const statusCard = screen.getByRole("button");
+
+    expect(screen.getByText("Type check incomplete")).toBeTruthy();
+    expect(statusCard.className).toContain("border-l-amber-500");
+    expect(container.querySelector(".text-amber-600")).toBeTruthy();
+  });
+
+  it("keeps completed checks with source errors in the green finished state", () => {
+    const { container } = render(
+      <DyadMarkdownParser
+        content={
+          '<dyad-status title="Type errors found" state="finished">Found 1 type error.</dyad-status>'
+        }
+      />,
+    );
+
+    expect(screen.getByText("Type errors found")).toBeTruthy();
+    expect(container.querySelector(".text-green-600")).toBeTruthy();
+    expect(container.querySelector(".text-red-600")).toBeNull();
+  });
+});
+
+describe("DyadMarkdownParser dyad-command", () => {
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("renders the add TypeScript command as a supported action button", () => {
+    render(
+      <DyadMarkdownParser
+        content={'<dyad-command type="add-typescript"></dyad-command>'}
+      />,
+    );
+
+    expect(
+      screen.getByRole("button", { name: /add typescript/i }),
+    ).toBeTruthy();
+    expect(screen.queryByText(/Unsupported:/)).toBeNull();
+  });
+});
+
+describe("DyadMarkdownParser dyad-explore-chat-history", () => {
+  afterEach(() => {
+    cleanup();
+  });
+
+  it.each(["partial", "no_match"])(
+    "keeps a persisted %s report expanded",
+    (outcome) => {
+      render(
+        <DyadMarkdownParser
+          content={`<dyad-explore-chat-history query="auth" chats="1" evidence="2" outcome="${outcome}">Historical evidence</dyad-explore-chat-history>`}
+        />,
+      );
+
+      expect(
+        screen
+          .getByTestId("dyad-explore-chat-history")
+          .getAttribute("aria-expanded"),
+      ).toBe("true");
+    },
+  );
+});
+
+describe("DyadMarkdownParser dyad-git", () => {
+  afterEach(() => {
+    cleanup();
+  });
+
+  it.each([
+    ["status", "Checked project changes"],
+    ["diff", "Reviewed changes in src/main.ts"],
+    ["log", "Reviewed versions of src/main.ts"],
+    ["show_commit", "Inspected version abc123"],
+    ["show_file", "Read src/main.ts"],
+    ["restore_file", "Restored src/main.ts"],
+  ])("renders the %s Git operation as an activity row", (operation, label) => {
+    render(
+      <DyadMarkdownParser
+        content={`<dyad-git operation="${operation}" revision="abc123" path="src/main.ts"></dyad-git>`}
+      />,
+    );
+
+    expect(screen.getByText(label)).toBeTruthy();
+    expect(screen.queryByText("Git")).toBeNull();
+  });
+
+  it("renders a pending state while the Git tag streams", () => {
+    const store = createStore();
+    store.set(selectedChatIdAtom, 1);
+    mockStreamState.current = { type: "streaming" };
+    render(
+      <Provider store={store}>
+        <DyadMarkdownParser
+          content={'<dyad-git operation="status" state="pending">'}
+        />
+      </Provider>,
+    );
+
+    expect(screen.getByText("Checking project changes")).toBeTruthy();
+    expect(screen.getByLabelText("In progress")).toBeTruthy();
+  });
+
+  it("shows a useful status summary and expands structured file details", () => {
+    const status = JSON.stringify({
+      branch: "main",
+      detached: false,
+      staged: ["src/App.tsx"],
+      unstaged: ["src/App.tsx", "src/index.css"],
+      untracked: ["src/new.ts"],
+      conflicted: [],
+    });
+    render(
+      <DyadMarkdownParser
+        content={`<dyad-git operation="status" branch="main" changed_count="2" untracked_count="1" conflicted_count="0" detail_format="status">${status}</dyad-git>`}
+      />,
+    );
+
+    expect(screen.getByText("2 changed · 1 new")).toBeTruthy();
+    const row = screen.getByRole("button", {
+      name: /checked project changes/i,
+    });
+    expect(row.getAttribute("aria-expanded")).toBe("false");
+
+    fireEvent.click(row);
+
+    expect(row.getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByText("Branch main")).toBeTruthy();
+    expect(screen.getAllByText("src/App.tsx")).toHaveLength(2);
+    expect(screen.getByText("src/index.css")).toBeTruthy();
+    expect(screen.getByText("src/new.ts")).toBeTruthy();
+  });
+
+  it("does not render malformed status detail as structured content", () => {
+    render(
+      <DyadMarkdownParser
+        content={
+          '<dyad-git operation="status" detail_format="status">{"branch":"main","detached":false,"staged":[{}],"unstaged":[],"untracked":[],"conflicted":[]}</dyad-git>'
+        }
+      />,
+    );
+
+    expect(screen.getByText("Checked project changes")).toBeTruthy();
+    expect(screen.queryByRole("button")).toBeNull();
   });
 });
 

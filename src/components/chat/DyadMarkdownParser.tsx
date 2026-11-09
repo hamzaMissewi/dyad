@@ -1,3 +1,4 @@
+import { ClaudeCodeToolCard } from "./ClaudeCodeToolCard";
 import React, { useDeferredValue, useMemo, useRef } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -10,8 +11,12 @@ import { DyadAddDependency } from "./DyadAddDependency";
 import { DyadExecuteSql } from "./DyadExecuteSql";
 import { DyadLogs } from "./DyadLogs";
 import { DyadGrep } from "./DyadGrep";
+import { DyadSearchChats } from "./DyadSearchChats";
+import { DyadReadChat } from "./DyadReadChat";
 import { DyadExploreCode } from "./DyadExploreCode";
+import { DyadExploreChatHistory } from "./DyadExploreChatHistory";
 import { DyadAddIntegration } from "./DyadAddIntegration";
+import { DyadSuggestPlugin } from "./DyadSuggestPlugin";
 import { DyadEnableNitro } from "./DyadEnableNitro";
 import { DyadEdit } from "./DyadEdit";
 import { DyadSearchReplace } from "./DyadSearchReplace";
@@ -19,11 +24,12 @@ import { DyadCodebaseContext } from "./DyadCodebaseContext";
 import { DyadThink } from "./DyadThink";
 import { CodeHighlight } from "./CodeHighlight";
 import { useAtomValue } from "jotai";
+import { selectedChatIdAtom } from "@/atoms/chatAtoms";
 import {
-  isStreamingByIdAtom,
-  selectedChatIdAtom,
-  streamingPreviewByChatIdAtom,
-} from "@/atoms/chatAtoms";
+  useChatStreamPreview,
+  useChatStreamState,
+} from "@/hooks/useChatStream";
+import { isStreamActive } from "@/chat_stream/transition";
 import { CustomTagState } from "./stateTypes";
 import { DyadOutput } from "./DyadOutput";
 import { DyadProblemSummary } from "./DyadProblemSummary";
@@ -59,8 +65,11 @@ import { DyadExitPlan } from "./DyadExitPlan";
 import { DyadQuestionnaire } from "./DyadQuestionnaire";
 import { DyadStepLimit } from "./DyadStepLimit";
 import { DyadAppBlueprintCard } from "./DyadAppBlueprintCard";
+import { DyadTestAssertionsCard } from "./DyadTestAssertionsCard";
 import { DyadReadGuide } from "./DyadReadGuide";
 import { DyadScript } from "./DyadScript";
+import { DyadGit } from "./DyadGit";
+import { DyadSubagent } from "./DyadSubagent";
 import { mapActionToButton } from "./ChatInput";
 import { SuggestedAction } from "@/lib/schemas";
 import { FixAllErrorsButton } from "./FixAllErrorsButton";
@@ -125,9 +134,10 @@ export const DyadMarkdownParser: React.FC<DyadMarkdownParserProps> = ({
   showStreamingPreview = false,
 }) => {
   const chatId = useAtomValue(selectedChatIdAtom);
-  const isStreamingMap = useAtomValue(isStreamingByIdAtom);
-  const isStreaming =
-    chatId != null ? (isStreamingMap.get(chatId) ?? false) : false;
+  const streamState = useChatStreamState(chatId ?? undefined) ?? {
+    type: "idle",
+  };
+  const isStreaming = isStreamActive(streamState);
   const deferredContent = useDeferredValue(content);
   const contentToParse = isStreaming ? deferredContent : content;
 
@@ -241,8 +251,7 @@ function StreamingPreviewBlocks({
   chatId: number;
   isStreaming: boolean;
 }) {
-  const previewStates = useAtomValue(streamingPreviewByChatIdAtom);
-  const previewXml = previewStates.get(chatId);
+  const previewXml = useChatStreamPreview(chatId);
   const previewBlocks = useMemo<Block[] | null>(() => {
     if (!previewXml) return null;
     return parseFullMessage(previewXml).blocks;
@@ -337,6 +346,12 @@ function renderClosedBlock(
   return renderBlock(block, false);
 }
 
+// Original payload length recorded on a truncated MCP tag.
+function parseTruncatedFrom(block: CustomTagBlock): number | undefined {
+  const value = Number(block.attributes["truncated-from"]);
+  return Number.isFinite(value) ? value : undefined;
+}
+
 // One card for an MCP tool call + its result. Memoizes on both block refs;
 // once the result is present the card is "finished" regardless of streaming,
 // so isStreaming is only compared while still waiting for a result.
@@ -371,6 +386,13 @@ const MemoMcpToolPair = React.memo(
         resultContent={resultBlock?.content}
         state={state}
         isError={isError}
+        inputTruncatedFrom={parseTruncatedFrom(callBlock)}
+        resultTruncatedFrom={
+          resultBlock ? parseTruncatedFrom(resultBlock) : undefined
+        }
+        resultToolTruncated={
+          resultBlock?.attributes["tool-truncated"] === "true"
+        }
       >
         {callBlock.content}
       </DyadMcpToolCall>
@@ -482,7 +504,12 @@ function getState({
   inProgress?: boolean;
   explicitState?: string;
 }): CustomTagState {
-  if (explicitState === "aborted" || explicitState === "finished") {
+  if (
+    explicitState === "aborted" ||
+    explicitState === "error" ||
+    explicitState === "finished" ||
+    explicitState === "warning"
+  ) {
     return explicitState;
   }
   if (explicitState === "in-progress" || explicitState === "pending") {
@@ -504,6 +531,21 @@ function renderCustomTag(
   const { tag, attributes, content, inProgress } = block;
 
   switch (tag) {
+    case "dyad-subagent": {
+      const subagentChatId = Number(attributes["chat-id"]);
+      if (!Number.isSafeInteger(subagentChatId)) return null;
+      return (
+        <DyadSubagent
+          chatId={subagentChatId}
+          threadId={attributes["thread-id"] || ""}
+          persona={attributes.persona || "agent"}
+          taskName={attributes["task-name"] || "Sub-agent task"}
+          renderActivity={(xml, activityId) => (
+            <DyadMarkdownParser content={xml} messageId={activityId} />
+          )}
+        />
+      );
+    }
     case "dyad-read":
       return (
         <DyadRead
@@ -519,6 +561,19 @@ function renderCustomTag(
           {content}
         </DyadRead>
       );
+    case "dyad-git":
+      return (
+        <DyadGit
+          node={{
+            properties: {
+              ...attributes,
+              state: getState({ isStreaming, inProgress }),
+            },
+          }}
+        >
+          {content}
+        </DyadGit>
+      );
     case "dyad-web-search":
       return (
         <DyadWebSearch
@@ -531,6 +586,44 @@ function renderCustomTag(
         >
           {content}
         </DyadWebSearch>
+      );
+    case "dyad-search-chats":
+      return (
+        <DyadSearchChats
+          node={{
+            properties: {
+              query: attributes.query || "",
+              indexStatus: attributes["index-status"] || "",
+              resultCount: attributes["result-count"],
+              state: getState({
+                isStreaming,
+                inProgress,
+                explicitState: attributes.state as CustomTagState,
+              }),
+            },
+          }}
+        >
+          {content}
+        </DyadSearchChats>
+      );
+    case "dyad-read-chat":
+      return (
+        <DyadReadChat
+          node={{
+            properties: {
+              chatId: attributes["chat-id"] || "",
+              title: attributes.title || "",
+              range: attributes.range || "",
+              state: getState({
+                isStreaming,
+                inProgress,
+                explicitState: attributes.state as CustomTagState,
+              }),
+            },
+          }}
+        >
+          {content}
+        </DyadReadChat>
       );
     case "dyad-web-crawl":
       return (
@@ -560,7 +653,11 @@ function renderCustomTag(
           node={{
             properties: {
               query: attributes.query || "",
-              state: getState({ isStreaming, inProgress }),
+              state: getState({
+                isStreaming,
+                inProgress,
+                explicitState: attributes.state,
+              }),
               appName: attributes.app_name || "",
             },
           }}
@@ -602,6 +699,10 @@ function renderCustomTag(
           {content}
         </DyadThink>
       );
+    // "dyad-generate-test" is legacy: no longer emitted, but historical chats
+    // still contain it. Both tags carry a path/description and a file body, so
+    // the old test cards render as plain file-write cards instead of raw markup.
+    case "dyad-generate-test":
     case "dyad-write":
       return (
         <DyadWrite
@@ -609,7 +710,11 @@ function renderCustomTag(
             properties: {
               path: attributes.path || "",
               description: attributes.description || "",
-              state: getState({ isStreaming, inProgress }),
+              state: getState({
+                isStreaming,
+                inProgress,
+                explicitState: attributes.state,
+              }),
             },
           }}
         >
@@ -709,7 +814,11 @@ function renderCustomTag(
         <DyadGrep
           node={{
             properties: {
-              state: getState({ isStreaming, inProgress }),
+              state: getState({
+                isStreaming,
+                inProgress,
+                explicitState: attributes.state,
+              }),
               query: attributes.query || "",
               include: attributes.include || "",
               exclude: attributes.exclude || "",
@@ -725,12 +834,33 @@ function renderCustomTag(
         </DyadGrep>
       );
 
+    case "dyad-explore-chat-history":
+      return (
+        <DyadExploreChatHistory
+          node={{
+            properties: {
+              state: getState({ isStreaming, inProgress }),
+              query: attributes.query || "",
+              chats: attributes.chats || "",
+              evidence: attributes.evidence || "",
+              outcome: attributes.outcome || "",
+            },
+          }}
+        >
+          {content}
+        </DyadExploreChatHistory>
+      );
+
     case "dyad-explore-code":
       return (
         <DyadExploreCode
           node={{
             properties: {
-              state: getState({ isStreaming, inProgress }),
+              state: getState({
+                isStreaming,
+                inProgress,
+                explicitState: attributes.state,
+              }),
               query: attributes.query || "",
               appName: attributes.app_name || "",
               files: attributes.files || "",
@@ -753,9 +883,36 @@ function renderCustomTag(
               ? attributes.provider
               : undefined
           }
+          outcome={
+            attributes.outcome === "pending" ||
+            attributes.outcome === "skipped" ||
+            attributes.outcome === "completed" ||
+            attributes.outcome === "dismissed"
+              ? attributes.outcome
+              : undefined
+          }
         >
           {content}
         </DyadAddIntegration>
+      );
+
+    case "dyad-suggest-plugin":
+      return (
+        <DyadSuggestPlugin
+          slug={attributes.slug || ""}
+          name={attributes.name}
+          reason={attributes.reason || ""}
+          requestId={attributes["request-id"]}
+          outcome={
+            attributes.outcome === "pending" ||
+            attributes.outcome === "connected" ||
+            attributes.outcome === "declined" ||
+            attributes.outcome === "never" ||
+            attributes.outcome === "dismissed"
+              ? attributes.outcome
+              : undefined
+          }
+        />
       );
 
     case "dyad-enable-nitro":
@@ -783,7 +940,11 @@ function renderCustomTag(
             properties: {
               path: attributes.path || "",
               description: attributes.description || "",
-              state: getState({ isStreaming, inProgress }),
+              state: getState({
+                isStreaming,
+                inProgress,
+                explicitState: attributes.state,
+              }),
             },
           }}
         >
@@ -843,6 +1004,7 @@ function renderCustomTag(
               autoApprovedReason: attributes["auto-approved-reason"] || "",
             },
           }}
+          inputTruncatedFrom={parseTruncatedFrom(block)}
         >
           {content}
         </DyadMcpToolCall>
@@ -906,6 +1068,11 @@ function renderCustomTag(
       // Don't render anything for dyad-chat-summary
       return null;
 
+    case "dyad-suggested-prompts":
+      // Rendered as clickable chips above the chat input (see
+      // SuggestedPromptsStrip), not inline in the transcript.
+      return null;
+
     case "dyad-command":
       if (attributes.type) {
         const action = {
@@ -924,7 +1091,11 @@ function renderCustomTag(
               recursive: attributes.recursive || "",
               include_ignored:
                 attributes.include_ignored || attributes.include_hidden || "",
-              state: getState({ isStreaming, inProgress }),
+              state: getState({
+                isStreaming,
+                inProgress,
+                explicitState: attributes.state,
+              }),
               appName: attributes.app_name || "",
             },
           }}
@@ -1025,6 +1196,9 @@ function renderCustomTag(
         </DyadImageGeneration>
       );
 
+    case "dyad-claude-tool":
+      return <ClaudeCodeToolCard content={content} />;
+
     case "dyad-status":
       return (
         <DyadStatus
@@ -1117,6 +1291,23 @@ function renderCustomTag(
             },
           }}
         />
+      );
+
+    case "dyad-test-assertions":
+      return (
+        <DyadTestAssertionsCard
+          node={{
+            properties: {
+              "proposal-id": attributes["proposal-id"] || "",
+              "request-id": attributes["request-id"] || "",
+              status: attributes.status || "proposed",
+              "spec-path": attributes["spec-path"] || "",
+              state: getState({ isStreaming, inProgress }),
+            },
+          }}
+        >
+          {content}
+        </DyadTestAssertionsCard>
       );
 
     default:

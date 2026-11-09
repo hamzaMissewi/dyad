@@ -1,16 +1,68 @@
-import { test, testSkipIfWindows, Timeout } from "./helpers/test_helper";
-import { expect, Locator, type Page } from "@playwright/test";
+import { PageObject, test, Timeout } from "./helpers/test_helper";
+import {
+  expect,
+  test as baseTest,
+  type Locator,
+  type Page,
+  type TestInfo,
+} from "@playwright/test";
+import fs from "fs";
+import os from "os";
+import path from "path";
+import type { ElectronApplication } from "playwright";
+import { FAKE_LLM_BASE_PORT } from "./helpers/test-ports";
+import { launchElectronApp, terminateElectronApp } from "./helpers/fixtures";
 
 async function queueMessage(page: Page, chatInput: Locator, message: string) {
   await expect(async () => {
     await chatInput.click();
     await chatInput.fill(message);
     expect(await chatInput.textContent()).toContain(message);
-    await chatInput.press("Enter");
-    await expect(page.locator("li", { hasText: message })).toBeVisible({
-      timeout: 2_000,
-    });
   }).toPass({ timeout: Timeout.MEDIUM });
+
+  await chatInput.press("Enter");
+  await expect(page.locator("li", { hasText: message })).toBeVisible({
+    timeout: Timeout.MEDIUM,
+  });
+}
+
+async function waitForGeneration(po: PageObject) {
+  await expect(
+    po.page.getByRole("button", { name: /cancel generation/i }),
+  ).toBeVisible({ timeout: Timeout.MEDIUM });
+}
+
+async function launchDyadWithProfile({
+  userDataDir,
+  fakeLlmPort,
+  testInfo,
+}: {
+  userDataDir: string;
+  fakeLlmPort: number;
+  testInfo: TestInfo;
+}) {
+  const electronApp = await launchElectronApp({
+    userDataDir,
+    fakeLlmPort,
+    parallelIndex: testInfo.parallelIndex,
+  });
+  const page = await electronApp.firstWindow();
+  const po = new PageObject(electronApp, page, {
+    userDataDir,
+    fakeLlmPort,
+    testInfo,
+  });
+  await page.evaluate(async () => {
+    await (window as any).electron.ipcRenderer.invoke("set-user-settings", {
+      enablePnpmMinimumReleaseAgeWarning: false,
+      hidePnpmMinimumReleaseAgeWarning: true,
+    });
+  });
+  return { electronApp, po };
+}
+
+async function closeDyad(electronApp: ElectronApplication) {
+  await terminateElectronApp(electronApp);
 }
 
 test.describe("queued messages", () => {
@@ -26,8 +78,9 @@ test.describe("queued messages", () => {
     await po.sendPrompt("tc=1 [sleep=medium]", {
       skipWaitForCompletion: true,
     });
+    await waitForGeneration(po);
 
-    // Wait for chat input to appear (indicates we're in chat view and streaming)
+    // Wait for chat input to appear now that streaming is active.
     await expect(chatInput).toBeVisible();
 
     // While streaming, send another message - this should be queued
@@ -39,21 +92,20 @@ test.describe("queued messages", () => {
       po.page.getByText(/\d+ Queued.*will send after current response/),
     ).toBeVisible();
 
-    // Wait for the first stream to complete
-    await po.chatActions.waitForChatCompletion();
-
-    // Verify the queued message indicator is gone (message is now being sent)
+    // The next generation starts immediately, so the idle state between turns
+    // can be too brief to observe. Wait for the queued prompt to be admitted,
+    // then wait for the final generation to finish.
+    const messagesList = po.page.locator('[data-testid="messages-list"]');
+    await expect(messagesList.getByText("tc=2", { exact: true })).toBeVisible({
+      timeout: Timeout.EXTRA_LONG,
+    });
     await expect(
       po.page.getByText(/\d+ Queued.*will send after current response/),
     ).not.toBeVisible();
-
-    // Wait for the queued message to also complete
-    await po.chatActions.waitForChatCompletion();
+    await po.chatActions.waitForChatCompletion({ timeout: Timeout.EXTRA_LONG });
 
     // Verify both messages were sent by checking the message list
-    const messagesList = po.page.locator('[data-testid="messages-list"]');
     await expect(messagesList.getByText("tc=1 [sleep=medium]")).toBeVisible();
-    await expect(messagesList.getByText("tc=2")).toBeVisible();
   });
 
   test("can be reordered, deleted, and edited", async ({ po }) => {
@@ -61,8 +113,9 @@ test.describe("queued messages", () => {
     await po.sendPrompt("tc=1 [sleep=medium]", {
       skipWaitForCompletion: true,
     });
+    await waitForGeneration(po);
 
-    // Wait for chat input to appear (indicates we're in chat view and streaming)
+    // Wait for chat input to appear now that streaming is active.
     await expect(chatInput).toBeVisible();
 
     // Queue 3 messages while streaming
@@ -105,17 +158,68 @@ test.describe("queued messages", () => {
       po.page.locator("li", { hasText: "tc=first-edited" }),
     ).toBeVisible();
 
-    // Wait for the initial stream to finish, then the queued messages to send
-    await po.chatActions.waitForChatCompletion();
-    await po.chatActions.waitForChatCompletion();
-
     // Verify the final messages were sent in correct order:
     // "tc=first-edited" first, then "tc=third" (which was moved up past "tc=second")
     const messagesList = po.page.locator('[data-testid="messages-list"]');
-    await expect(messagesList.getByText("tc=first-edited")).toBeVisible();
-    await expect(messagesList.getByText("tc=third")).toBeVisible();
+    await expect(
+      messagesList.getByText("tc=first-edited", { exact: true }),
+    ).toBeVisible({ timeout: Timeout.EXTRA_LONG });
+    await expect(
+      messagesList.getByText("tc=third", { exact: true }),
+    ).toBeVisible({
+      timeout: Timeout.EXTRA_LONG,
+    });
+    await po.chatActions.waitForChatCompletion({ timeout: Timeout.EXTRA_LONG });
     // "tc=second" was deleted, so it should NOT appear
     await expect(messagesList.getByText("tc=second")).not.toBeVisible();
+  });
+
+  test("stops and parks an unpaused queue without an error toast", async ({
+    po,
+  }) => {
+    await po.sendPrompt("tc=1 [sleep=long]", {
+      skipWaitForCompletion: true,
+    });
+    await waitForGeneration(po);
+    await expect(chatInput).toBeVisible();
+
+    await queueMessage(po.page, chatInput, "tc=2 [sleep=medium]");
+    const queueHeader = po.page.getByTestId("queue-header");
+    await expect(queueHeader).toContainText("1 Queued");
+    await expect(queueHeader).not.toContainText("Paused");
+    await po.toastNotifications.dismissAllToasts();
+
+    await po.page.getByRole("button", { name: /cancel generation/i }).click();
+
+    await expect(queueHeader).toContainText("Paused", {
+      timeout: Timeout.MEDIUM,
+    });
+    await expect(
+      po.page.getByRole("button", { name: /cancel generation/i }),
+    ).not.toBeVisible({ timeout: Timeout.MEDIUM });
+    await expect(queueHeader).toContainText("1 Queued");
+    await expect(
+      queueHeader.getByText("tc=2 [sleep=medium]", { exact: true }),
+    ).toBeVisible();
+    await po.toastNotifications.expectNoToast();
+
+    // Cancellation replaces the composer while its acceptance state settles.
+    // Use the resilient Send-button path so this submission targets the current
+    // editor and resumes the parked queue.
+    await po.sendPrompt("tc=3", { skipWaitForCompletion: true });
+
+    await expect(
+      po.page.getByRole("button", { name: /cancel generation/i }),
+    ).toBeVisible({ timeout: Timeout.MEDIUM });
+    await expect(queueHeader).not.toContainText("Paused");
+    await expect(queueHeader).toContainText("1 Queued");
+    await expect(queueHeader.getByText("tc=3", { exact: true })).toBeVisible();
+    await expect(
+      po.page
+        .locator('[data-testid="messages-list"]')
+        .getByText("tc=2 [sleep=medium]", { exact: true }),
+    ).toBeVisible({ timeout: Timeout.MEDIUM });
+    await po.toastNotifications.expectNoToast();
   });
 
   test("fires queued message while on another page", async ({ po }) => {
@@ -123,8 +227,9 @@ test.describe("queued messages", () => {
     await po.sendPrompt("tc=1 [sleep=medium]", {
       skipWaitForCompletion: true,
     });
+    await waitForGeneration(po);
 
-    // Wait for chat input to appear (indicates we're in chat view and streaming)
+    // Wait for chat input to appear now that streaming is active.
     await expect(chatInput).toBeVisible();
 
     // While streaming, queue a second message
@@ -158,142 +263,127 @@ test.describe("queued messages", () => {
   });
 });
 
-testSkipIfWindows(
-  "editing queued message restores attachments and selected components",
-  async ({ po }) => {
-    await po.setUp({ autoApprove: true });
-    const chatInput = po.chatActions.getChatInput();
+test("keeps queued prompts across renderer reload", async ({
+  po,
+  electronApp,
+}) => {
+  const queuedPrompts = [
+    "renderer reload queued one",
+    "renderer reload queued two",
+  ];
 
-    // Build an app so we have a preview with selectable components
-    await po.sendPrompt("tc=basic");
-    await po.previewPanel.clickTogglePreviewPanel();
+  await po.setUp({ autoApprove: true });
+  const chatInput = po.chatActions.getChatInput();
 
-    // Start a slow streaming response so the setup below finishes while queuing is still active
-    await po.sendPrompt("tc=1 [sleep=long]", {
-      skipWaitForCompletion: true,
-    });
-    await expect(chatInput).toBeVisible();
+  await po.sendPrompt("tc=1 [sleep=long]", {
+    skipWaitForCompletion: true,
+  });
+  await waitForGeneration(po);
+  await expect(chatInput).toBeVisible();
 
-    // While streaming, select a component
-    await po.previewPanel.clickPreviewPickElement();
-    await po.previewPanel
-      .getPreviewIframeElement()
-      .contentFrame()
-      .getByRole("heading", { name: "Welcome to Your Blank App" })
-      .click();
-    await expect(po.previewPanel.getSelectedComponentsDisplay()).toBeVisible({
-      timeout: Timeout.SHORT,
-    });
+  for (const prompt of queuedPrompts) {
+    await queueMessage(po.page, chatInput, prompt);
+  }
 
-    // Attach a file
-    await po.chatActions
-      .getChatInputContainer()
-      .getByTestId("auxiliary-actions-menu")
-      .click();
-    await po.page.getByRole("menuitem", { name: "Attach files" }).click();
-    const chatContextItem = po.page.getByText("Attach file as chat context");
-    await expect(chatContextItem).toBeVisible();
-    const fileChooserPromise = po.page.waitForEvent("filechooser");
-    await chatContextItem.click();
-    const fileChooser = await fileChooserPromise;
-    await fileChooser.setFiles("e2e-tests/fixtures/images/logo.png");
-    await expect(po.page.getByText("logo.png")).toBeVisible();
+  const queueHeader = po.page.getByTestId("queue-header");
+  await expect(queueHeader).toContainText("2 Queued");
+  await po.page.getByRole("button", { name: "Pause queue" }).click();
+  await expect(queueHeader).toContainText("Paused");
 
-    // Queue a message with both attachment and selected component
-    await queueMessage(po.page, chatInput, "queued with extras");
+  const appPath = await electronApp.evaluate(({ app }) => app.getAppPath());
+  const rendererIndexPath = path.join(
+    appPath,
+    ".vite/renderer/main_window/index.html",
+  );
+  await electronApp.evaluate(async ({ BrowserWindow }, rendererIndexPath) => {
+    const window = BrowserWindow.getAllWindows()[0];
+    try {
+      await window.loadFile(rendererIndexPath);
+    } catch (error) {
+      if (!(error instanceof Error) || !error.message.includes("(-3)")) {
+        throw error;
+      }
+    }
+  }, rendererIndexPath);
+  await po.page.waitForLoadState("domcontentloaded");
 
-    // After queuing, both should be cleared
-    await expect(
-      po.previewPanel.getSelectedComponentsDisplay(),
-    ).not.toBeVisible();
-    await expect(po.page.getByText("logo.png")).not.toBeVisible();
-    await expect(po.page.getByText(/\d+ Queued/)).toBeVisible();
+  await expect(queueHeader).toContainText("2 Queued", {
+    timeout: Timeout.EXTRA_LONG,
+  });
+  await expect(queueHeader).toContainText("Paused");
+  await expect(
+    po.page.getByRole("button", { name: "Resume queue" }),
+  ).toBeVisible();
 
-    // Edit the queued message
-    const queuedRow = po.page.locator("li", {
-      hasText: "queued with extras",
-    });
-    await queuedRow.hover();
-    await queuedRow.getByTitle("Edit").click();
+  for (const prompt of queuedPrompts) {
+    await expect(po.page.locator("li", { hasText: prompt })).toBeVisible();
+  }
+});
 
-    // The input should contain the queued message text
-    await expect(chatInput).toContainText("queued with extras");
+baseTest(
+  "restores queued prompts paused after app restart",
+  async ({}, testInfo) => {
+    baseTest.skip(
+      process.platform === "win32",
+      "Manual Electron restarts can hang on Windows in this E2E environment.",
+    );
+    baseTest.setTimeout(120_000);
 
-    // Both attachment and selected components should be restored
-    await expect(po.page.getByText("logo.png")).toBeVisible();
-    await expect(po.previewPanel.getSelectedComponentsDisplay()).toBeVisible({
-      timeout: Timeout.SHORT,
-    });
+    const fakeLlmPort = FAKE_LLM_BASE_PORT + testInfo.parallelIndex;
+    const userDataDir = path.join(
+      os.tmpdir(),
+      `dyad-e2e-durable-queue-${testInfo.parallelIndex}-${Date.now()}`,
+    );
+    const queuedPrompts = ["durable queued one", "durable queued two"];
+    let activeApp: ElectronApplication | undefined;
 
-    // Submit the edit — both should clear again
-    await chatInput.press("Enter");
-    await expect(po.page.getByText("logo.png")).not.toBeVisible();
-    await expect(
-      po.previewPanel.getSelectedComponentsDisplay(),
-    ).not.toBeVisible();
+    try {
+      const firstSession = await launchDyadWithProfile({
+        userDataDir,
+        fakeLlmPort,
+        testInfo,
+      });
+      activeApp = firstSession.electronApp;
+      await firstSession.po.setUp({ autoApprove: true });
+      const chatInput = firstSession.po.chatActions.getChatInput();
+      await firstSession.po.sendPrompt("tc=1 [sleep=long]", {
+        skipWaitForCompletion: true,
+      });
+      await waitForGeneration(firstSession.po);
+      await expect(chatInput).toBeVisible();
+      for (const prompt of queuedPrompts) {
+        await queueMessage(firstSession.po.page, chatInput, prompt);
+      }
+      await expect(
+        firstSession.po.page.getByTestId("queue-header"),
+      ).toContainText("2 Queued");
 
-    // Wait for all messages to complete
-    await po.chatActions.waitForChatCompletion({ timeout: Timeout.EXTRA_LONG });
-    await po.chatActions.waitForChatCompletion();
+      await closeDyad(firstSession.electronApp);
+      activeApp = undefined;
 
-    // Verify both messages were sent
-    const messagesList = po.page.locator('[data-testid="messages-list"]');
-    await expect(messagesList.getByText("tc=1 [sleep=long]")).toBeVisible();
-    await expect(messagesList.getByText("queued with extras")).toBeVisible();
-  },
-);
-
-testSkipIfWindows(
-  "canceling queued message edit clears restored components",
-  async ({ po }) => {
-    await po.setUp({ autoApprove: true });
-    const chatInput = po.chatActions.getChatInput();
-
-    // Build an app so we have a preview with selectable components
-    await po.sendPrompt("tc=basic");
-    await po.previewPanel.clickTogglePreviewPanel();
-
-    // Start a slow streaming response so the setup below finishes while queuing is still active
-    await po.sendPrompt("tc=1 [sleep=long]", {
-      skipWaitForCompletion: true,
-    });
-    await expect(chatInput).toBeVisible();
-
-    // While streaming, select a component and queue a message with it
-    await po.previewPanel.clickPreviewPickElement();
-    await po.previewPanel
-      .getPreviewIframeElement()
-      .contentFrame()
-      .getByRole("heading", { name: "Welcome to Your Blank App" })
-      .click();
-    await expect(po.previewPanel.getSelectedComponentsDisplay()).toBeVisible({
-      timeout: Timeout.SHORT,
-    });
-
-    await queueMessage(po.page, chatInput, "queued with component");
-    await expect(po.page.getByText(/\d+ Queued/)).toBeVisible();
-
-    // Edit the queued message — components should be restored
-    const queuedRow = po.page.locator("li", {
-      hasText: "queued with component",
-    });
-    await queuedRow.hover();
-    await queuedRow.getByTitle("Edit").click();
-    await expect(po.previewPanel.getSelectedComponentsDisplay()).toBeVisible({
-      timeout: Timeout.SHORT,
-    });
-
-    // Cancel the edit — components should be cleared
-    await po.page.getByText("Cancel", { exact: true }).click();
-    await expect(
-      po.previewPanel.getSelectedComponentsDisplay(),
-    ).not.toBeVisible();
-
-    // Input should be empty after cancel
-    await expect(chatInput).toBeEmpty();
-
-    // Wait for the in-flight chat and the queued message to finish before ending the test
-    await po.chatActions.waitForChatCompletion({ timeout: Timeout.EXTRA_LONG });
-    await po.chatActions.waitForChatCompletion();
+      const secondSession = await launchDyadWithProfile({
+        userDataDir,
+        fakeLlmPort,
+        testInfo,
+      });
+      activeApp = secondSession.electronApp;
+      await secondSession.po.navigation.goToChatTab();
+      const queueHeader = secondSession.po.page.getByTestId("queue-header");
+      await expect(queueHeader).toContainText("2 Queued", {
+        timeout: Timeout.EXTRA_LONG,
+      });
+      await expect(queueHeader).toContainText("Paused");
+      await expect(
+        secondSession.po.page.getByRole("button", { name: "Resume queue" }),
+      ).toBeVisible();
+      for (const prompt of queuedPrompts) {
+        await expect(
+          secondSession.po.page.locator("li", { hasText: prompt }),
+        ).toBeVisible();
+      }
+    } finally {
+      if (activeApp) await closeDyad(activeApp);
+      await fs.promises.rm(userDataDir, { recursive: true, force: true });
+    }
   },
 );

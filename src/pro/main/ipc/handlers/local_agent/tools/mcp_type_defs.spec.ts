@@ -13,12 +13,29 @@ import { mcpManager } from "@/ipc/utils/mcp_manager";
 import { requireMcpToolConsent } from "@/ipc/utils/mcp_consent";
 import { DyadError, DyadErrorKind } from "@/errors/dyad_error";
 import type { AgentContext } from "./types";
+import { MCP_RESULT_MAX_BYTES } from "@/ipc/utils/mcp_result_sanitizer";
+import {
+  MCP_TRANSCRIPT_PAYLOAD_MAX_CHARS,
+  MCP_TRANSCRIPT_TURN_BUDGET_CHARS,
+} from "@/ipc/utils/mcp_transcript_preview";
+import {
+  createMutationActivityOwner,
+  endTurnFinalization,
+  tryBeginTurnFinalization,
+} from "../subagents/mutation_activity_tracker";
 
-vi.mock("@/ipc/utils/mcp_manager", () => ({
-  mcpManager: {
-    getClient: vi.fn(),
-  },
-}));
+vi.mock("@/ipc/utils/mcp_manager", () => {
+  const getClient = vi.fn();
+  return {
+    mcpManager: {
+      getClient,
+      // Mirror the real wrapper so tests can stub the client alone.
+      listToolsWithin: vi.fn((serverId: number) =>
+        getClient(serverId).then((client: any) => client.tools()),
+      ),
+    },
+  };
+});
 
 vi.mock("@/ipc/utils/mcp_consent", () => ({
   requireMcpToolConsent: vi.fn(),
@@ -283,6 +300,8 @@ function createCtx(): AgentContext {
     todos: [],
     dyadRequestId: "spec",
     fileEditTracker: {},
+    testingEnabled: true,
+    testRunAttempts: new Map(),
     onXmlStream: vi.fn(),
     onXmlComplete: vi.fn(),
     requireConsent: vi.fn().mockResolvedValue(true),
@@ -337,6 +356,83 @@ describe("buildMcpCapabilityMap", () => {
     expect(xmls.some((x) => x.startsWith("<dyad-mcp-tool-result"))).toBe(true);
   });
 
+  it("tracks direct MCP execution until the host call settles", async () => {
+    vi.mocked(requireMcpToolConsent).mockResolvedValue({ approved: true });
+    let finishExecute!: (value: { content: never[] }) => void;
+    const execute = vi.fn().mockReturnValue(
+      new Promise((resolve) => {
+        finishExecute = resolve;
+      }),
+    );
+    vi.mocked(mcpManager.getClient).mockResolvedValue({
+      tools: async () => ({ hello: { execute } }),
+    } as any);
+    const ctx = createCtx();
+    const turnId = "direct-mcp-test";
+    ctx.mutationActivityOwner = createMutationActivityOwner({
+      appId: ctx.appId,
+      chatId: ctx.chatId,
+      turnId,
+      actorRunId: "root",
+    });
+    const call = buildMcpCapabilityMap({
+      event: {} as any,
+      ctx,
+      defs: [makeDef()],
+    }).srv__hello({});
+
+    await vi.waitFor(() => expect(execute).toHaveBeenCalledOnce());
+    expect(tryBeginTurnFinalization(turnId)).toBe(false);
+    finishExecute({ content: [] });
+    await call;
+    expect(tryBeginTurnFinalization(turnId)).toBe(true);
+    endTurnFinalization(turnId);
+  });
+
+  it("holds the turn open during the client lookup and skips execution after a Stop", async () => {
+    vi.mocked(requireMcpToolConsent).mockResolvedValue({ approved: true });
+    const execute = vi.fn().mockResolvedValue({ content: [] });
+    let finishLookup!: (client: unknown) => void;
+    vi.mocked(mcpManager.getClient).mockReturnValue(
+      new Promise<any>((resolve) => {
+        finishLookup = resolve;
+      }),
+    );
+    const abortController = new AbortController();
+    const ctx = createCtx();
+    ctx.abortSignal = abortController.signal;
+    const turnId = "sandbox-mcp-lookup-test";
+    ctx.mutationActivityOwner = createMutationActivityOwner({
+      appId: ctx.appId,
+      chatId: ctx.chatId,
+      turnId,
+      actorRunId: "root",
+    });
+    const call = buildMcpCapabilityMap({
+      event: {} as any,
+      ctx,
+      defs: [makeDef()],
+    }).srv__hello({});
+
+    await vi.waitFor(() =>
+      expect(mcpManager.getClient).toHaveBeenCalledWith(42),
+    );
+    expect(mcpManager.listToolsWithin).toHaveBeenCalledWith(42, {
+      signal: abortController.signal,
+    });
+    // The lookup is in flight, so the turn must not be finalizable yet.
+    expect(tryBeginTurnFinalization(turnId)).toBe(false);
+    abortController.abort();
+    finishLookup({ tools: async () => ({ hello: { execute } }) });
+
+    await expect(call).rejects.toMatchObject({
+      kind: DyadErrorKind.UserCancelled,
+    });
+    expect(execute).not.toHaveBeenCalled();
+    expect(tryBeginTurnFinalization(turnId)).toBe(true);
+    endTurnFinalization(turnId);
+  });
+
   it("wraps a plain-string MCP result into the declared McpResult shape", async () => {
     vi.mocked(requireMcpToolConsent).mockResolvedValue({ approved: true });
     const execute = vi.fn().mockResolvedValue("hello world");
@@ -361,6 +457,86 @@ describe("buildMcpCapabilityMap", () => {
       .mock.calls.map((c) => c[0])
       .find((x) => x.startsWith("<dyad-mcp-tool-result"));
     expect(resultXml).toContain("hello world");
+  });
+
+  it("bounds oversized text and embedded media before returning or emitting the result", async () => {
+    vi.mocked(requireMcpToolConsent).mockResolvedValue({ approved: true });
+    const hugeText = "z".repeat(MCP_RESULT_MAX_BYTES * 3);
+    const hugeImage = "A".repeat(MCP_RESULT_MAX_BYTES * 3);
+    const execute = vi.fn().mockResolvedValue({
+      content: [
+        { type: "image", data: hugeImage, mimeType: "image/png" },
+        { type: "text", text: hugeText },
+      ],
+    });
+    vi.mocked(mcpManager.getClient).mockResolvedValue({
+      tools: async () => ({ hello: { execute } }),
+    } as any);
+
+    const ctx = createCtx();
+    const map = buildMcpCapabilityMap({
+      event: {} as any,
+      ctx,
+      defs: [makeDef()],
+    });
+
+    const result = await map.srv__hello({});
+    const serializedResult = JSON.stringify(result);
+    expect(Buffer.byteLength(serializedResult, "utf8")).toBeLessThanOrEqual(
+      MCP_RESULT_MAX_BYTES,
+    );
+    expect(serializedResult).not.toContain(hugeText);
+    expect(serializedResult).not.toContain(hugeImage);
+    expect(serializedResult).toContain("_dyadMcpTruncation");
+
+    const resultXml = vi
+      .mocked(ctx.onXmlComplete)
+      .mock.calls.map((call) => call[0])
+      .find((xml) => xml.startsWith("<dyad-mcp-tool-result"));
+    expect(resultXml).toMatch(
+      /^<dyad-mcp-tool-result [^>]*truncated-from="\d+" tool-truncated="true">/,
+    );
+    expect(resultXml).not.toContain(hugeText);
+    expect(resultXml).not.toContain(hugeImage);
+  });
+
+  it("passes full arguments to the tool while the turn's transcript copy stays bounded", async () => {
+    vi.mocked(requireMcpToolConsent).mockResolvedValue({ approved: true });
+    const execute = vi.fn().mockResolvedValue({
+      content: [{ type: "text", text: "ok" }],
+    });
+    vi.mocked(mcpManager.getClient).mockResolvedValue({
+      tools: async () => ({ hello: { execute } }),
+    } as any);
+
+    const ctx = createCtx();
+    const map = buildMcpCapabilityMap({
+      event: {} as any,
+      ctx,
+      defs: [makeDef()],
+    });
+    const payload = "p".repeat(MCP_TRANSCRIPT_PAYLOAD_MAX_CHARS * 2);
+    const calls = 50;
+    for (let i = 0; i < calls; i++) {
+      await map.srv__hello({ payload });
+    }
+
+    expect(execute).toHaveBeenCalledTimes(calls);
+    for (const [args] of execute.mock.calls) {
+      expect(args).toEqual({ payload });
+    }
+    const callXmls = vi
+      .mocked(ctx.onXmlComplete)
+      .mock.calls.map((call) => call[0])
+      .filter((xml) => xml.startsWith("<dyad-mcp-tool-call"));
+    expect(callXmls).toHaveLength(calls);
+    for (const xml of callXmls) {
+      expect(xml).toMatch(/truncated-from="\d+">/);
+    }
+    const totalChars = callXmls.reduce((sum, xml) => sum + xml.length, 0);
+    expect(totalChars).toBeLessThan(
+      MCP_TRANSCRIPT_TURN_BUDGET_CHARS + calls * 2_000,
+    );
   });
 
   it("throws a DyadError(UserCancelled) and skips execution when consent is denied", async () => {
@@ -390,6 +566,22 @@ describe("buildMcpCapabilityMap", () => {
     );
     expect(execute).not.toHaveBeenCalled();
     expect(ctx.onXmlComplete).not.toHaveBeenCalled();
+  });
+
+  it("runs sandbox MCP calls concurrently with other writers", async () => {
+    vi.mocked(requireMcpToolConsent).mockResolvedValue({ approved: true });
+    const execute = vi.fn().mockResolvedValue({ content: [] });
+    vi.mocked(mcpManager.getClient).mockResolvedValue({
+      tools: async () => ({ hello: { execute } }),
+    } as any);
+    const map = buildMcpCapabilityMap({
+      event: {} as any,
+      ctx: createCtx(),
+      defs: [makeDef()],
+    });
+
+    await expect(map.srv__hello({})).resolves.toEqual({ content: [] });
+    expect(execute).toHaveBeenCalledOnce();
   });
 
   it("does not pass an auto-approve callback during Dyad Free turns", async () => {
@@ -454,6 +646,7 @@ describe("buildMcpCapabilityMap", () => {
     });
 
     await expect(map.srv__hello({})).rejects.toThrow("upstream boom");
+    expect(ctx.mcpToolRan).toBe(true);
     const xmls = vi.mocked(ctx.onXmlComplete).mock.calls.map((c) => c[0]);
     expect(xmls.some((x) => x.startsWith("<dyad-mcp-tool-call"))).toBe(true);
     expect(
@@ -471,9 +664,62 @@ describe("buildMcpCapabilityMap", () => {
       ),
     ).toBe(true);
   });
+
+  it("bounds a large MCP error in the transcript", async () => {
+    vi.mocked(requireMcpToolConsent).mockResolvedValue({ approved: true });
+    const message = "e".repeat(MCP_TRANSCRIPT_PAYLOAD_MAX_CHARS * 2);
+    const execute = vi.fn().mockRejectedValue(new Error(message));
+    vi.mocked(mcpManager.getClient).mockResolvedValue({
+      tools: async () => ({ hello: { execute } }),
+    } as any);
+
+    const ctx = createCtx();
+    const map = buildMcpCapabilityMap({
+      event: {} as any,
+      ctx,
+      defs: [makeDef()],
+    });
+
+    await expect(map.srv__hello({})).rejects.toThrow(message);
+    const outputXml = vi
+      .mocked(ctx.onXmlComplete)
+      .mock.calls.map((c) => c[0])
+      .find((x) => x.startsWith("<dyad-output"));
+    expect(outputXml).toContain("MCP tool 'srv__hello' failed");
+    expect(outputXml!.length).toBeLessThan(
+      MCP_TRANSCRIPT_PAYLOAD_MAX_CHARS * 2 + 1_000,
+    );
+  });
 });
 
 // No test for built-in-name collisions: the `serverNameSanitized__`
 // prefix on every toolKey makes a bare match like `read_file`
 // unreachable today. The seeded reserved set in `collectMcpToolDefs`
 // is defense in depth for future key-format or built-in changes.
+
+describe("MCP shell fallback evidence", () => {
+  it.each([true, false])(
+    "records execution failures without promoting consent denial (approved=%s)",
+    async (approved) => {
+      vi.mocked(requireMcpToolConsent).mockResolvedValue({ approved });
+      const execute = vi
+        .fn()
+        .mockRejectedValue(new Error("Service unavailable"));
+      vi.mocked(mcpManager.getClient).mockResolvedValue({
+        tools: async () => ({ hello: { execute } }),
+      } as any);
+      const ctx = createCtx();
+      ctx.shellReviewContext = { tools: [], history: [] };
+      const map = buildMcpCapabilityMap({
+        event: {} as any,
+        ctx,
+        defs: [makeDef()],
+      });
+      await expect(map.srv__hello({})).rejects.toThrow();
+      expect(ctx.shellReviewContext.history[0].outcome).toContain(
+        approved ? "execution_failed" : "not_executed_or_denied",
+      );
+      expect(execute).toHaveBeenCalledTimes(approved ? 1 : 0);
+    },
+  );
+});

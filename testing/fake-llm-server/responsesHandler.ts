@@ -8,7 +8,18 @@ import fs from "fs";
 import path from "path";
 import { CANNED_MESSAGE } from "./index";
 import { fakeLlmLog } from "./log";
+import { respondToInvalidApiKey } from "./apiKeyValidation";
 import { resolveDumpDir, resolveFixturesDir } from "./paths";
+import {
+  matchConsentClassifierPayload,
+  SLOW_CONSENT_TOOL,
+} from "./consentClassifier";
+import { matchAssertionCodePayload } from "./testAssertionsFixtures";
+import {
+  extractLocalAgentFixture,
+  loadLocalAgentFixture,
+} from "./localAgentHandler";
+import type { ToolCall, Turn } from "./localAgentTypes";
 
 /**
  * Generate a dump file from the request and return the path marker
@@ -105,6 +116,26 @@ function extractTestCaseName(promptText: string): string | null {
   return m[1].trim().split(/\s+/)[0] || null;
 }
 
+async function waitForDelayOrDisconnect(
+  res: Response,
+  delayMs: number,
+): Promise<boolean> {
+  let disconnected = false;
+  await new Promise<void>((resolve) => {
+    const onClose = () => {
+      disconnected = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      res.removeListener("close", onClose);
+      resolve();
+    }, delayMs);
+    res.once("close", onClose);
+  });
+  return disconnected;
+}
+
 /**
  * Create SSE event string
  */
@@ -112,11 +143,121 @@ function createSSEEvent(eventType: string, data: any): string {
   return `event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`;
 }
 
+function countFunctionCallOutputs(input: unknown): number {
+  return Array.isArray(input)
+    ? input.filter((item) => item?.type === "function_call_output").length
+    : 0;
+}
+
+async function responsesFixtureTurn(
+  testCaseName: string | null,
+  input: unknown,
+): Promise<Turn | undefined> {
+  const fixtureName = extractLocalAgentFixture(
+    testCaseName ? `tc=${testCaseName}` : "",
+  );
+  if (!fixtureName) return undefined;
+  const fixture = await loadLocalAgentFixture(fixtureName);
+  return fixture.turns?.[countFunctionCallOutputs(input)];
+}
+
+async function streamResponsesToolCalls(params: {
+  res: Response;
+  baseResponseFields: Record<string, unknown>;
+  toolCalls: ToolCall[];
+  usage: Record<string, unknown>;
+}): Promise<void> {
+  const { res, baseResponseFields, toolCalls, usage } = params;
+  let sequence = 0;
+  const nextSequence = () => sequence++;
+  const output = toolCalls.map((toolCall, index) => ({
+    id: `fc_${Date.now()}_${index}`,
+    call_id: `call_${Date.now()}_${index}`,
+    type: "function_call" as const,
+    name: toolCall.name,
+    arguments: JSON.stringify(toolCall.args),
+    status: "completed" as const,
+  }));
+
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders?.();
+  res.write(
+    createSSEEvent("response.created", {
+      type: "response.created",
+      sequence_number: nextSequence(),
+      response: {
+        ...baseResponseFields,
+        output_text: "",
+        output: [],
+        status: "in_progress",
+      },
+    }),
+  );
+
+  for (const [outputIndex, item] of output.entries()) {
+    res.write(
+      createSSEEvent("response.output_item.added", {
+        type: "response.output_item.added",
+        output_index: outputIndex,
+        sequence_number: nextSequence(),
+        item: { ...item, arguments: "", status: "in_progress" },
+      }),
+    );
+    res.write(
+      createSSEEvent("response.function_call_arguments.delta", {
+        type: "response.function_call_arguments.delta",
+        output_index: outputIndex,
+        item_id: item.id,
+        sequence_number: nextSequence(),
+        delta: item.arguments,
+      }),
+    );
+    res.write(
+      createSSEEvent("response.function_call_arguments.done", {
+        type: "response.function_call_arguments.done",
+        output_index: outputIndex,
+        item_id: item.id,
+        sequence_number: nextSequence(),
+        name: item.name,
+        arguments: item.arguments,
+      }),
+    );
+    res.write(
+      createSSEEvent("response.output_item.done", {
+        type: "response.output_item.done",
+        output_index: outputIndex,
+        sequence_number: nextSequence(),
+        item,
+      }),
+    );
+  }
+
+  res.write(
+    createSSEEvent("response.completed", {
+      type: "response.completed",
+      sequence_number: nextSequence(),
+      response: {
+        ...baseResponseFields,
+        output_text: "",
+        output,
+        status: "completed",
+        usage,
+      },
+    }),
+  );
+  res.write("data: [DONE]\n\n");
+  res.end();
+}
+
 /**
  * Create the Responses API handler
  */
 export const createResponsesHandler =
   (prefix: string) => async (req: Request, res: Response) => {
+    if (respondToInvalidApiKey(req, res, prefix)) return;
+
     const { input, messages, stream = false } = req.body ?? {};
     fakeLlmLog(`* [responses/${prefix}] Received request`, {
       hasInput: input != null,
@@ -145,8 +286,38 @@ export const createResponsesHandler =
       });
     }
 
+    // Handle compaction summary requests (from streamText() in
+    // compaction_handler; Pro users pin an openai-provider compaction model,
+    // which routes here instead of the chat-completions handler). Checked
+    // before fixture loading because the summarized transcript can itself
+    // contain tc=<name> markers from earlier turns.
+    const isCompactionRequest = lastUserText.startsWith(
+      "Please summarize the following conversation:",
+    );
+    if (isCompactionRequest) {
+      messageContent =
+        "## Key Decisions Made\n- Completed initial task as requested\n\n## Current Task State\nConversation was compacted to save context space.";
+    }
+
+    // Classifier context can quote tc= markers from earlier user turns.
+    // Dump probes must also take precedence over legacy fixture adapters.
+    const consentMatch = isCompactionRequest
+      ? null
+      : matchConsentClassifierPayload(lastUserText);
+    const isDumpRequest =
+      !isCompactionRequest && !consentMatch && lastUserText.includes("[dump]");
+    const skipFixture = isCompactionRequest || !!consentMatch || isDumpRequest;
+
     // Load a fixture file when the prompt includes tc=<name>
-    const testCaseName = extractTestCaseName(lastUserText);
+    const localAgentFixture = skipFixture
+      ? null
+      : extractLocalAgentFixture(lastUserText);
+    const testCaseName = localAgentFixture
+      ? `local-agent/${localAgentFixture}`
+      : skipFixture
+        ? null
+        : extractTestCaseName(lastUserText);
+    const localAgentTurn = await responsesFixtureTurn(testCaseName, input);
     if (testCaseName && !testCaseName.startsWith("local-agent/")) {
       const testFilePath = path.join(
         resolveFixturesDir(),
@@ -154,48 +325,59 @@ export const createResponsesHandler =
         `${testCaseName}.md`,
       );
       try {
-        messageContent = fs.readFileSync(testFilePath, "utf-8");
+        messageContent = fs
+          .readFileSync(testFilePath, "utf-8")
+          .replace(/\r\n/g, "\n");
       } catch (error) {
         console.error(`* [responses/${prefix}] Error reading test file`, error);
         messageContent = `Error: Could not read test file: ${testCaseName}`;
       }
     }
 
-    // Check if the message contains "[dump]" to generate a dump
-    if (lastUserText.includes("[dump]")) {
+    // Check if the message contains "[dump]" to generate a dump. Skipped for
+    // compaction requests: the summarized transcript can embed "[dump]" from
+    // earlier turns, which must not overwrite the canned summary.
+    if (isDumpRequest) {
       messageContent = generateDump(req);
     }
 
-    // The MCP auto-consent classifier payload (buildUserPayload) carries these
-    // labels. Detect it off the user text, then decide off the tool name so e2e
-    // can exercise both the allow and ask paths.
-    const isConsent =
-      lastUserText.includes("MCP server:") &&
-      lastUserText.includes("Tool:") &&
-      lastUserText.includes("Arguments:");
-    if (isConsent) {
-      const risky = /(delete|drop|danger|destroy|remove)/i.test(lastUserText);
+    const isSubagentReviewerRequest =
+      lastUserText.includes("Review this exact diff.") &&
+      lastUserText.includes("Return JSON only, with this exact shape:");
+    if (isSubagentReviewerRequest) {
       messageContent = JSON.stringify({
-        reason: risky ? "destructive tool" : "safe tool",
-        decision: risky ? "ask" : "allow",
+        status: "no_findings",
+        findings: [],
+        summary: "No actionable defects found in the reviewed change.",
       });
+    }
+
+    // See testAssertionsFixtures.ts: code synthesis for assertions the user
+    // edited before approving the card. The proposal itself is an agent tool
+    // call, which this route never serves.
+    const assertionsMatch = matchAssertionCodePayload(lastUserText);
+    if (assertionsMatch) {
+      messageContent = assertionsMatch;
+    }
+    // See consentClassifier.ts: fake decisions for the MCP auto-consent
+    // classifier, shared with the chat-completions fake route. Also gated off
+    // for compaction requests, whose transcript can quote classifier payloads.
+    if (consentMatch) {
+      messageContent = consentMatch.content;
       // Answer slowly for print_envs so e2e can observe the "AI reviewing"
       // spinner and exercise the user-decides-before-the-AI path. Race the delay
       // against the client disconnecting so we don't write to a closed response.
-      if (lastUserText.includes("Tool: print_envs")) {
-        await new Promise<void>((resolve) => {
-          const timer = setTimeout(() => {
-            req.off("close", onClose);
-            resolve();
-          }, 4000);
-          const onClose = () => {
-            clearTimeout(timer);
-            resolve();
-          };
-          req.on("close", onClose);
-        });
-        if (req.destroyed) return;
+      if (consentMatch.toolName === SLOW_CONSENT_TOOL) {
+        if (await waitForDelayOrDisconnect(res, 4000)) return;
       }
+    }
+
+    // Match the chat-completions fake route: keep Reviewer observably active
+    // long enough for E2E tests to verify that the authoritative queue remains
+    // paused while review is running.
+    if (isSubagentReviewerRequest) {
+      await new Promise((resolve) => setTimeout(resolve, 1_500));
+      if (res.destroyed) return;
     }
 
     const responseId = `resp_${Date.now()}`;
@@ -225,6 +407,25 @@ export const createResponsesHandler =
       output_tokens_details: { reasoning_tokens: 0 },
       total_tokens: 10 + Math.max(1, Math.ceil(messageContent.length / 4)),
     });
+
+    if (localAgentTurn?.delayMs) {
+      const disconnected = await waitForDelayOrDisconnect(
+        res,
+        localAgentTurn.delayMs,
+      );
+      if (disconnected || res.destroyed) return;
+    }
+
+    if (stream && localAgentTurn?.toolCalls?.length) {
+      return streamResponsesToolCalls({
+        res,
+        baseResponseFields,
+        toolCalls: localAgentTurn.toolCalls,
+        usage: mkUsage(),
+      });
+    }
+
+    if (localAgentTurn?.text) messageContent = localAgentTurn.text;
 
     // Non-streaming response
     if (!stream) {

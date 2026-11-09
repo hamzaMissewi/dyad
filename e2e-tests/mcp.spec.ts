@@ -1,14 +1,39 @@
-import path from "path";
-import { spawn } from "child_process";
-import { testSkipIfWindows } from "./helpers/test_helper";
 import { expect } from "@playwright/test";
+import { spawn, type ChildProcess } from "child_process";
+import path from "path";
+
+import { test, testSkipIfWindows } from "./helpers/test_helper";
+
+test.beforeEach(async ({ po }) => {
+  // These scenarios exercise manual consent, not Pro's safe-tool auto-approval.
+  await po.page.evaluate(async () => {
+    await (window as any).electron.ipcRenderer.invoke("set-user-settings", {
+      autoApproveSafeMcpTools: false,
+    });
+  });
+  await expect
+    .poll(() => po.settings.recordSettings().autoApproveSafeMcpTools)
+    .toBe(false);
+});
+
+async function stopProcess(process: ChildProcess): Promise<void> {
+  process.kill();
+  await new Promise<void>((resolve) => {
+    const timeout = setTimeout(() => {
+      process.kill("SIGKILL");
+      resolve();
+    }, 2_000);
+    process.once("exit", () => {
+      clearTimeout(timeout);
+      resolve();
+    });
+  });
+}
 
 testSkipIfWindows("mcp - call calculator", async ({ po }) => {
-  await po.setUp();
-  await po.navigation.goToSettingsTab();
-  await po.settings.scrollToSettingsSection("advanced");
-  await po.settings.toggleEnableMcpServersForBuildMode();
-  await po.settings.scrollToSettingsSection("tools-mcp");
+  await po.setUpDyadPro({ localAgent: true });
+  await po.navigation.goToPluginsTab();
+  await po.plugins.openAddPluginDialog();
 
   await po.page
     .getByRole("textbox", { name: "My MCP Server" })
@@ -20,32 +45,38 @@ testSkipIfWindows("mcp - call calculator", async ({ po }) => {
     "testing",
     "fake-stdio-mcp-server.mjs",
   );
-  console.log("testMcpServerPath", testMcpServerPath);
   await po.page
     .getByRole("textbox", { name: "path/to/mcp-server.js --flag" })
     .fill(testMcpServerPath);
-  await po.page.getByRole("button", { name: "Add Server" }).click();
-  await po.page
+  await po.plugins.submitAddPluginDialog();
+
+  // Adding lands on the new server's page, which is where env vars are
+  // entered. Asserted before openPluginDetail below, which tolerates
+  // either starting point.
+  await expect(po.page.getByTestId("plugin-detail")).toBeVisible();
+
+  // Environment variables are edited on the plugin's detail page.
+  await po.plugins.openPluginDetail("testing-mcp-server");
+  const detail = po.page.getByTestId("plugin-detail");
+  await detail
     .getByRole("button", { name: "Add Environment Variable" })
     .click();
-  await po.page.getByRole("textbox", { name: "Key" }).fill("testKey1");
-  await po.page.getByRole("textbox", { name: "Value" }).fill("testValue1");
-  await po.page.getByRole("button", { name: "Save" }).click();
+  await detail.getByRole("textbox", { name: "Key" }).fill("testKey1");
+  await detail.getByRole("textbox", { name: "Value" }).fill("testValue1");
+  await detail.getByRole("button", { name: "Save" }).click();
+  await po.plugins.waitForToolInDetail("calculator_add");
+
   await po.navigation.goToAppsTab();
-  await po.chatActions.selectChatMode("build");
-  await po.sendPrompt("[call_tool=calculator_add]", {
+  await po.chatActions.selectChatMode("local-agent");
+  await po.sendPrompt("tc=local-agent/mcp-calculator", {
     skipWaitForCompletion: true,
   });
-  // Wait for consent dialog to appear
   await po.agentConsent.waitForAgentConsentBanner();
 
-  // Make sure the tool call doesn't execute until consent is given
   await po.snapshotMessages();
   await po.agentConsent.clickAgentConsentAlwaysAllow();
-  await po.approveProposal();
-
-  await po.sendPrompt("[dump]");
-  await po.snapshotServerDump("all-messages");
+  await po.chatActions.waitForChatCompletion();
+  await expect(po.page.getByText(/The sum of 5 and 3 is 8/)).toBeVisible();
 });
 
 testSkipIfWindows("mcp - call calculator via http", async ({ po }) => {
@@ -55,93 +86,68 @@ testSkipIfWindows("mcp - call calculator via http", async ({ po }) => {
     "testing",
     "fake-http-mcp-server.mjs",
   );
-  console.log("Starting HTTP MCP server at:", httpMcpServerPath);
-
   const httpServerProcess = spawn("node", [httpMcpServerPath], {
-    env: { ...process.env, PORT: "3002" },
+    env: { ...process.env, PORT: "0" },
     stdio: "pipe",
   });
 
-  // Wait for the HTTP server to be ready by checking stdout for the ready message
-  await new Promise<void>((resolve, reject) => {
+  const port = await new Promise<number>((resolve, reject) => {
     const timeout = setTimeout(() => {
       reject(new Error("HTTP MCP server failed to start within timeout"));
-    }, 10000);
+    }, 10_000);
 
     httpServerProcess.stdout?.on("data", (data: Buffer) => {
-      console.log("HTTP MCP server stdout:", data.toString());
-      if (data.toString().includes("HTTP MCP server running")) {
+      const output = data.toString();
+      const match = output.match(/localhost:(\d+)\/mcp/);
+      if (match) {
         clearTimeout(timeout);
-        resolve();
+        resolve(Number(match[1]));
       }
     });
-
     httpServerProcess.stderr?.on("data", (data: Buffer) => {
       console.error("HTTP MCP server stderr:", data.toString());
     });
-
-    httpServerProcess.on("error", (err) => {
+    httpServerProcess.once("error", (error) => {
       clearTimeout(timeout);
-      reject(err);
+      reject(error);
     });
   });
 
   try {
-    await po.setUp();
-    await po.navigation.goToSettingsTab();
-    await po.settings.scrollToSettingsSection("advanced");
-    await po.settings.toggleEnableMcpServersForBuildMode();
-    await po.settings.scrollToSettingsSection("tools-mcp");
+    await po.setUpDyadPro({ localAgent: true });
+    await po.navigation.goToPluginsTab();
+    await po.plugins.openAddPluginDialog();
 
-    // Fill in server name
     await po.page
       .getByRole("textbox", { name: "My MCP Server" })
       .fill("testing-mcp-server");
-
     await po.page.getByTestId("mcp-transport-select").selectOption("http");
+    await po.page
+      .getByPlaceholder("http://localhost:3000")
+      .fill(`http://localhost:${port}/mcp`);
+    await po.page.getByRole("switch", { name: "Use OAuth" }).click();
+    await po.plugins.submitAddPluginDialog();
 
-    const urlInput = po.page.getByPlaceholder("http://localhost:3000");
-    await expect(urlInput).toBeVisible();
-    await urlInput.fill("http://localhost:3002/mcp");
+    // Headers are edited on the plugin's detail page.
+    await po.plugins.openPluginDetail("testing-mcp-server");
+    const detail = po.page.getByTestId("plugin-detail");
+    await detail.getByRole("button", { name: "Add Header" }).click();
+    await detail.getByRole("textbox", { name: "Key" }).fill("Authorization");
+    await detail.getByRole("textbox", { name: "Value" }).fill("testValue1");
+    await detail.getByRole("button", { name: "Save" }).click();
+    await po.plugins.waitForToolInDetail("calculator_add");
 
-    await po.page.getByRole("button", { name: "Add Server" }).click();
-
-    // Wait for the server to be created and the "Add Environment Variable" button (for headers) to become visible
-    const addHeaderButton = po.page.getByRole("button", {
-      name: "Add Environment Variable",
-    });
-    await expect(addHeaderButton).toBeVisible({ timeout: 10000 });
-    await addHeaderButton.click();
-    await po.page.getByRole("textbox", { name: "Key" }).fill("Authorization");
-    await po.page.getByRole("textbox", { name: "Value" }).fill("testValue1");
-    await po.page.getByRole("button", { name: "Save" }).click();
-    await po.navigation.goToSettingsTab();
-    await po.settings.scrollToSettingsSection("tools-mcp");
     await po.navigation.goToAppsTab();
-    await po.chatActions.selectChatMode("build");
-    await po.sendPrompt("[call_tool=calculator_add]", {
+    await po.chatActions.selectChatMode("local-agent");
+    await po.sendPrompt("tc=local-agent/mcp-calculator", {
       skipWaitForCompletion: true,
     });
-    const allowOnceButton = po.page.getByRole("button", {
-      name: "Allow once",
-    });
-    await expect(allowOnceButton).toBeVisible({ timeout: 30_000 });
+    await po.agentConsent.waitForAgentConsentBanner();
     await po.snapshotMessages();
     await po.agentConsent.clickAgentConsentAllowOnce();
-    await po.approveProposal();
-
-    await po.sendPrompt("[dump]");
-    await po.snapshotServerDump("all-messages");
+    await po.chatActions.waitForChatCompletion();
+    await expect(po.page.getByText(/The sum of 5 and 3 is 8/)).toBeVisible();
   } finally {
-    // Clean up: kill the HTTP server process
-    httpServerProcess.kill();
-    await new Promise<void>((resolve) => {
-      httpServerProcess.on("exit", () => resolve());
-      // Force kill after 2 seconds if it doesn't exit gracefully
-      setTimeout(() => {
-        httpServerProcess.kill("SIGKILL");
-        resolve();
-      }, 2000);
-    });
+    await stopProcess(httpServerProcess);
   }
 });

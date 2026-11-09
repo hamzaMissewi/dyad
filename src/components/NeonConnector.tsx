@@ -1,4 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
+import { NeonSignInButton } from "@/components/NeonSignInButton";
+import { NeonLogo } from "@/components/NeonLogo";
 import { useTranslation } from "react-i18next";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -24,7 +26,6 @@ import { Badge } from "@/components/ui/badge";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useLoadApp } from "@/hooks/useLoadApp";
-import { useDeepLink } from "@/contexts/DeepLinkContext";
 import { Switch } from "@/components/ui/switch";
 import {
   ExternalLink,
@@ -40,6 +41,9 @@ import { useQueryClient } from "@tanstack/react-query";
 import { queryKeys } from "@/lib/queryKeys";
 import { isNeonSupportedFramework } from "@/lib/framework_constants";
 import { getErrorMessage } from "@/lib/errors";
+import { canUseUnsafeNeonBranch } from "@/shared/neon_branch_protection";
+import { NeonBranchWarning } from "@/components/NeonBranchWarning";
+import { NeonSettingsStatus } from "@/components/NeonSettingsStatus";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -54,9 +58,9 @@ import {
 
 export function NeonConnector({ appId }: { appId: number }) {
   const { t } = useTranslation("home");
-  const { settings, refreshSettings, updateSettings } = useSettings();
+  const { settings, settingsLoading, refreshSettings, updateSettings } =
+    useSettings();
   const { app, loading: isLoadingApp, refreshApp } = useLoadApp(appId);
-  const { lastDeepLink, clearLastDeepLink } = useDeepLink();
   const queryClient = useQueryClient();
   const { isDarkMode } = useTheme();
 
@@ -68,16 +72,18 @@ export function NeonConnector({ appId }: { appId: number }) {
   );
   const [isConnecting, setIsConnecting] = useState(false);
   const [isSwitchingBranch, setIsSwitchingBranch] = useState(false);
+  const [pendingProductionBranch, setPendingProductionBranch] = useState<
+    string | null
+  >(null);
   const [isUpdatingEmailVerification, setIsUpdatingEmailVerification] =
     useState(false);
-  const [isOpeningOauth, setIsOpeningOauth] = useState(false);
   const [isDisconnecting, setIsDisconnecting] = useState(false);
   const [isDisconnectingAccount, setIsDisconnectingAccount] = useState(false);
   const [isDisconnectDialogOpen, setIsDisconnectDialogOpen] = useState(false);
   const [removeFromVercel, setRemoveFromVercel] = useState(true);
+  const [removeFromCloudflare, setRemoveFromCloudflare] = useState(true);
   const [isDisconnectAccountDialogOpen, setIsDisconnectAccountDialogOpen] =
     useState(false);
-  const oauthTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const formatToastError = (error: unknown) => getErrorMessage(error);
   const projectDateFormatter = new Intl.DateTimeFormat(undefined, {
     dateStyle: "medium",
@@ -97,55 +103,20 @@ export function NeonConnector({ appId }: { appId: number }) {
     branchesError,
     refetchProjects,
   } = useNeon(appId);
-
+  const activeBranchId =
+    app?.neonActiveBranchId ?? app?.neonDevelopmentBranchId;
+  const activeBranch = branches.find(
+    (branch) => branch.branchId === activeBranchId,
+  );
+  const developmentBranch = branches.find(
+    (branch) => branch.type === "development",
+  );
+  const canSelectProduction =
+    !!settings &&
+    canUseUnsafeNeonBranch(settings, activeBranch?.type === "production");
   useEffect(() => {
-    const handleDeepLink = async () => {
-      if (lastDeepLink?.type === "neon-oauth-return") {
-        if (oauthTimeoutRef.current) {
-          clearTimeout(oauthTimeoutRef.current);
-          oauthTimeoutRef.current = null;
-        }
-        setIsOpeningOauth(false);
-        await refreshSettings();
-        await refetchProjects();
-        await refreshApp();
-        toast.success(t("integrations.neon.connectedSuccess"));
-        clearLastDeepLink();
-      }
-    };
-    handleDeepLink();
-  }, [lastDeepLink?.timestamp]);
-
-  useEffect(() => {
-    return () => {
-      if (oauthTimeoutRef.current) {
-        clearTimeout(oauthTimeoutRef.current);
-        oauthTimeoutRef.current = null;
-      }
-    };
-  }, []);
-
-  const handleConnect = async () => {
-    try {
-      setIsOpeningOauth(true);
-      if (settings?.isTestMode) {
-        await ipc.neon.fakeConnect();
-      } else {
-        await ipc.system.openExternalUrl(
-          "https://oauth.dyad.sh/api/integrations/neon/login",
-        );
-      }
-      // Reset after 20s if the OAuth return never arrives
-      oauthTimeoutRef.current = setTimeout(() => {
-        setIsOpeningOauth(false);
-        oauthTimeoutRef.current = null;
-        toast.warning(t("integrations.neon.signInTimedOut"));
-      }, 20_000);
-    } catch (error) {
-      setIsOpeningOauth(false);
-      toast.error(formatToastError(error));
-    }
-  };
+    setPendingProductionBranch(null);
+  }, [appId, app?.neonProjectId, activeBranchId, canSelectProduction]);
 
   const handleProjectSelect = async (projectId: string) => {
     setIsConnecting(true);
@@ -214,6 +185,8 @@ export function NeonConnector({ appId }: { appId: number }) {
   const handleUnsetProject = async () => {
     setIsDisconnecting(true);
     const shouldRemoveFromVercel = removeFromVercel && !!app?.vercelProjectId;
+    const shouldRemoveFromCloudflare =
+      removeFromCloudflare && !!app?.deploymentProvidersInUse.cloudflare;
     try {
       await ipc.neon.unsetAppProject({ appId });
 
@@ -232,6 +205,21 @@ export function NeonConnector({ appId }: { appId: number }) {
             vercelError,
           );
           toast.warning(t("integrations.neon.failedRemoveVercelEnvVars"));
+        }
+      }
+      // The same for the secrets on the app's Cloudflare Workers.
+      if (shouldRemoveFromCloudflare) {
+        try {
+          const result = await ipc.cloudflare.removeNeonEnvVars({ appId });
+          if (result.warning) {
+            toast.warning(result.warning);
+          }
+        } catch (cloudflareError) {
+          console.error(
+            "Failed to remove Neon secrets from Cloudflare:",
+            cloudflareError,
+          );
+          toast.warning(t("integrations.neon.failedRemoveCloudflareEnvVars"));
         }
       }
 
@@ -306,12 +294,33 @@ export function NeonConnector({ appId }: { appId: number }) {
   };
 
   const handleBranchSelect = async (branchId: string) => {
+    if (
+      branches.find((branch) => branch.branchId === branchId)?.type ===
+        "production" &&
+      !canSelectProduction
+    )
+      return;
     setIsSwitchingBranch(true);
     try {
       const result = await ipc.neon.setActiveBranch({ appId, branchId });
       const branch = branches.find((b) => b.branchId === branchId);
+      // Leaving production also hides it when the destination is a legacy
+      // branch classified as a snapshot rather than the dedicated development branch.
+      const showProtectionNotice =
+        activeBranch?.type === "production" &&
+        !!branch &&
+        branch.type !== "production" &&
+        !canUseUnsafeNeonBranch(settings, false);
       toast.success(
         `${t("integrations.neon.branchSwitched")}: ${branch?.branchName ?? branchId}. ${t("integrations.neon.envUpdated")}`,
+        showProtectionNotice
+          ? {
+              description: t(
+                "integrations.neon.branchSafety.productionHiddenAfterSwitch",
+              ),
+              duration: 10_000,
+            }
+          : undefined,
       );
       if (result.warning) {
         toast.warning(result.warning);
@@ -388,6 +397,22 @@ export function NeonConnector({ appId }: { appId: number }) {
     );
   }
 
+  if (!settings) {
+    return (
+      <Card className="mt-1">
+        <CardHeader>
+          <CardTitle>{t("integrations.neon.database")}</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <NeonSettingsStatus
+            loading={settingsLoading}
+            onRetry={refreshSettings}
+          />
+        </CardContent>
+      </Card>
+    );
+  }
+
   // State 1: Connected and has project set
   if (isConnected && app?.neonProjectId) {
     return (
@@ -420,7 +445,7 @@ export function NeonConnector({ appId }: { appId: number }) {
               }}
               className="inline-flex items-center gap-2 px-2 py-1"
             >
-              <NeonSvg isDarkMode={isDarkMode} aria-hidden="true" />
+              <NeonLogo isDarkMode={isDarkMode} aria-hidden="true" />
               <ExternalLink className="h-4 w-4" aria-hidden="true" />
             </Button>
           </div>
@@ -480,8 +505,19 @@ export function NeonConnector({ appId }: { appId: number }) {
                 </div>
               ) : (
                 <Select
-                  value={app.neonActiveBranchId ?? ""}
-                  onValueChange={(value) => value && handleBranchSelect(value)}
+                  value={activeBranchId ?? ""}
+                  onValueChange={(value) => {
+                    if (!value || value === activeBranchId) return;
+                    if (
+                      branches.find((branch) => branch.branchId === value)
+                        ?.type === "production"
+                    ) {
+                      if (canSelectProduction)
+                        setPendingProductionBranch(value);
+                    } else {
+                      void handleBranchSelect(value);
+                    }
+                  }}
                   disabled={isSwitchingBranch}
                 >
                   <SelectTrigger
@@ -491,16 +527,18 @@ export function NeonConnector({ appId }: { appId: number }) {
                     <SelectValue
                       placeholder={t("integrations.neon.selectBranch")}
                     >
-                      {app.neonActiveBranchId
-                        ? (branches.find(
-                            (b) => b.branchId === app.neonActiveBranchId,
-                          )?.branchName ?? app.neonActiveBranchId)
+                      {activeBranchId
+                        ? (activeBranch?.branchName ?? activeBranchId)
                         : undefined}
                     </SelectValue>
                   </SelectTrigger>
                   <SelectContent>
                     {branches
-                      .filter((branch) => branch.type !== "preview")
+                      .filter(
+                        (branch) =>
+                          branch.type !== "preview" &&
+                          (branch.type !== "production" || canSelectProduction),
+                      )
                       .map((branch) => (
                         <SelectItem
                           key={branch.branchId}
@@ -514,13 +552,69 @@ export function NeonConnector({ appId }: { appId: number }) {
                             >
                               {t(`integrations.neon.${branch.type}`)}
                             </Badge>
+                            {branch.type === "development" && (
+                              <span className="text-xs">
+                                {t("integrations.database.recommended")}
+                              </span>
+                            )}
+                            {branch.type === "production" && (
+                              <span className="text-xs text-destructive">
+                                {t(
+                                  "integrations.neon.branchSafety.notRecommended",
+                                )}
+                              </span>
+                            )}
                           </span>
                         </SelectItem>
                       ))}
                   </SelectContent>
                 </Select>
               )}
+              {activeBranch?.type === "production" && (
+                <NeonBranchWarning
+                  usage="development"
+                  disabled={isSwitchingBranch}
+                  onUseRecommended={
+                    developmentBranch
+                      ? () =>
+                          void handleBranchSelect(developmentBranch.branchId)
+                      : undefined
+                  }
+                />
+              )}
             </div>
+
+            <AlertDialog
+              open={!!pendingProductionBranch && canSelectProduction}
+              onOpenChange={(open) => {
+                if (!open) setPendingProductionBranch(null);
+              }}
+            >
+              <AlertDialogContent>
+                <AlertDialogHeader>
+                  <AlertDialogTitle>
+                    {t("integrations.neon.branchSafety.developmentTitle")}
+                  </AlertDialogTitle>
+                  <AlertDialogDescription>
+                    {t("integrations.neon.branchSafety.developmentWarning")}
+                  </AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter>
+                  <AlertDialogCancel>
+                    {t("integrations.neon.branchSafety.keepCurrent")}
+                  </AlertDialogCancel>
+                  <AlertDialogAction
+                    className={buttonVariants({ variant: "destructive" })}
+                    onClick={() => {
+                      if (pendingProductionBranch)
+                        void handleBranchSelect(pendingProductionBranch);
+                    }}
+                  >
+                    {t("integrations.neon.branchSafety.confirmProduction")}
+                  </AlertDialogAction>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
 
             {!isLoadingEmailConfig && emailPasswordConfig && (
               <div className="space-y-1">
@@ -561,7 +655,10 @@ export function NeonConnector({ appId }: { appId: number }) {
               onOpenChange={(open) => {
                 if (isDisconnecting) return;
                 setIsDisconnectDialogOpen(open);
-                if (open) setRemoveFromVercel(true);
+                if (open) {
+                  setRemoveFromVercel(true);
+                  setRemoveFromCloudflare(true);
+                }
               }}
             >
               <AlertDialogTrigger
@@ -595,6 +692,29 @@ export function NeonConnector({ appId }: { appId: number }) {
                       </span>
                       <span className="text-xs text-gray-600 dark:text-gray-400">
                         {t("integrations.neon.removeVercelEnvVarsHelp")}
+                      </span>
+                    </span>
+                  </label>
+                )}
+                {app?.deploymentProvidersInUse.cloudflare && (
+                  <label
+                    className="flex items-start gap-2 rounded-md border border-border p-3 text-sm"
+                    data-testid="neon-remove-cloudflare-secrets"
+                  >
+                    <Checkbox
+                      checked={removeFromCloudflare}
+                      onCheckedChange={(checked) =>
+                        setRemoveFromCloudflare(checked === true)
+                      }
+                      disabled={isDisconnecting}
+                      className="mt-0.5"
+                    />
+                    <span className="flex flex-col gap-0.5">
+                      <span className="font-medium">
+                        {t("integrations.neon.removeCloudflareEnvVars")}
+                      </span>
+                      <span className="text-xs text-gray-600 dark:text-gray-400">
+                        {t("integrations.neon.removeCloudflareEnvVarsHelp")}
                       </span>
                     </span>
                   </label>
@@ -840,99 +960,8 @@ export function NeonConnector({ appId }: { appId: number }) {
         <CardDescription>{t("integrations.neon.freeTier")}</CardDescription>
       </CardHeader>
       <CardContent>
-        <Button
-          variant="outline"
-          onClick={handleConnect}
-          disabled={isOpeningOauth}
-          className="w-auto h-10 flex items-center justify-center px-4 py-2 border-2 transition-colors font-medium text-sm dark:bg-gray-900 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-800"
-          data-testid="connect-neon-button"
-          aria-label={t("integrations.neon.connectTo") + " Neon"}
-        >
-          {isOpeningOauth ? (
-            <>
-              <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-              <span>{t("integrations.neon.completingSignIn")}</span>
-            </>
-          ) : (
-            <>
-              <span className="mr-2">{t("integrations.neon.connectTo")}</span>
-              <NeonSvg isDarkMode={isDarkMode} />
-            </>
-          )}
-        </Button>
+        <NeonSignInButton appId={appId} />
       </CardContent>
     </Card>
-  );
-}
-
-function NeonSvg({
-  isDarkMode,
-  className,
-}: {
-  isDarkMode?: boolean;
-  className?: string;
-}) {
-  const textColor = isDarkMode ? "#fff" : "#000";
-
-  return (
-    <svg
-      xmlns="http://www.w3.org/2000/svg"
-      width="68"
-      height="18"
-      fill="none"
-      viewBox="0 0 102 28"
-      className={className}
-    >
-      <path
-        fill="#12FFF7"
-        fillRule="evenodd"
-        d="M0 4.828C0 2.16 2.172 0 4.851 0h18.436c2.679 0 4.85 2.161 4.85 4.828V20.43c0 2.758-3.507 3.955-5.208 1.778l-5.318-6.809v8.256c0 2.4-1.955 4.345-4.367 4.345H4.851C2.172 28 0 25.839 0 23.172zm4.851-.966a.97.97 0 0 0-.97.966v18.344c0 .534.435.966.97.966h8.539c.268 0 .34-.216.34-.483v-11.07c0-2.76 3.507-3.956 5.208-1.779l5.319 6.809V4.828c0-.534.05-.966-.485-.966z"
-        clipRule="evenodd"
-      />
-      <path
-        fill="url(#a)"
-        fillRule="evenodd"
-        d="M0 4.828C0 2.16 2.172 0 4.851 0h18.436c2.679 0 4.85 2.161 4.85 4.828V20.43c0 2.758-3.507 3.955-5.208 1.778l-5.318-6.809v8.256c0 2.4-1.955 4.345-4.367 4.345H4.851C2.172 28 0 25.839 0 23.172zm4.851-.966a.97.97 0 0 0-.97.966v18.344c0 .534.435.966.97.966h8.539c.268 0 .34-.216.34-.483v-11.07c0-2.76 3.507-3.956 5.208-1.779l5.319 6.809V4.828c0-.534.05-.966-.485-.966z"
-        clipRule="evenodd"
-      />
-      <path
-        fill="url(#b)"
-        fillRule="evenodd"
-        d="M0 4.828C0 2.16 2.172 0 4.851 0h18.436c2.679 0 4.85 2.161 4.85 4.828V20.43c0 2.758-3.507 3.955-5.208 1.778l-5.318-6.809v8.256c0 2.4-1.955 4.345-4.367 4.345H4.851C2.172 28 0 25.839 0 23.172zm4.851-.966a.97.97 0 0 0-.97.966v18.344c0 .534.435.966.97.966h8.539c.268 0 .34-.216.34-.483v-11.07c0-2.76 3.507-3.956 5.208-1.779l5.319 6.809V4.828c0-.534.05-.966-.485-.966z"
-        clipRule="evenodd"
-      />
-      <path
-        fill="#B9FFB3"
-        d="M23.287 0c2.679 0 4.85 2.161 4.85 4.828V20.43c0 2.758-3.507 3.955-5.208 1.778l-5.319-6.809v8.256c0 2.4-1.954 4.345-4.366 4.345a.484.484 0 0 0 .485-.483V12.584c0-2.758 3.508-3.955 5.21-1.777l5.318 6.808V.965a.97.97 0 0 0-.97-.965"
-      />
-      <path
-        fill={textColor}
-        d="M48.112 7.432v8.032l-7.355-8.032H36.93v13.136h3.49v-8.632l8.01 8.632h3.173V7.432zM58.075 17.64v-2.326h7.815v-2.797h-7.815V10.36h9.48V7.432H54.514v13.136H67.75v-2.927zM77.028 21c4.909 0 8.098-2.552 8.098-7s-3.19-7-8.098-7c-4.91 0-8.081 2.552-8.081 7s3.172 7 8.08 7m0-3.115c-2.73 0-4.413-1.408-4.413-3.885s1.701-3.885 4.413-3.885c2.729 0 4.412 1.408 4.412 3.885s-1.683 3.885-4.412 3.885M98.508 7.432v8.032l-7.355-8.032h-3.828v13.136h3.491v-8.632l8.01 8.632H102V7.432z"
-      />
-      <defs>
-        <linearGradient
-          id="a"
-          x1="28.138"
-          x2="3.533"
-          y1="28"
-          y2="-.12"
-          gradientUnits="userSpaceOnUse"
-        >
-          <stop stopColor="#B9FFB3" />
-          <stop offset="1" stopColor="#B9FFB3" stopOpacity="0" />
-        </linearGradient>
-        <linearGradient
-          id="b"
-          x1="28.138"
-          x2="11.447"
-          y1="28"
-          y2="21.476"
-          gradientUnits="userSpaceOnUse"
-        >
-          <stop stopColor="#1A1A1A" stopOpacity=".9" />
-          <stop offset="1" stopColor="#1A1A1A" stopOpacity="0" />
-        </linearGradient>
-      </defs>
-    </svg>
   );
 }

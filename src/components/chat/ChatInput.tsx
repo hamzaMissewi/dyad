@@ -1,3 +1,4 @@
+import { SubscriptionLimitBanner } from "@/components/SubscriptionConnectionStatus";
 import {
   StopCircleIcon,
   X,
@@ -22,19 +23,19 @@ import {
 import type React from "react";
 import { useCallback, useEffect, useRef, useState, useMemo } from "react";
 import { useTranslation } from "react-i18next";
+import { getNpmPackagePageUrl } from "./npmPackageUrl";
 
 import { useSettings } from "@/hooks/useSettings";
+import { useChatMessages } from "@/hooks/useChatMessages";
 import { ipc } from "@/ipc/types";
 import {
   chatInputValuesByIdAtom,
   chatMessagesByIdAtom,
   selectedChatIdAtom,
-  pendingToolConsentsAtom,
-  type PendingToolConsent,
   agentTodosByChatIdAtom,
-  needsFreshPlanChatAtom,
 } from "@/atoms/chatAtoms";
-import { atom, useAtom, useSetAtom, useAtomValue } from "jotai";
+import { chatAnnotationsAtom } from "@/atoms/chatAnnotationAtoms";
+import { atom, useAtom, useSetAtom, useAtomValue, useStore } from "jotai";
 import { useStreamChat } from "@/hooks/useStreamChat";
 import { selectedAppIdAtom } from "@/atoms/appAtoms";
 import { Button } from "@/components/ui/button";
@@ -49,34 +50,37 @@ import {
 
 import { isPreviewOpenAtom } from "@/atoms/viewAtoms";
 import { useRunApp } from "@/hooks/useRunApp";
-import { AutoApproveSwitch } from "../AutoApproveSwitch";
 import { usePostHog } from "posthog-js/react";
 import { CodeHighlight } from "./CodeHighlight";
 import { TokenBar } from "./TokenBar";
 
 import { useVersions } from "@/hooks/useVersions";
 import { useAttachments } from "@/hooks/useAttachments";
+import { useAppMediaFiles } from "@/hooks/useAppMediaFiles";
+import { useLoadApps } from "@/hooks/useLoadApps";
+import { buildOptimisticChatDisplay } from "@/lib/optimisticChatDisplay";
 import { AttachmentsList } from "./AttachmentsList";
 import { DragDropOverlay } from "./DragDropOverlay";
 import { FileAttachmentTypeDialog } from "./FileAttachmentTypeDialog";
-import { showExtraFilesToast, showInfo, showWarning } from "@/lib/toast";
+import { showExtraFilesToast, showWarning } from "@/lib/toast";
 import { useSummarizeInNewChat } from "./SummarizeInNewChatButton";
 import { ChatInputControls } from "../ChatInputControls";
 import { ChatErrorBox } from "./ChatErrorBox";
 import { AgentConsentBanner } from "./AgentConsentBanner";
+import { CancellationBanner } from "./CancellationBanner";
+import { useCancellationRequestLatch } from "./useCancellationRequestLatch";
 import { TodoList } from "./TodoList";
 import { QuestionnaireInput } from "./QuestionnaireInput";
 import { QueuedMessagesList } from "./QueuedMessagesList";
+import { TestAssertionsInput } from "./TestAssertionsInput";
 import {
   selectedComponentsPreviewAtom,
   previewIframeRefAtom,
   visualEditingSelectedComponentAtom,
   currentComponentCoordinatesAtom,
   pendingVisualChangesAtom,
-  isRestoringQueuedSelectionAtom,
 } from "@/atoms/previewAtoms";
 import { SelectedComponentsDisplay } from "./SelectedComponentDisplay";
-import { useCheckProblems } from "@/hooks/useCheckProblems";
 import { LexicalChatInput } from "./LexicalChatInput";
 import { AuxiliaryActionsMenu } from "./AuxiliaryActionsMenu";
 import {
@@ -84,10 +88,11 @@ import {
   doesSqlMutateSchema,
 } from "@/lib/sqlSchemaMutation";
 import { ChatImageGenerationStrip } from "./ChatImageGenerationStrip";
-import {
-  chatImageGenerationJobsAtom,
-  dismissedImageGenerationJobIdsAtom,
-} from "@/atoms/imageGenerationAtoms";
+import { SuggestedPromptsStrip } from "./SuggestedPromptsStrip";
+import { selectSuggestedPrompts } from "@/lib/suggestedPrompts";
+import { DEFAULT_ENABLE_SUGGESTED_PROMPTS } from "@/shared/settings_defaults";
+import { dismissedImageGenerationJobIdsAtom } from "@/atoms/imageGenerationAtoms";
+import { useChatImageGenerationJobs } from "@/image_generation/hooks";
 import { ImageGeneratorDialog } from "@/components/ImageGeneratorDialog";
 import { useChatModeToggle } from "@/hooks/useChatModeToggle";
 import { VisualEditingChangesDialog } from "@/components/preview_panel/VisualEditingChangesDialog";
@@ -103,16 +108,31 @@ import {
   ContextLimitBanner,
   shouldShowContextLimitBanner,
 } from "./ContextLimitBanner";
+import { PromoMessage, usePromoMessage } from "./PromoMessage";
 import { useCountTokens } from "@/hooks/useCountTokens";
 import { useChats } from "@/hooks/useChats";
 import { useRouter } from "@tanstack/react-router";
 import { showError as showErrorToast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 import { useVoiceToText } from "@/hooks/useVoiceToText";
-import { isDyadProEnabled } from "@/lib/schemas";
+import { isDyadProEnabled, isLocalAgentBackedMode } from "@/lib/schemas";
+import { isFreeProModel } from "@/lib/freeProModel";
+import { ReferencedAppsBar } from "./ReferencedAppsBar";
 import { useChatMode } from "@/hooks/useChatMode";
-import { useInitialChatMode } from "@/hooks/useInitialChatMode";
 import { useOpenPreviewIfSetupRequired } from "@/hooks/useOpenPreviewIfSetupRequired";
+import { getUserInputReadModel } from "@/user_input/read_model";
+import { usePendingToolConsents } from "@/user_input/hooks";
+import type { PendingToolConsent } from "@/user_input/selectors";
+import { useSendPreviewIframeEvent } from "@/preview_iframe/usePreviewIframe";
+import {
+  CHAT_PROMPT_LENGTH_LIMIT_MESSAGE,
+  MAX_CHAT_PROMPT_CHARS,
+} from "@/shared/chatAttachmentLimits";
+import { ChatAnnotationsTray } from "./ChatAnnotationsTray";
+import {
+  composeChatPrompt,
+  hasChatComposerPayload,
+} from "@/lib/serializeChatAnnotations";
 
 const showTokenBarAtom = atom(false);
 
@@ -136,20 +156,32 @@ export function ChatInput({ chatId }: { chatId?: number }) {
     },
     [chatId, setInputValuesById],
   );
+  const [allChatAnnotations, setAllChatAnnotations] =
+    useAtom(chatAnnotationsAtom);
+  const chatAnnotations = useMemo(
+    () => (chatId ? (allChatAnnotations.get(chatId) ?? []) : []),
+    [allChatAnnotations, chatId],
+  );
   const { settings } = useSettings();
   const {
+    chat: activeChat,
     selectedMode: chatMode,
-    effectiveMode,
+    selectedMode,
+    storedChatMode,
+    selectedModel,
     isLoading: isChatModeLoading,
+    setChatMode,
   } = useChatMode(chatId);
-  const initialChatMode = useInitialChatMode();
   const appId = useAtomValue(selectedAppIdAtom);
+  const { mediaApps } = useAppMediaFiles();
+  const { apps } = useLoadApps();
   const { refreshVersions } = useVersions(appId);
   const openPreviewIfSetupRequired = useOpenPreviewIfSetupRequired();
   const {
     streamMessage,
+    cancelStream,
     isStreaming,
-    setIsStreaming,
+    isCancellationSettling,
     error,
     setError,
     queuedMessages,
@@ -157,20 +189,25 @@ export function ChatInput({ chatId }: { chatId?: number }) {
     updateQueuedMessage,
     removeQueuedMessage,
     reorderQueuedMessages,
-    clearAllQueuedMessages,
     isPaused,
     pauseQueue,
     clearPauseOnly,
     resumeQueue,
-    clearCompletionFlag,
   } = useStreamChat();
+  const { isCancellationRequested, requestCancellation } =
+    useCancellationRequestLatch({
+      chatId,
+      isStreaming,
+      isCancellationSettling,
+    });
   const [showError, setShowError] = useState(true);
   const [isApproving, setIsApproving] = useState(false); // State for approving
   const [isRejecting, setIsRejecting] = useState(false); // State for rejecting
   const [editingQueuedMessageId, setEditingQueuedMessageId] = useState<
     string | null
   >(null);
-  const messagesById = useAtomValue(chatMessagesByIdAtom);
+  const isAwaitingTurnAcceptanceRef = useRef(false);
+  const messages = useChatMessages(chatId);
   const setMessagesById = useSetAtom(chatMessagesByIdAtom);
   const setIsPreviewOpen = useSetAtom(isPreviewOpenAtom);
   const [showTokenBar, setShowTokenBar] = useAtom(showTokenBarAtom);
@@ -190,56 +227,27 @@ export function ChatInput({ chatId }: { chatId?: number }) {
     currentComponentCoordinatesAtom,
   );
   const setPendingVisualChanges = useSetAtom(pendingVisualChangesAtom);
-  const setIsRestoringQueuedSelection = useSetAtom(
-    isRestoringQueuedSelectionAtom,
-  );
-  const [pendingToolConsents, setPendingToolConsents] = useAtom(
-    pendingToolConsentsAtom,
-  );
-  // Get the first consent in the queue for this chat (if any)
-  const consentsForThisChat = pendingToolConsents.filter(
-    (c) => c.chatId === chatId,
-  );
+  const sendPreviewIframeEvent = useSendPreviewIframeEvent(appId);
+  const store = useStore();
+  const userInputReadModel = getUserInputReadModel({ store });
+  const consentsForThisChat = usePendingToolConsents(chatId);
   const pendingToolConsent = consentsForThisChat[0] ?? null;
 
-  // Route a consent decision back to the channel that requested it.
-  const respondToPendingConsent = (
-    consent: PendingToolConsent,
-    decision: "accept-once" | "accept-always" | "decline",
-  ) => {
-    if (consent.kind === "mcp") {
-      return ipc.mcp.respondToConsent({
-        requestId: consent.requestId,
-        decision,
-      });
-    }
-    return ipc.agent.respondToConsent({
-      requestId: consent.requestId,
-      decision,
-    });
-  };
-
-  // Remove the banner immediately for instant feedback, then send the decision.
-  // If the send fails, re-queue the consent so the decision is not lost.
+  // The read-model adapter owns optimistic hiding, rollback, and stale-request
+  // reconciliation so the request snapshot retains exactly one owner.
   const decideConsent = async (
     consent: PendingToolConsent,
     decision: "accept-once" | "accept-always" | "decline",
   ) => {
-    setPendingToolConsents((prev) =>
-      prev.filter((c) => c.requestId !== consent.requestId),
-    );
-    try {
-      await respondToPendingConsent(consent, decision);
-    } catch (error) {
-      setPendingToolConsents((prev) => [consent, ...prev]);
-      showErrorToast(error as Error);
-    }
+    await userInputReadModel.respond(consent.requestId, {
+      kind: consent.kind === "mcp" ? "mcp-consent" : "agent-consent",
+      decision,
+    });
   };
 
   // Get todos for this chat
   const agentTodosByChatId = useAtomValue(agentTodosByChatIdAtom);
   const chatTodos = chatId ? (agentTodosByChatId.get(chatId) ?? []) : [];
-  const { checkProblems } = useCheckProblems(appId);
   const { refreshAppIframe } = useRunApp();
   const { navigate } = useRouter();
   const setSelectedChatId = useSetAtom(selectedChatIdAtom);
@@ -250,7 +258,7 @@ export function ChatInput({ chatId }: { chatId?: number }) {
   }, []);
 
   // Image generation jobs for auto-adding to chat on send
-  const chatImageJobs = useAtomValue(chatImageGenerationJobsAtom);
+  const chatImageJobs = useChatImageGenerationJobs();
   const [dismissedImageJobIds, setDismissedImageJobIds] = useAtom(
     dismissedImageGenerationJobIdsAtom,
   );
@@ -266,6 +274,13 @@ export function ChatInput({ chatId }: { chatId?: number }) {
     );
   }, [chatImageJobs, dismissedImageJobIds, appId]);
   const hasSuccessfulImageJobs = visibleSuccessfulImageJobs.length > 0;
+  const hasPendingImageJobs = chatImageJobs.some(
+    (job) =>
+      (!appId || job.targetAppId === appId) &&
+      !dismissedImageJobIds.has(job.id) &&
+      // A cancelling job can still finish and be attached to the next message.
+      (job.status === "pending" || job.status === "cancelling"),
+  );
 
   // Use the attachments hook
   const {
@@ -278,11 +293,13 @@ export function ChatInput({ chatId }: { chatId?: number }) {
     handleDragLeave,
     handleDrop,
     clearAttachments,
+    clearSubmittedAttachments,
+    restoreSubmittedAttachments,
     replaceAttachments,
     handlePaste,
     confirmPendingFiles,
     cancelPendingFiles,
-  } = useAttachments();
+  } = useAttachments(chatId);
 
   // Use the hook to fetch the proposal
   const {
@@ -290,28 +307,31 @@ export function ChatInput({ chatId }: { chatId?: number }) {
     isLoading: isProposalLoading,
     error: proposalError,
     refreshProposal,
-  } = useProposal(chatId);
+  } = useProposal(chatId, { isStreaming });
   const { proposal, messageId } = proposalResult ?? {};
   useChatModeToggle();
 
-  const lastMessage = (chatId ? (messagesById.get(chatId) ?? []) : []).at(-1);
+  const lastMessage = messages.at(-1);
   const disableSendButton =
-    effectiveMode !== "local-agent" &&
     lastMessage?.role === "assistant" &&
     !lastMessage.approvalState &&
     !!proposal &&
     proposal.type === "code-proposal" &&
     messageId === lastMessage.id;
+  const hasComposerPayload = hasChatComposerPayload({
+    inputValue,
+    attachmentCount: attachments.length,
+    hasSuccessfulImageJobs,
+    annotationCount: chatAnnotations.length,
+  });
 
   // Extract user message history for terminal-style navigation
   const userMessageHistory = useMemo(() => {
-    if (!chatId) return [];
-    const messages = messagesById.get(chatId) ?? [];
     return messages
       .filter((msg) => msg.role === "user")
       .map((msg) => msg.content)
       .reverse(); // Most recent first
-  }, [chatId, messagesById]);
+  }, [messages]);
 
   const { userBudget } = useUserBudgetInfo();
   const isProEnabled = settings ? isDyadProEnabled(settings) : false;
@@ -323,49 +343,12 @@ export function ChatInput({ chatId }: { chatId?: number }) {
     [setInputValue],
   );
 
-  const { isRecording, isTranscribing, toggleRecording } = useVoiceToText({
-    enabled: isProEnabled,
-    onTranscription: handleTranscription,
-    onError: (message) => showErrorToast(message),
-  });
-
-  const [needsFreshPlanChat, setNeedsFreshPlanChat] = useAtom(
-    needsFreshPlanChatAtom,
-  );
-
-  // Detect transition to plan mode from another mode in a chat with messages
-  const prevModeRef = useRef(chatMode);
-  const prevModeChatIdRef = useRef(chatId);
-  const hasInitializedModeRef = useRef(false);
-  useEffect(() => {
-    if (isChatModeLoading) return;
-    if (
-      !hasInitializedModeRef.current ||
-      prevModeChatIdRef.current !== chatId
-    ) {
-      hasInitializedModeRef.current = true;
-      prevModeChatIdRef.current = chatId;
-      prevModeRef.current = chatMode;
-      return;
-    }
-
-    const prevMode = prevModeRef.current;
-    const currentMode = chatMode;
-    prevModeRef.current = currentMode;
-
-    if (prevMode && prevMode !== "plan" && currentMode === "plan") {
-      const messages = chatId ? (messagesById.get(chatId) ?? []) : [];
-      if (messages.length > 0) {
-        setNeedsFreshPlanChat(true);
-      }
-    }
-  }, [
-    chatMode,
-    chatId,
-    isChatModeLoading,
-    messagesById,
-    setNeedsFreshPlanChat,
-  ]);
+  const { isRecording, isTranscribing, isVoiceBusy, toggleRecording } =
+    useVoiceToText({
+      enabled: isProEnabled,
+      onTranscription: handleTranscription,
+      onError: (message) => showErrorToast(message),
+    });
 
   // Token counting for context limit banner
   const { result: tokenCountResult } = useCountTokens(
@@ -380,6 +363,11 @@ export function ChatInput({ chatId }: { chatId?: number }) {
       totalTokens: tokenCountResult.actualMaxTokens,
       contextWindow: tokenCountResult.contextWindow,
     });
+
+  // Promo cap row on the composer; never stack two caps — the context limit
+  // warning wins the slot.
+  const promo = usePromoMessage(chatId);
+  const showPromo = promo.visible && !showBanner;
 
   useEffect(() => {
     if (error) {
@@ -406,6 +394,7 @@ export function ChatInput({ chatId }: { chatId?: number }) {
   const clearComposerAfterSubmit = useCallback(() => {
     setInputValue("");
     setSelectedComponents([]);
+    sendPreviewIframeEvent({ type: "PICKER_DEACTIVATED" });
     setVisualEditingSelectedComponent(null);
     // Clear overlays in the preview iframe
     if (previewIframeRef?.contentWindow) {
@@ -417,6 +406,7 @@ export function ChatInput({ chatId }: { chatId?: number }) {
   }, [
     setInputValue,
     setSelectedComponents,
+    sendPreviewIframeEvent,
     setVisualEditingSelectedComponent,
     previewIframeRef,
   ]);
@@ -455,13 +445,27 @@ export function ChatInput({ chatId }: { chatId?: number }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Auto-clear pause state when queue becomes empty (Users expect that deleting all queued messages returns them to normal send mode)
+  // Auto-clear pause state when queue becomes empty (Users expect that deleting
+  // all queued messages returns them to normal send mode). Keep the
+  // authoritative Stop policy until cancellation settles so a late submission
+  // admitted by the stream machine cannot land in an unpaused queue.
 
   useEffect(() => {
-    if (chatId && isPaused && queuedMessages.length === 0) {
+    if (
+      chatId &&
+      isPaused &&
+      queuedMessages.length === 0 &&
+      !isCancellationRequested
+    ) {
       clearPauseOnly();
     }
-  }, [chatId, isPaused, queuedMessages.length, clearPauseOnly]);
+  }, [
+    chatId,
+    isPaused,
+    queuedMessages.length,
+    isCancellationRequested,
+    clearPauseOnly,
+  ]);
 
   // Queue management handlers
   const handleEditQueuedMessage = useCallback(
@@ -484,8 +488,8 @@ export function ChatInput({ chatId }: { chatId?: number }) {
       setInputValue(msg.prompt);
       // Restore attachments and selected components from the queued message
       replaceAttachments(msg.attachments ?? []);
-      setIsRestoringQueuedSelection(true);
       setSelectedComponents(msg.selectedComponents ?? []);
+      sendPreviewIframeEvent({ type: "SELECTION_RESTORE_QUEUED" });
       // Reset visual editing target to avoid stale toolbar state
       setVisualEditingSelectedComponent(null);
       // Set editing mode
@@ -501,7 +505,7 @@ export function ChatInput({ chatId }: { chatId?: number }) {
       replaceAttachments,
       setSelectedComponents,
       setVisualEditingSelectedComponent,
-      setIsRestoringQueuedSelection,
+      sendPreviewIframeEvent,
       updateQueuedMessage,
     ],
   );
@@ -532,21 +536,60 @@ export function ChatInput({ chatId }: { chatId?: number }) {
       if (editingQueuedMessageId === id) {
         resetEditingState();
       }
-      removeQueuedMessage(id);
+      return removeQueuedMessage(id);
     },
     [editingQueuedMessageId, removeQueuedMessage, resetEditingState],
   );
 
   const handleSubmit = async () => {
     if (
-      (!inputValue.trim() &&
-        attachments.length === 0 &&
-        !hasSuccessfulImageJobs) ||
+      !hasComposerPayload ||
       !chatId ||
-      pendingFiles
+      pendingFiles ||
+      isAwaitingTurnAcceptanceRef.current
     ) {
       return;
     }
+
+    const submittedAnnotations = chatAnnotations;
+    const submittedAnnotationIds = new Set(
+      submittedAnnotations.map((annotation) => annotation.id),
+    );
+    const hideSubmittedAnnotations = () => {
+      if (submittedAnnotationIds.size === 0) return;
+      setAllChatAnnotations((previous) => {
+        const next = new Map(previous);
+        const remaining = (next.get(chatId) ?? []).filter(
+          (annotation) => !submittedAnnotationIds.has(annotation.id),
+        );
+        if (remaining.length === 0) next.delete(chatId);
+        else next.set(chatId, remaining);
+        return next;
+      });
+    };
+    let restoredSubmittedAnnotations = false;
+    const restoreSubmittedAnnotations = () => {
+      if (submittedAnnotations.length === 0 || restoredSubmittedAnnotations) {
+        return;
+      }
+      restoredSubmittedAnnotations = true;
+      setAllChatAnnotations((previous) => {
+        const current = previous.get(chatId) ?? [];
+        const currentIds = new Set(current.map((annotation) => annotation.id));
+        const missing = submittedAnnotations.filter(
+          (annotation) => !currentIds.has(annotation.id),
+        );
+        if (missing.length === 0) return previous;
+        const next = new Map(previous);
+        next.set(
+          chatId,
+          [...missing, ...current].sort(
+            (left, right) => left.createdAt - right.createdAt,
+          ),
+        );
+        return next;
+      });
+    };
 
     if (isRecording) {
       await toggleRecording();
@@ -561,47 +604,28 @@ export function ChatInput({ chatId }: { chatId?: number }) {
         ? `${inputValue} ${imageMentions}`
         : inputValue
       : imageMentions;
+    const currentInput = composeChatPrompt(
+      promptWithImages,
+      submittedAnnotations,
+    );
 
-    // Dismiss image jobs that were auto-added
-    if (visibleSuccessfulImageJobs.length > 0) {
-      setDismissedImageJobIds((prev) => {
-        const next = new Set(prev);
-        for (const job of visibleSuccessfulImageJobs) {
-          next.add(job.id);
-        }
-        return next;
-      });
-    }
-
-    // If switching to plan mode from another mode in a chat with messages,
-    // create a new chat for a clean context.
-    if (needsFreshPlanChat && chatMode === "plan" && appId) {
-      clearComposerAfterSubmit();
-      setNeedsFreshPlanChat(false);
-
-      const newChatId = await ipc.chat.createChat({
-        appId,
-        initialChatMode: "plan",
-      });
-      setSelectedChatId(newChatId);
-      navigate({ to: "/chat", search: { id: newChatId } });
-      queryClient.invalidateQueries({ queryKey: queryKeys.chats.all });
-      showInfo("We've switched you to a new chat for a clean context");
-
-      void openPreviewIfSetupRequired(appId);
-      await streamMessage({
-        prompt: promptWithImages,
-        chatId: newChatId,
-        attachments,
-        redo: false,
-        requestedChatMode: "plan",
-      });
-      clearAttachments();
-      posthog.capture("chat:submit", { chatMode });
+    if (currentInput.length > MAX_CHAT_PROMPT_CHARS) {
+      showErrorToast(CHAT_PROMPT_LENGTH_LIMIT_MESSAGE);
       return;
     }
 
-    const currentInput = promptWithImages;
+    const submittedInputValue = inputValue;
+    const submittedImageJobIds = visibleSuccessfulImageJobs.map(
+      (job) => job.id,
+    );
+    const dismissSubmittedImageJobs = () => {
+      if (submittedImageJobIds.length === 0) return;
+      setDismissedImageJobIds((previous) => {
+        const next = new Set(previous);
+        for (const jobId of submittedImageJobIds) next.add(jobId);
+        return next;
+      });
+    };
 
     // Use all selected components for multi-component editing
     const componentsToSend =
@@ -616,12 +640,15 @@ export function ChatInput({ chatId }: { chatId?: number }) {
         attachments,
         selectedComponents: componentsToSend,
       });
+      hideSubmittedAnnotations();
+      dismissSubmittedImageJobs();
       resetEditingState();
       return;
     }
 
-    // Queue while actively streaming. If we're paused but currently idle,
-    // send the new message immediately and keep existing queued items paused.
+    // Queue while actively streaming. When Stop parked the queue but the actor
+    // is idle, the main actor appends this prompt and resumes FIFO. Explicit
+    // Pause and step-limit pauses instead let this new turn run immediately.
     if (isStreaming) {
       const queued = queueMessage({
         prompt: currentInput,
@@ -630,59 +657,205 @@ export function ChatInput({ chatId }: { chatId?: number }) {
       });
       if (queued) {
         // Only clear input, attachments, and components on successful queue
+        hideSubmittedAnnotations();
         clearComposerAfterSubmit();
         clearAttachments();
+        dismissSubmittedImageJobs();
       }
       // If queue failed, leave input/attachments intact for the user
       return;
     }
 
-    // Not streaming - send immediately
-    // Clear input and components before sending
-    clearComposerAfterSubmit();
-
-    // Send message with attachments and clear them after sending
+    // Clear text immediately, even when admission waits on network preflight.
+    // Keep the submitted draft in this request's closure so rejection can
+    // restore it without discarding anything typed while admission was pending.
     void openPreviewIfSetupRequired(appId);
+    setInputValue("");
+    clearSubmittedAttachments(attachments);
+    dismissSubmittedImageJobs();
+    let didRestoreSubmittedInput = false;
+    const restoreSubmittedInput = () => {
+      if (didRestoreSubmittedInput) return;
+      didRestoreSubmittedInput = true;
+      restoreSubmittedAttachments(attachments);
+      setDismissedImageJobIds((previous) => {
+        const next = new Set(previous);
+        for (const jobId of submittedImageJobIds) next.delete(jobId);
+        return next;
+      });
+      setInputValue((current) =>
+        current && submittedInputValue
+          ? `${submittedInputValue}\n\n${current}`
+          : submittedInputValue || current,
+      );
+    };
+    let didClearAcceptedPayload = false;
+    const clearAcceptedPayload = () => {
+      if (didClearAcceptedPayload) return;
+      didClearAcceptedPayload = true;
+      const currentComponents = store.get(selectedComponentsPreviewAtom);
+      if (
+        currentComponents.length === componentsToSend.length &&
+        currentComponents.every(
+          (component, index) => component === componentsToSend[index],
+        )
+      ) {
+        setSelectedComponents([]);
+        sendPreviewIframeEvent({ type: "PICKER_DEACTIVATED" });
+        setVisualEditingSelectedComponent(null);
+        if (previewIframeRef?.contentWindow) {
+          previewIframeRef.contentWindow.postMessage(
+            { type: "clear-dyad-component-overlays" },
+            "*",
+          );
+        }
+      }
+    };
+    isAwaitingTurnAcceptanceRef.current = true;
+    hideSubmittedAnnotations();
+    let wasAccepted = false;
     await streamMessage({
       prompt: currentInput,
       chatId,
       attachments,
       redo: false,
+      showOptimisticMessage: true,
+      optimisticDisplayContent: buildOptimisticChatDisplay(
+        currentInput,
+        apps.find((app) => app.id === appId)?.path,
+        [
+          ...(mediaApps.find((app) => app.appId === appId)?.files ?? []),
+          ...visibleSuccessfulImageJobs.map((job) => ({
+            fileName: job.result!.fileName,
+            mimeType: "image/png",
+          })),
+        ],
+      ),
       selectedComponents: componentsToSend,
-      requestedChatMode: isChatModeLoading ? null : chatMode,
+      requestedChatMode: isChatModeLoading ? null : storedChatMode,
+      onAccepted: () => {
+        wasAccepted = true;
+        isAwaitingTurnAcceptanceRef.current = false;
+        clearAcceptedPayload();
+      },
+      onAcceptanceRejected: () => {
+        isAwaitingTurnAcceptanceRef.current = false;
+        restoreSubmittedInput();
+        restoreSubmittedAnnotations();
+      },
+      onSettled: ({ success, queued }) => {
+        isAwaitingTurnAcceptanceRef.current = false;
+        if (queued) clearAcceptedPayload();
+        if (!success && !queued && !wasAccepted) {
+          restoreSubmittedInput();
+          restoreSubmittedAnnotations();
+        }
+      },
     });
-    clearAttachments();
     posthog.capture("chat:submit", { chatMode });
   };
 
   const handleCancel = () => {
-    // Only clear the queue if NOT paused
-    if (!isPaused) {
-      clearAllQueuedMessages();
-    }
+    // A ref-backed optimistic latch closes the same-render double-click window
+    // before the stream actor's cancelling projection reaches React.
+    if (!requestCancellation()) return;
+    // Stopping is non-destructive: queued prompts are parked, never deleted.
+    // `isPaused` is a transient latch (resuming, an emptied queue, or a
+    // step-limit continue all clear it), so it can be false while the user
+    // still has prompts they care about queued — deleting them here silently
+    // lost work, including the queue restored (paused) after a restart.
+    //
+    // The cancel intent also tells the authoritative actor to park the queue.
+    // Keeping those actions in one actor transition prevents queue revision
+    // races while still parking follow-ups admitted during cancellation.
     // Always reset editing state when cancelling, regardless of pause state
     if (editingQueuedMessageId) {
       resetEditingState();
     }
-    // Do NOT reset pause state here; queued messages should remain paused after stopping
     if (chatId) {
-      clearCompletionFlag();
-      ipc.chat.cancelStream(chatId);
+      // The stream machine reconciles the cancel with the real terminal
+      // event (including cancels fired before main registered the stream).
+      cancelStream();
     }
-    setIsStreaming(false);
   };
 
   const dismissError = () => {
     setShowError(false);
   };
 
+  // Follow-up prompts the model attached to its last reply. Hidden while a
+  // pending consent or unapproved proposal still owns the composer's attention,
+  // and entirely when the user has turned the setting off.
+  const suggestedPromptsEnabled =
+    settings?.enableSuggestedPrompts ?? DEFAULT_ENABLE_SUGGESTED_PROMPTS;
+  const suggestedPrompts = useMemo(
+    () =>
+      suggestedPromptsEnabled
+        ? selectSuggestedPrompts({
+            messages,
+            isStreaming,
+            hasError: !!error,
+            composerHasContent:
+              hasComposerPayload ||
+              selectedComponents.length > 0 ||
+              !!pendingFiles ||
+              hasPendingImageJobs ||
+              isVoiceBusy,
+          })
+        : null,
+    [
+      suggestedPromptsEnabled,
+      messages,
+      isStreaming,
+      error,
+      hasComposerPayload,
+      selectedComponents,
+      pendingFiles,
+      hasPendingImageJobs,
+      isVoiceBusy,
+    ],
+  );
+  const handleSelectSuggestedPrompt = useCallback(
+    (prompt: string) => {
+      if (!chatId || isStreaming || isAwaitingTurnAcceptanceRef.current) {
+        return;
+      }
+      // Same latch as handleSubmit, so a second click before the optimistic
+      // user message renders cannot queue a duplicate turn.
+      isAwaitingTurnAcceptanceRef.current = true;
+      const releaseLatch = () => {
+        isAwaitingTurnAcceptanceRef.current = false;
+      };
+      void openPreviewIfSetupRequired(appId);
+      void streamMessage({
+        prompt,
+        chatId,
+        redo: false,
+        showOptimisticMessage: true,
+        requestedChatMode: isChatModeLoading ? null : storedChatMode,
+        onAccepted: releaseLatch,
+        onAcceptanceRejected: releaseLatch,
+        onSettled: releaseLatch,
+      });
+      posthog.capture("chat:submit", { chatMode, source: "suggested_prompt" });
+    },
+    [
+      chatId,
+      isStreaming,
+      appId,
+      openPreviewIfSetupRequired,
+      streamMessage,
+      isChatModeLoading,
+      storedChatMode,
+      posthog,
+      chatMode,
+    ],
+  );
+
   const handleNewChat = async () => {
     if (appId) {
       try {
-        const newChatId = await ipc.chat.createChat({
-          appId,
-          initialChatMode,
-        });
+        const newChatId = await ipc.chat.createChat({ appId });
         setSelectedChatId(newChatId);
         navigate({
           to: "/chat",
@@ -734,9 +907,6 @@ export function ChatInput({ chatId }: { chatId?: number }) {
         setIsPreviewOpen(true);
       }
       refreshVersions();
-      if (settings?.enableAutoFixProblems) {
-        checkProblems();
-      }
 
       // Keep same as handleReject
       refreshProposal();
@@ -778,8 +948,17 @@ export function ChatInput({ chatId }: { chatId?: number }) {
         <ChatErrorBox
           onDismiss={dismissError}
           error={error}
-          isDyadProEnabled={settings.enableDyadPro ?? false}
+          isDyadProEnabled={isProEnabled}
           onStartNewChat={handleNewChat}
+          onSwitchToBuildMode={
+            isFreeProModel(selectedModel)
+              ? undefined
+              : () => {
+                  void setChatMode("build")
+                    .then(dismissError)
+                    .catch(() => {});
+                }
+          }
         />
       )}
       {/* Display loading or error state for proposal */}
@@ -794,6 +973,8 @@ export function ChatInput({ chatId }: { chatId?: number }) {
         </div>
       )}
       <div className="p-2 pt-0" data-testid="chat-input-container">
+        {/* Promo cap row fused to the top of the composer */}
+        {showPromo && <PromoMessage seed={promo.seed} />}
         {/* Show context limit banner above chat input for visibility */}
         {showBanner && tokenCountResult && (
           <ContextLimitBanner
@@ -801,12 +982,19 @@ export function ChatInput({ chatId }: { chatId?: number }) {
             contextWindow={tokenCountResult.contextWindow}
           />
         )}
+        {/* Cancelling a turn can take a minute when the agent is mid-tool (a
+            test run has to be killed and its isolation torn down). Pinned here
+            rather than inline in the transcript, which scrolls away. */}
+        {isCancellationRequested && (
+          <CancellationBanner appId={activeChat?.appId} />
+        )}
         <div
           className={cn(
             "relative flex flex-col border border-border rounded-2xl bg-(--background-lighter) transition-colors duration-200",
             "focus-within:border-primary/30 focus-within:ring-1 focus-within:ring-primary/20",
             isDraggingOver && "ring-2 ring-blue-500 border-blue-500",
-            showBanner && "rounded-t-none border-t-0",
+            (showBanner || showPromo || isCancellationRequested) &&
+              "rounded-t-none border-t-0",
           )}
           onDragOver={handleDragOver}
           onDragLeave={handleDragLeave}
@@ -814,6 +1002,11 @@ export function ChatInput({ chatId }: { chatId?: number }) {
         >
           {/* Show active questionnaire if exists */}
           <QuestionnaireInput />
+
+          {chatId && <ChatAnnotationsTray chatId={chatId} />}
+
+          {/* Show the recorded-test plan waiting on a review, if any */}
+          <TestAssertionsInput />
 
           {/* Show todo list if there are todos for this chat */}
           {chatTodos.length > 0 && <TodoList todos={chatTodos} />}
@@ -828,6 +1021,7 @@ export function ChatInput({ chatId }: { chatId?: number }) {
               onClose={() => decideConsent(pendingToolConsent, "decline")}
             />
           )}
+          <SubscriptionLimitBanner />
           {/* Show queued messages list */}
           {queuedMessages.length > 0 && (
             <QueuedMessagesList
@@ -861,9 +1055,7 @@ export function ChatInput({ chatId }: { chatId?: number }) {
           {/* Only render ChatInputActions if proposal is loaded and no pending consent */}
           {!pendingToolConsent &&
             proposal &&
-            proposalResult?.chatId === chatId &&
-            effectiveMode !== "ask" &&
-            effectiveMode !== "local-agent" && (
+            proposalResult?.chatId === chatId && (
               <ChatInputActions
                 proposal={proposal}
                 onApprove={handleApprove}
@@ -891,18 +1083,11 @@ export function ChatInput({ chatId }: { chatId?: number }) {
               onReset={() => {
                 // Exit component selection mode and visual editing
                 setSelectedComponents([]);
+                sendPreviewIframeEvent({ type: "PICKER_DEACTIVATED" });
                 setVisualEditingSelectedComponent(null);
                 setCurrentComponentCoordinates(null);
                 setPendingVisualChanges(new Map());
                 refreshAppIframe();
-
-                // Deactivate component selector in iframe
-                if (previewIframeRef?.contentWindow) {
-                  previewIframeRef.contentWindow.postMessage(
-                    { type: "deactivate-dyad-component-selector" },
-                    "*",
-                  );
-                }
               }}
             />
           ) : (
@@ -932,6 +1117,13 @@ export function ChatInput({ chatId }: { chatId?: number }) {
 
           <SelectedComponentsDisplay />
 
+          {/* Apps referenced with @app: that stay readable for this chat */}
+          <ReferencedAppsBar
+            chatId={chatId}
+            isEnabled={isLocalAgentBackedMode(selectedMode)}
+            isStreaming={isStreaming}
+          />
+
           {/* Use the AttachmentsList component */}
           <AttachmentsList
             attachments={attachments}
@@ -942,6 +1134,19 @@ export function ChatInput({ chatId }: { chatId?: number }) {
           <ChatImageGenerationStrip
             onGenerateImage={handleOpenImageGenerator}
           />
+
+          {/* Model-suggested follow-up prompts from the last reply */}
+          {chatId &&
+            suggestedPrompts &&
+            !pendingToolConsent &&
+            !disableSendButton && (
+              <SuggestedPromptsStrip
+                chatId={chatId}
+                messageId={suggestedPrompts.messageId}
+                prompts={suggestedPrompts.prompts}
+                onSelect={handleSelectSuggestedPrompt}
+              />
+            )}
 
           {/* Use the DragDropOverlay component */}
           <DragDropOverlay isDraggingOver={isDraggingOver} />
@@ -1028,19 +1233,41 @@ export function ChatInput({ chatId }: { chatId?: number }) {
             )}
 
             {isStreaming ? (
+              // Cancelling is not instant — an in-flight tool has to unwind
+              // first. Confirm the click here (the banner above carries the
+              // reason) and refuse a second one, which would only re-abort an
+              // already-aborted controller.
               <Tooltip>
                 <TooltipTrigger
                   render={
                     <button
                       onClick={handleCancel}
-                      aria-label={t("cancelGeneration")}
-                      className="px-2 py-2 mb-0.5 mr-1 text-muted-foreground hover:text-destructive rounded-lg transition-colors duration-150 cursor-pointer"
+                      disabled={isCancellationRequested}
+                      aria-label={
+                        isCancellationRequested
+                          ? t("stoppingGeneration", "Stopping…")
+                          : t("cancelGeneration")
+                      }
+                      className={cn(
+                        "px-2 py-2 mb-0.5 mr-1 rounded-lg transition-colors duration-150",
+                        isCancellationRequested
+                          ? "text-amber-600 dark:text-amber-500 cursor-default"
+                          : "text-muted-foreground hover:text-destructive cursor-pointer",
+                      )}
                     />
                   }
                 >
-                  <StopCircleIcon size={20} />
+                  {isCancellationRequested ? (
+                    <Loader2 size={20} className="animate-spin" />
+                  ) : (
+                    <StopCircleIcon size={20} />
+                  )}
                 </TooltipTrigger>
-                <TooltipContent>{t("cancelGeneration")}</TooltipContent>
+                <TooltipContent>
+                  {isCancellationRequested
+                    ? t("stoppingGeneration", "Stopping…")
+                    : t("cancelGeneration")}
+                </TooltipContent>
               </Tooltip>
             ) : (
               <Tooltip>
@@ -1048,12 +1275,7 @@ export function ChatInput({ chatId }: { chatId?: number }) {
                   render={
                     <button
                       onClick={handleSubmit}
-                      disabled={
-                        (!inputValue.trim() &&
-                          attachments.length === 0 &&
-                          !hasSuccessfulImageJobs) ||
-                        disableSendButton
-                      }
+                      disabled={!hasComposerPayload || disableSendButton}
                       aria-label={t("sendMessage")}
                       className="px-2 py-2 mb-0.5 mr-1 text-muted-foreground hover:text-primary rounded-lg transition-colors duration-150 disabled:opacity-30 disabled:hover:text-muted-foreground cursor-pointer disabled:cursor-default"
                     />
@@ -1067,7 +1289,7 @@ export function ChatInput({ chatId }: { chatId?: number }) {
           </div>
           <div className="px-2 flex items-center justify-between pb-0.5 pt-0.5">
             <div className="flex items-center">
-              <ChatInputControls showContextFilesPicker={false} />
+              <ChatInputControls />
             </div>
 
             <AuxiliaryActionsMenu
@@ -1279,6 +1501,28 @@ function KeepGoingButton() {
   );
 }
 
+function AddTypeScriptButton() {
+  const { t } = useTranslation("chat");
+  const { streamMessage } = useStreamChat();
+  const chatId = useAtomValue(selectedChatIdAtom);
+  const onClick = () => {
+    if (!chatId) {
+      console.error("No chat id found");
+      return;
+    }
+    streamMessage({
+      prompt:
+        "Add TypeScript to this project: install `typescript` as a dev dependency and create a lenient tsconfig (`allowJs: true`, `strict: false`) so existing JavaScript keeps working.",
+      chatId,
+    });
+  };
+  return (
+    <SuggestionButton onClick={onClick} tooltipText={t("addTypeScript")}>
+      {t("addTypeScript")}
+    </SuggestionButton>
+  );
+}
+
 export function mapActionToButton(action: SuggestedAction) {
   switch (action.id) {
     case "summarize-in-new-chat":
@@ -1295,6 +1539,8 @@ export function mapActionToButton(action: SuggestedAction) {
       return <RefreshButton />;
     case "keep-going":
       return <KeepGoingButton />;
+    case "add-typescript":
+      return <AddTypeScriptButton />;
     default:
       console.error(`Unsupported action: ${action.id}`);
       return (
@@ -1429,9 +1675,6 @@ function ChatInputActions({
             )}
             {t("reject")}
           </Button>
-          <div className="flex items-center space-x-1 ml-auto">
-            <AutoApproveSwitch />
-          </div>
         </div>
       </div>
 
@@ -1485,9 +1728,7 @@ function ChatInputActions({
                       key={index}
                       className="flex items-center space-x-2"
                       onClick={() => {
-                        ipc.system.openExternalUrl(
-                          `https://www.npmjs.com/package/${pkg}`,
-                        );
+                        ipc.system.openExternalUrl(getNpmPackagePageUrl(pkg));
                       }}
                     >
                       <Package

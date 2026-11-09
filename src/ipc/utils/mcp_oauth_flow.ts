@@ -12,62 +12,62 @@ import { mcpServers } from "../../db/schema";
 import {
   DyadOAuthClientProvider,
   decryptFromString,
+  issueMcpOAuthWriteAuthority,
+  revokeMcpOAuthWriteAuthority,
 } from "./mcp_oauth_provider";
 import { DEFAULT_OAUTH_CALLBACK_PORT } from "../types/mcp";
 import { mcpManager } from "./mcp_manager";
 import { DyadError, DyadErrorKind } from "../../errors/dyad_error";
+import {
+  createMcpOAuthRegistry,
+  type McpOAuthListenerHandle,
+  type McpOAuthListenerRequest,
+} from "@/mcp_oauth/registry";
+import { systemClock, uuidIdSource } from "@/state_machines/clock";
+import { PendingReceiptLedger } from "@/state_machines/pending_receipt_ledger";
+import { publishQueryInvalidations } from "./query_invalidation_delivery";
 
 const logger = log.scope("mcp_oauth_flow");
+const LOOPBACK_BIND_HOSTS = ["127.0.0.1", "::1"] as const;
+const mutatingServers = new Set<number>();
+const serverMutationBarriers = new Map<number, Promise<unknown>>();
+const latestOAuthRequestGeneration = new Map<number, number>();
+const activeOAuthPreparations = new Set<
+  Promise<{ success: boolean; error: string | null }>
+>();
+const OAUTH_REQUEST_RECEIPT_LIMIT = 128;
+const OAUTH_REQUEST_RECEIPT_RETENTION_MS = 5 * 60_000;
+let oauthShuttingDown = false;
+const oauthReceiptLedger = new PendingReceiptLedger<{
+  success: boolean;
+  error: string | null;
+}>({
+  clock: systemClock,
+  maxPendingEntries: OAUTH_REQUEST_RECEIPT_LIMIT,
+  maxSettledEntries: OAUTH_REQUEST_RECEIPT_LIMIT,
+  settledRetentionMs: OAUTH_REQUEST_RECEIPT_RETENTION_MS,
+  disposal: {
+    kind: "resolve",
+    value: () => ({ success: false, error: "OAuth is shutting down." }),
+  },
+});
 
-// Cap on how long the loopback listener waits for browser-side
-// consent. Past this, tear it down and error out -- otherwise a
-// closed tab would leak the listener indefinitely.
-const OAUTH_FLOW_TIMEOUT_MS = 5 * 60 * 1000;
-
-interface PendingFlow {
-  reject: (err: Error) => void;
-  // Servers are pushed as their bind completes (even if the flow has
-  // since been superseded), so a supersede can enumerate them via
-  // `servers` after awaiting `binding`.
-  servers: Server[];
-  // Resolves once the initial bind attempts have all settled. A
-  // supersede awaits this so the previous flow's `listen()` calls
-  // can't win the port between our `pendingFlows.delete` and our own
-  // bind, which would surface as EADDRINUSE.
-  binding: Promise<void>;
-  timeout: NodeJS.Timeout | null;
+function escapeHtml(value: string): string {
+  return value.replace(
+    /[&<>"']/g,
+    (character) => `&#${character.charCodeAt(0)};`,
+  );
 }
 
-// Returned by startCallbackListener: the awaited code, plus a dispose
-// that tears down only this flow's own listener.
-interface CallbackListener {
-  code: Promise<string>;
-  dispose: () => void;
-}
-
-// At most one OAuth flow per port at a time. A second Connect on the
-// same port supersedes the first (which rejects with "superseded")
-// rather than queueing. Map key is the port number.
-const pendingFlows = new Map<number, PendingFlow>();
-
-function escapeHtml(s: string): string {
-  return s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
-}
-
-// Self-contained (no external assets) so it works on the loopback
-// listener. On success, auto-fires the `dyad://mcp-oauth-return`
-// deep link to bring Dyad to the foreground, with a visible "Open
-// Dyad" button as a fallback for browsers that block scripted
-// protocol-handler navigation.
-function renderCallbackPage(opts: {
+function renderCallbackPage(options: {
   kind: "success" | "error";
   title: string;
   message: string;
 }): string {
-  const isSuccess = opts.kind === "success";
+  const isSuccess = options.kind === "success";
   const accent = isSuccess ? "#10b981" : "#ef4444";
-  const safeTitle = escapeHtml(opts.title);
-  const safeMessage = escapeHtml(opts.message);
+  const safeTitle = escapeHtml(options.title);
+  const safeMessage = escapeHtml(options.message);
   const returnUrl = "dyad://mcp-oauth-return";
   return `<!DOCTYPE html>
 <html lang="en">
@@ -147,9 +147,6 @@ function renderCallbackPage(opts: {
       isSuccess
         ? `<a class="btn" href="${returnUrl}">Open Dyad</a>
     <script>
-      // Try to hand focus back to Dyad automatically; the button above
-      // is the fallback for browsers that block scripted navigation
-      // to custom protocol handlers.
       setTimeout(function () { window.location.href = ${JSON.stringify(returnUrl)}; }, 500);
     </script>`
         : `<p class="muted">You can close this window and return to Dyad.</p>`
@@ -160,95 +157,30 @@ function renderCallbackPage(opts: {
 }
 
 function generateState(): string {
-  // 16 random bytes -> 22-char base64url. Used as the OAuth `state`
-  // parameter for CSRF protection: verified on callback before we
-  // accept the `code`.
   const bytes = new Uint8Array(16);
   crypto.getRandomValues(bytes);
   return Buffer.from(bytes).toString("base64url");
 }
 
-// Bind both IPv4 and IPv6 loopback: `localhost` often resolves to
-// `::1` first, so a `127.0.0.1`-only listener would miss the browser's
-// callback. Partial success is fine -- one bound stack is enough.
-const LOOPBACK_BIND_HOSTS = ["127.0.0.1", "::1"] as const;
-
-async function startCallbackListener(
-  port: number,
-  expectedState: string,
-): Promise<CallbackListener> {
-  // Supersede any flow already pending on this port (user clicked
-  // Connect again). Reject the old promise, then wait for its sockets
-  // to finish closing before the new listener binds.
-  const existing = pendingFlows.get(port);
-  if (existing) {
-    logger.info(`Superseding stale OAuth flow on port ${port}`);
-    if (existing.timeout) clearTimeout(existing.timeout);
-    pendingFlows.delete(port);
-    existing.reject(
-      new Error("OAuth flow superseded by a new Connect attempt."),
-    );
-    // Wait for any in-flight `tryBind` calls so `existing.servers`
-    // includes every socket that successfully bound, even ones that
-    // bound after the supersede flipped `disposed`.
-    await existing.binding;
-    await Promise.all(
-      existing.servers.map(
-        (s) =>
-          new Promise<void>((resolveClose) => {
-            s.close(() => resolveClose());
-            setTimeout(() => resolveClose(), 500);
-          }),
-      ),
-    );
-  }
-
-  let resolveCode!: (code: string) => void;
-  let rejectCode!: (err: Error) => void;
-  const code = new Promise<string>((resolve, reject) => {
-    resolveCode = resolve;
-    rejectCode = reject;
+function closeServer(server: Server): Promise<void> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    server.close(finish);
+    server.closeAllConnections();
+    setTimeout(finish, 500);
   });
-  // Pre-attach a no-op observer so a rejection fired before the caller
-  // gets the listener (e.g. a supersede landing while we're still
-  // awaiting the loopback bind) doesn't surface as an unhandled
-  // rejection in the Electron main process. Real observers attached
-  // later still see the rejection.
-  code.catch(() => undefined);
+}
 
-  // Set before flow.reject so a supersede also flips `disposed` and
-  // any in-flight bind from this flow tears itself down on completion.
-  let disposed = false;
-
-  const flow: PendingFlow = {
-    reject: (err: Error) => {
-      disposed = true;
-      rejectCode(err);
-    },
-    servers: [],
-    // Overwritten below before `pendingFlows.set` exposes the flow.
-    binding: Promise.resolve(),
-    timeout: null,
-  };
-
-  // Tears down only this flow's resources; drops the map entry only
-  // while it still belongs to this flow.
-  const dispose = (): void => {
-    disposed = true;
-    if (flow.timeout) clearTimeout(flow.timeout);
-    for (const s of flow.servers) {
-      // close() stops new connections; closeAllConnections() also drops
-      // a keep-alive socket the browser left open on an abandoned flow.
-      s.close();
-      s.closeAllConnections();
-    }
-    if (pendingFlows.get(port) === flow) pendingFlows.delete(port);
-  };
-
-  const settle = (fn: () => void): void => {
-    dispose();
-    fn();
-  };
+/** HTTP-only adapter: the registry owns all OAuth lifecycle decisions. */
+function bindCallbackListener(
+  request: McpOAuthListenerRequest,
+): McpOAuthListenerHandle {
+  const servers: Server[] = [];
 
   const handler = (req: IncomingMessage, res: ServerResponse): void => {
     try {
@@ -256,23 +188,23 @@ async function startCallbackListener(
         res.writeHead(400).end("Bad request");
         return;
       }
-      const url = new URL(req.url, `http://localhost:${port}`);
+      const url = new URL(req.url, `http://localhost:${request.port}`);
       if (url.pathname !== "/callback") {
         res.writeHead(404).end("Not found");
         return;
       }
-      const codeParam = url.searchParams.get("code");
-      const errParam = url.searchParams.get("error");
-      const state = url.searchParams.get("state");
+      const code = url.searchParams.get("code") ?? undefined;
+      const error = url.searchParams.get("error") ?? undefined;
+      const claim = request.onCallback({
+        invocationRef: request.invocationRef,
+        state: url.searchParams.get("state"),
+        code,
+        error,
+      });
 
-      if (state !== expectedState) {
-        // Don't tear down the listener: a stale callback from a
-        // superseded Connect attempt (old browser tab finishing after
-        // a retry) carries the previous flow's `state`. Returning an
-        // error page is enough to dismiss it; the active flow's real
-        // callback can still arrive.
+      if (!claim.claimed) {
         logger.info(
-          `Ignoring OAuth callback with mismatched state on port ${port}; keeping active flow alive.`,
+          `Ignoring ${claim.reason} OAuth callback on port ${request.port}; keeping active flow alive.`,
         );
         res.writeHead(400, { "Content-Type": "text/html" }).end(
           renderCallbackPage({
@@ -285,7 +217,7 @@ async function startCallbackListener(
         return;
       }
 
-      if (codeParam) {
+      if (code) {
         res.writeHead(200, { "Content-Type": "text/html" }).end(
           renderCallbackPage({
             kind: "success",
@@ -293,7 +225,6 @@ async function startCallbackListener(
             message: "You can close this tab and return to Dyad.",
           }),
         );
-        settle(() => resolveCode(codeParam));
         return;
       }
 
@@ -301,260 +232,339 @@ async function startCallbackListener(
         renderCallbackPage({
           kind: "error",
           title: "Authorization failed",
-          message: errParam ?? "missing code",
+          message: error ?? "missing code",
         }),
       );
-      settle(() =>
-        rejectCode(
-          new Error(`OAuth callback error: ${errParam ?? "missing code"}`),
-        ),
-      );
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
       logger.warn(`OAuth callback handler crashed: ${message}`);
       if (!res.headersSent) {
         res
           .writeHead(500, { "Content-Type": "text/plain" })
           .end("Internal error");
       }
-      settle(() => rejectCode(err instanceof Error ? err : new Error(message)));
     }
   };
 
-  // EADDRINUSE means the other process owns the address; "other"
-  // means the stack is unavailable (e.g. IPv6 disabled). Partial-bind
-  // is safe only for the second case.
   type BindResult =
-    | { server: Server }
-    | { error: "in_use" }
-    | { error: "other" };
+    | { host: string; server: Server }
+    | { host: string; error: "in_use" | "other" };
   const tryBind = (host: string): Promise<BindResult> =>
-    new Promise((resolveBind) => {
-      const s = createServer(handler);
-      const onError = (err: Error & { code?: string }) => {
+    new Promise((resolve) => {
+      const server = createServer(handler);
+      const onError = (error: Error & { code?: string }) => {
         logger.warn(
-          `Could not bind OAuth callback listener on ${host}:${port}: ${err.message}`,
+          `Could not bind OAuth callback listener on ${host}:${request.port}: ${error.message}`,
         );
-        resolveBind({ error: err.code === "EADDRINUSE" ? "in_use" : "other" });
+        resolve({
+          host,
+          error: error.code === "EADDRINUSE" ? "in_use" : "other",
+        });
       };
-      s.once("error", onError);
-      s.listen(port, host, () => {
-        s.removeListener("error", onError);
-        resolveBind({ server: s });
+      server.once("error", onError);
+      server.listen(request.port, host, () => {
+        server.removeListener("error", onError);
+        servers.push(server);
+        resolve({ host, server });
       });
     });
 
-  // Push to `flow.servers` as soon as a bind succeeds (rather than
-  // after the whole `Promise.all`) so a supersede landing during the
-  // bind window can observe and close every bound socket.
-  const bindPromises = LOOPBACK_BIND_HOSTS.map(async (host) => {
-    const result = await tryBind(host);
-    if ("server" in result) flow.servers.push(result.server);
-    return result;
-  });
-  flow.binding = Promise.all(bindPromises).then(() => undefined);
-
-  // Register the pending flow before kicking off the async bind so a
-  // concurrent Connect on the same port sees this entry and supersedes
-  // it (rather than racing into its own bind and hitting EADDRINUSE).
-  pendingFlows.set(port, flow);
-
-  // Await the bind so callers can safely open the browser knowing the
-  // callback endpoint is actually listening. Without this, `auth()`
-  // could redirect before the socket was ready and hit ECONNREFUSED.
-  await flow.binding;
-
-  if (disposed) {
-    for (const s of flow.servers) s.close();
-    if (pendingFlows.get(port) === flow) pendingFlows.delete(port);
-    // Throw rather than return: a returned listener would let
-    // `runOAuthFlow` proceed into `auth(provider)` and open the
-    // browser for an already-superseded flow, whose stale callback
-    // could land on the new listener with a mismatching `state` and
-    // abort the real flow.
-    throw new Error("OAuth flow superseded before listener bound.");
-  }
-  // Already settled — `flow.binding` awaited the same promises.
-  const bindResults = await Promise.all(bindPromises);
-  // EADDRINUSE on either stack is fatal: `localhost` could resolve
-  // to the busy address and the callback would land out of reach.
-  if (bindResults.some((r) => "error" in r && r.error === "in_use")) {
-    for (const s of flow.servers) s.close();
-    if (pendingFlows.get(port) === flow) pendingFlows.delete(port);
-    throw new Error(
-      `Could not bind OAuth callback listener on port ${port}: ` +
-        `another local process is holding one of the loopback stacks (127.0.0.1 / ::1). ` +
-        `Stop the conflicting process or configure a different OAuth callback port.`,
+  const bindResults = Promise.all(LOOPBACK_BIND_HOSTS.map(tryBind));
+  const settled = bindResults.then((results) => {
+    const boundHosts = results.flatMap((result) =>
+      "server" in result ? [result.host] : [],
     );
-  }
-  if (flow.servers.length === 0) {
-    if (pendingFlows.get(port) === flow) pendingFlows.delete(port);
-    // Don't reject `code` here: we throw before returning, so the
-    // caller never gets a listener to attach `code.catch(...)` to,
-    // and a rejected-but-unobserved `code` would surface as an
-    // unhandled rejection in the Electron main process.
-    throw new Error(
-      `Could not bind OAuth callback listener on port ${port} (tried IPv4 and IPv6 loopback).`,
+    logger.info(
+      `OAuth callback listener bind settled on http://localhost:${request.port} (${boundHosts.length} stack${boundHosts.length === 1 ? "" : "s"})`,
     );
-  }
-
-  flow.timeout = setTimeout(() => {
-    dispose();
-    rejectCode(
-      new Error(
-        `OAuth flow timed out after ${OAUTH_FLOW_TIMEOUT_MS / 1000}s. Did you close the browser tab?`,
+    return {
+      boundHosts,
+      anyInUse: results.some(
+        (result) => "error" in result && result.error === "in_use",
       ),
-    );
-  }, OAUTH_FLOW_TIMEOUT_MS);
-  logger.info(
-    `OAuth callback listener bound on http://localhost:${port} (${flow.servers.length} stack${flow.servers.length === 1 ? "" : "s"})`,
-  );
+    };
+  });
 
-  return { code, dispose };
+  let closing: Promise<void> | undefined;
+  return {
+    settled,
+    close() {
+      closing ??= bindResults
+        .then(() => Promise.all(servers.map(closeServer)))
+        .then(() => undefined);
+      return closing;
+    },
+  };
 }
+
+const mcpOAuthRegistry = createMcpOAuthRegistry({
+  clock: systemClock,
+  ids: uuidIdSource,
+  bindListener: bindCallbackListener,
+  onSettled: (serverId) => {
+    // Issuing an interactive authority invalidates any cached background
+    // provider for this server. Rebuild it after every terminal outcome,
+    // including cancellation/failure, so later refreshes capture the current
+    // epoch instead of remaining permanently fenced.
+    void mcpManager.dispose(serverId).catch(() => {});
+    publishQueryInvalidations([
+      { family: "mcp-servers" },
+      { family: "mcp-tools", serverId },
+    ]);
+  },
+});
 
 interface RunOAuthFlowParams {
   serverId: number;
+  /** Required by IPC; optional only for direct main-process callers/tests. */
+  rendererMessageId?: string;
   callbackPort?: number;
 }
 
-/**
- * Drive the full OAuth flow for a configured MCP server. Every
- * failure path (validation, not-found, live OAuth) returns
- * `{success, error}` so the renderer's `connectFeedback` UI can
- * render inline. (`disconnectOAuth` throws `DyadError(NotFound)`
- * instead — its caller `try/catch`es it.)
- */
-export async function runOAuthFlow(
+/** Preserve the IPC-facing `{success, error}` contract. */
+export function runOAuthFlow(
   params: RunOAuthFlowParams,
 ): Promise<{ success: boolean; error: string | null }> {
+  const rendererMessageId =
+    params.rendererMessageId ?? `main:${globalThis.crypto.randomUUID()}`;
+  if (oauthShuttingDown) {
+    return Promise.resolve({
+      success: false,
+      error: "OAuth is shutting down.",
+    });
+  }
+  let admitted = false;
+  const claim = oauthReceiptLedger.claim({
+    scope: "mcp-oauth-flow",
+    messageId: rendererMessageId,
+    fingerprint: String(params.serverId),
+    start: () => {
+      const generation =
+        (latestOAuthRequestGeneration.get(params.serverId) ?? 0) + 1;
+      latestOAuthRequestGeneration.set(params.serverId, generation);
+      const preparation = prepareAndRunOAuthFlow(
+        { ...params, rendererMessageId },
+        generation,
+        () => {
+          admitted = true;
+        },
+      );
+      activeOAuthPreparations.add(preparation);
+      const release = () => activeOAuthPreparations.delete(preparation);
+      void preparation.then(release, release);
+      return preparation;
+    },
+    retention: () => (admitted ? "retain" : "remove"),
+  });
+  if (claim.kind === "fresh" || claim.kind === "duplicate") {
+    return claim.receipt;
+  }
+  if (claim.kind === "conflict") {
+    return Promise.resolve({
+      success: false,
+      error: "OAuth retry message ID was reused for a different server.",
+    });
+  }
+  return Promise.resolve({
+    success: false,
+    error:
+      claim.kind === "capacity-rejected"
+        ? "Too many OAuth requests are already pending; finish or cancel one and retry."
+        : "OAuth is shutting down.",
+  });
+}
+
+async function prepareAndRunOAuthFlow(
+  params: RunOAuthFlowParams & { rendererMessageId: string },
+  generation: number,
+  onAdmitted: () => void,
+): Promise<{ success: boolean; error: string | null }> {
+  if (oauthShuttingDown || mutatingServers.has(params.serverId)) {
+    return {
+      success: false,
+      error: oauthShuttingDown
+        ? "OAuth is shutting down."
+        : "MCP server configuration is changing; retry OAuth in a moment.",
+    };
+  }
   const rows = await db
     .select()
     .from(mcpServers)
     .where(eq(mcpServers.id, params.serverId));
-  const s = rows[0];
-  if (!s) {
+  const server = rows[0];
+  if (
+    oauthShuttingDown ||
+    mutatingServers.has(params.serverId) ||
+    latestOAuthRequestGeneration.get(params.serverId) !== generation
+  ) {
+    return {
+      success: false,
+      error: oauthShuttingDown
+        ? "OAuth is shutting down."
+        : latestOAuthRequestGeneration.get(params.serverId) !== generation
+          ? "OAuth flow superseded by a newer Connect attempt."
+          : "MCP server configuration is changing; retry OAuth in a moment.",
+    };
+  }
+  if (!server) {
     return {
       success: false,
       error: `MCP server not found: ${params.serverId}`,
     };
   }
-  if (!s.url) {
+  if (!server.url) {
     return {
       success: false,
-      error: `MCP server "${s.name}" has no URL; OAuth requires HTTP transport.`,
+      error: `MCP server "${server.name}" has no URL; OAuth requires HTTP transport.`,
     };
   }
-  if (s.transport !== "http") {
+  if (server.transport !== "http") {
     return {
       success: false,
-      error: `OAuth not supported for transport "${s.transport}".`,
+      error: `OAuth not supported for transport "${server.transport}".`,
     };
   }
 
+  const serverUrl = server.url;
   const callbackPort =
-    params.callbackPort ?? s.oauthCallbackPort ?? DEFAULT_OAUTH_CALLBACK_PORT;
-  // Scope values are defined by each OAuth server; there is no
-  // universal default that works across providers. Pass through
-  // whatever the user configured, otherwise omit the `scope`
-  // parameter entirely so the server applies its own default.
-  const scope = s.oauthScope ?? undefined;
-  const decryptedClientSecret = s.oauthClientSecret
-    ? decryptFromString(s.oauthClientSecret) || undefined
-    : undefined;
+    params.callbackPort ??
+    server.oauthCallbackPort ??
+    DEFAULT_OAUTH_CALLBACK_PORT;
+  const scope = server.oauthScope ?? undefined;
+  let decryptedClientSecret: string | undefined;
+  try {
+    decryptedClientSecret = server.oauthClientSecret
+      ? decryptFromString(server.oauthClientSecret) || undefined
+      : undefined;
+  } catch {
+    throw new DyadError(
+      "Saved MCP OAuth client secret could not be opened. Unlock or restore your OS keyring and retry, or re-enter the client secret in the plugin settings. Resetting OAuth does not remove the configured client secret.",
+      DyadErrorKind.Precondition,
+    );
+  }
   const expectedState = generateState();
+  const writeAuthority = issueMcpOAuthWriteAuthority(server.id);
   const provider = new DyadOAuthClientProvider({
-    serverId: s.id,
+    serverId: server.id,
     callbackPort,
     scope,
-    preregisteredClientId: s.oauthClientId ?? undefined,
+    preregisteredClientId: server.oauthClientId ?? undefined,
     preregisteredClientSecret: decryptedClientSecret,
     flowState: expectedState,
     allowInteractive: true,
+    writeAuthority,
   });
 
-  // Start the listener before `auth()` -- `auth()` opens the browser
-  // and the callback can arrive before a later bind would be ready.
-  // A bind failure here must surface through the `{success, error}`
-  // return contract, not as an uncaught throw across the IPC boundary.
-  let listener: CallbackListener;
-  try {
-    listener = await startCallbackListener(callbackPort, expectedState);
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    logger.warn(
-      `Could not start OAuth callback listener for server ${s.id}: ${message}`,
-    );
-    return { success: false, error: message };
-  }
-  // Side-handler so an early bind-failure rejection isn't unhandled
-  // during the long `await auth()`; the real rejection still
-  // propagates through `await listener.code` below. Also marks the
-  // provider as aborted so a late SDK write (e.g. a slow DCR
-  // `/register` from a now-superseded flow) becomes a no-op instead
-  // of clobbering the active flow's row.
-  listener.code.catch(() => provider.abort());
+  let silentlyAuthorized = false;
+  onAdmitted();
+  const result = await mcpOAuthRegistry.connect({
+    port: callbackPort,
+    serverId: server.id,
+    rendererMessageId: params.rendererMessageId,
+    expectedState,
+    authorize: async (authorizationCode) => {
+      const authResult = await auth(provider, {
+        serverUrl,
+        scope,
+        ...(authorizationCode === undefined ? {} : { authorizationCode }),
+      });
+      silentlyAuthorized =
+        authorizationCode === undefined && authResult === "AUTHORIZED";
+      return authResult;
+    },
+    onAbort: () => provider.abort(),
+  });
 
-  try {
-    // First call kicks off discovery / DCR and opens the browser.
-    // Returns 'AUTHORIZED' when a silent refresh already succeeded.
-    const initial = await auth(provider, {
-      serverUrl: s.url,
-      scope,
-    });
-    if (initial === "AUTHORIZED") {
-      listener.dispose();
-      mcpManager.dispose(s.id);
-      return { success: true, error: null };
+  if (result.success) {
+    if (silentlyAuthorized) {
+      await mcpManager.dispose(server.id);
+    } else {
+      void mcpManager.dispose(server.id).catch(() => {});
     }
-
-    const code = await listener.code;
-    const final = await auth(provider, {
-      serverUrl: s.url,
-      authorizationCode: code,
-    });
-    if (final !== "AUTHORIZED") {
-      // The listener already closed when its callback delivered the
-      // code (settle disposes), so there's nothing to free here.
-      return {
-        success: false,
-        error: "OAuth completed without authorization; please try again.",
-      };
-    }
-
-    // Rebuild the cached MCP client so it picks up the new tokens.
-    mcpManager.dispose(s.id);
-    return { success: true, error: null };
-  } catch (err) {
-    listener.dispose();
-    const message = err instanceof Error ? err.message : String(err);
-    logger.warn(`OAuth flow failed for server ${s.id}: ${message}`);
-    return { success: false, error: message };
+  } else {
+    logger.warn(`OAuth flow failed for server ${server.id}: ${result.error}`);
   }
+  return result;
 }
 
 export async function disconnectOAuth(
   serverId: number,
 ): Promise<{ success: boolean }> {
-  const rows = await db
-    .select({ id: mcpServers.id })
-    .from(mcpServers)
-    .where(eq(mcpServers.id, serverId));
-  if (!rows[0]) {
-    throw new DyadError(
-      `MCP server not found: ${serverId}`,
-      DyadErrorKind.NotFound,
-    );
-  }
-  // `invalidateCredentials` only deletes state; no need to read /
-  // decrypt the pre-registered client_id / client_secret.
-  // `allowInteractive` so the invalidate guard doesn't no-op this
-  // user-initiated cleanup.
-  const provider = new DyadOAuthClientProvider({
+  return withMcpOAuthServerMutation(
     serverId,
-    allowInteractive: true,
+    "OAuth flow cancelled because the server was disconnected.",
+    async () => {
+      const rows = await db
+        .select({ id: mcpServers.id })
+        .from(mcpServers)
+        .where(eq(mcpServers.id, serverId));
+      if (!rows[0]) {
+        throw new DyadError(
+          `MCP server not found: ${serverId}`,
+          DyadErrorKind.NotFound,
+        );
+      }
+      const provider = new DyadOAuthClientProvider({
+        serverId,
+        allowInteractive: true,
+      });
+      await provider.disconnect();
+      void mcpManager.dispose(serverId).catch(() => {});
+      return { success: true };
+    },
+  );
+}
+
+/**
+ * Revoke a server flow before any deletion or OAuth-relevant row mutation.
+ * Registry cancellation aborts provider work and settles the renderer waiter;
+ * the authority barrier then fences writes that were already queued.
+ */
+export async function cancelMcpOAuthForServer(
+  serverId: number,
+  reason: string,
+): Promise<void> {
+  await mcpOAuthRegistry.cancelServer(serverId, reason);
+  await revokeMcpOAuthWriteAuthority(serverId);
+}
+
+export function withMcpOAuthServerMutation<T>(
+  serverId: number,
+  reason: string,
+  mutate: () => Promise<T>,
+): Promise<T> {
+  // Fence both active flows and preparations that are currently awaiting the
+  // row read. Keep the admission fence raised across an entire queued
+  // mutation chain; only the last barrier for this server may lower it.
+  mutatingServers.add(serverId);
+  latestOAuthRequestGeneration.set(
+    serverId,
+    (latestOAuthRequestGeneration.get(serverId) ?? 0) + 1,
+  );
+  const previous =
+    serverMutationBarriers.get(serverId)?.catch(() => undefined) ??
+    Promise.resolve();
+  const operation = previous.then(async () => {
+    await cancelMcpOAuthForServer(serverId, reason);
+    return await mutate();
   });
-  await provider.invalidateCredentials("all");
-  mcpManager.dispose(serverId);
-  return { success: true };
+  serverMutationBarriers.set(serverId, operation);
+  const clearBarrier = () => {
+    if (serverMutationBarriers.get(serverId) === operation) {
+      serverMutationBarriers.delete(serverId);
+      mutatingServers.delete(serverId);
+    }
+  };
+  void operation.then(clearBarrier, clearBarrier);
+  return operation;
+}
+
+export async function disposeMcpOAuthForShutdown(): Promise<void> {
+  oauthShuttingDown = true;
+  const pendingPreparations = [...activeOAuthPreparations];
+  oauthReceiptLedger.dispose();
+  await Promise.all([
+    mcpOAuthRegistry.dispose(),
+    Promise.allSettled(pendingPreparations),
+  ]);
 }

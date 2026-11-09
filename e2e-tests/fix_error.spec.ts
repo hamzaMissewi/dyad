@@ -4,18 +4,28 @@ import { expect } from "@playwright/test";
 testSkipIfWindows("fix error with AI", async ({ po }) => {
   await po.setUp({ autoApprove: true });
   await po.sendPrompt("tc=create-error");
+  await po.previewPanel.expectPreviewIframeIsVisible(Timeout.EXTRA_LONG);
 
-  await po.previewPanel.snapshotPreviewErrorBanner({
-    name: "fix-error-with-AI-1.aria.yml",
-  });
+  await po.snapshotStableAria(
+    po.previewPanel.locatePreviewErrorBanner(),
+    "fix-error-with-AI-1.aria.yml",
+  );
 
+  await po.previewPanel.collapsePreviewErrorBanner();
+  await expect(po.previewPanel.locatePreviewErrorBanner()).toBeVisible();
   await expect(
-    po.page.getByText("Error Line 6 error", { exact: true }),
-  ).toBeVisible({ timeout: Timeout.MEDIUM });
-  await po.page.getByText("Error Line 6 error", { exact: true }).click();
-  await po.previewPanel.snapshotPreviewErrorBanner({
-    name: "fix-error-with-AI-2.aria.yml",
+    po.page.getByRole("button", { name: "Fix error with AI" }),
+  ).toBeHidden();
+  await po.previewPanel.expandPreviewErrorBanner();
+
+  await expect(po.page.getByText("Line 6 error", { exact: true })).toBeVisible({
+    timeout: Timeout.MEDIUM,
   });
+  await po.page.getByRole("button", { name: "Show details" }).click();
+  await po.snapshotStableAria(
+    po.previewPanel.locatePreviewErrorBanner(),
+    "fix-error-with-AI-2.aria.yml",
+  );
 
   await po.previewPanel.clickFixErrorWithAI();
   await po.chatActions.waitForChatCompletion();
@@ -25,6 +35,7 @@ testSkipIfWindows("fix error with AI", async ({ po }) => {
   // be shown, however there's some kind of race condition and
   // we don't reliably detect when the HMR update has completed.
   // await po.previewPanel.locatePreviewErrorBanner().waitFor({ state: "hidden" });
+  await po.previewPanel.clickPreviewRefresh();
   await po.previewPanel.snapshotPreview({
     name: "fix-error-with-AI-4.aria.yml",
   });
@@ -34,9 +45,9 @@ testSkipIfWindows("copy error message from banner", async ({ po }) => {
   await po.setUp({ autoApprove: true });
   await po.sendPrompt("tc=create-error");
 
-  await expect(
-    po.page.getByText("Error Line 6 error", { exact: true }),
-  ).toBeVisible({ timeout: Timeout.MEDIUM });
+  await expect(po.page.getByText("Line 6 error", { exact: true })).toBeVisible({
+    timeout: Timeout.MEDIUM,
+  });
 
   await po.previewPanel.clickCopyErrorMessage();
 

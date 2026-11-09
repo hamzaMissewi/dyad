@@ -1,4 +1,4 @@
-import { dialog, ipcMain } from "electron";
+import { dialog } from "electron";
 import { platform, arch } from "os";
 import fixPath from "fix-path";
 import { runShellCommand } from "../utils/runShellCommand";
@@ -9,6 +9,7 @@ import fs from "fs/promises";
 import { delimiter, join } from "path";
 import { readSettings, writeSettings } from "../../main/settings";
 import { createTypedHandler } from "./base";
+import { registerTrustedIpcHandler } from "./trusted_handle";
 import { systemContracts } from "../types/system";
 import { IS_TEST_BUILD } from "../utils/test_utils";
 import { DyadError, DyadErrorKind } from "@/errors/dyad_error";
@@ -450,9 +451,9 @@ export function registerNodeHandlers() {
   // Test-only handler to control Node.js mock state
   // Guarded by IS_TEST_BUILD constant
   if (IS_TEST_BUILD) {
-    ipcMain.handle(
+    registerTrustedIpcHandler(
       "test:set-node-mock",
-      async (_, { installed }: { installed: boolean | null }) => {
+      async (_event, { installed }: { installed: boolean | null }) => {
         logger.log("test:set-node-mock called with installed:", installed);
         mockNodeInstalled = installed;
       },
@@ -460,7 +461,7 @@ export function registerNodeHandlers() {
   }
 
   createTypedHandler(systemContracts.getNodejsStatus, async () => {
-    logger.log(
+    logger.debug(
       "handling ipc: nodejs-status for platform:",
       platform(),
       "and arch:",

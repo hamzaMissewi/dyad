@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import fs from "node:fs";
 import {
   CommandExecutionError,
   SOCKET_FIREWALL_WARNING_MESSAGE,
@@ -28,10 +29,16 @@ const dbUpdates: Array<Record<string, unknown>> = [];
 vi.mock("node:fs", async () => ({
   default: {
     existsSync: vi.fn().mockReturnValue(false),
+    realpathSync: vi.fn((filePath: string) => filePath),
+    lstatSync: vi.fn(() => {
+      throw Object.assign(new Error("missing"), { code: "ENOENT" });
+    }),
     mkdirSync: vi.fn(),
     writeFileSync: vi.fn(),
     promises: {
       readFile: vi.fn().mockResolvedValue(""),
+      realpath: vi.fn(async (filePath: string) => filePath),
+      lstat: vi.fn(),
     },
   },
 }));
@@ -111,13 +118,20 @@ vi.mock("./executeAddDependency", async () => {
 });
 
 import { db } from "../../db";
-import { gitAdd, hasStagedChanges } from "../utils/git_utils";
+import { gitAdd, gitCommit, hasStagedChanges } from "../utils/git_utils";
 import { processFullResponseActions } from "./response_processor";
+import { resolveSelfAlias } from "../utils/path_test_utils";
 
 describe("processFullResponseActions add dependency errors", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     dbUpdates.length = 0;
+    vi.mocked(fs.realpathSync).mockImplementation((filePath) =>
+      String(filePath),
+    );
+    vi.mocked(fs.promises.realpath).mockImplementation(async (filePath) =>
+      String(filePath),
+    );
 
     readSettingsMock.mockReturnValue({
       enableSupabaseWriteSqlMigration: false,
@@ -228,7 +242,7 @@ describe("processFullResponseActions add dependency errors", () => {
       '<dyad-add-dependency packages="react"></dyad-add-dependency>',
       1,
       {
-        chatSummary: undefined,
+        chatSummary: "   ",
         messageId: 1,
       },
     );
@@ -270,6 +284,80 @@ describe("processFullResponseActions add dependency errors", () => {
     });
   });
 
+  it("describes legacy dependency commits as installs or updates", async () => {
+    executeAddDependencyMock.mockResolvedValue({
+      installResults: "updated",
+      warningMessages: [],
+    });
+    vi.mocked(hasStagedChanges).mockResolvedValueOnce(true);
+
+    await processFullResponseActions(
+      '<dyad-add-dependency packages="react"></dyad-add-dependency>',
+      1,
+      {
+        chatSummary: undefined,
+        messageId: 1,
+      },
+    );
+
+    expect(gitCommit).toHaveBeenCalledWith({
+      path: "/mock/apps/test-app",
+      message: "wrote 1 file(s), installed or updated react package(s)",
+    });
+  });
+
+  it("commits only dependency groups completed before a later failure", async () => {
+    executeAddDependencyMock.mockRejectedValue(
+      new ExecuteAddDependencyError({
+        error: new Error("zod failed"),
+        warningMessages: [],
+        completedPackages: ["react"],
+        installResults: "updated react",
+      }),
+    );
+    vi.mocked(hasStagedChanges).mockResolvedValueOnce(true);
+
+    await processFullResponseActions(
+      '<dyad-add-dependency packages="react zod@999.0.0"></dyad-add-dependency>',
+      1,
+      {
+        chatSummary: undefined,
+        messageId: 1,
+      },
+    );
+
+    expect(gitCommit).toHaveBeenCalledWith({
+      path: "/mock/apps/test-app",
+      message: "wrote 1 file(s), installed or updated react package(s)",
+    });
+    const contentUpdate = dbUpdates.find(
+      (update) => typeof update.content === "string",
+    );
+    expect(contentUpdate?.content).toContain(
+      'message="Partially installed or updated dependencies: react. zod failed"',
+    );
+  });
+
+  it("uses a fallback subject when a failed dependency operation stages project files", async () => {
+    executeAddDependencyMock.mockRejectedValue(new Error("install failed"));
+    vi.mocked(fs.existsSync).mockReturnValueOnce(true);
+    vi.mocked(hasStagedChanges).mockResolvedValueOnce(true);
+
+    await processFullResponseActions(
+      '<dyad-add-dependency packages="react"></dyad-add-dependency>',
+      1,
+      {
+        chatSummary: undefined,
+        messageId: 1,
+      },
+    );
+
+    expect(gitCommit).toHaveBeenCalledWith({
+      path: "/mock/apps/test-app",
+      message: "updated project files",
+    });
+  });
+
   it("queues delete tags for cloud sync even when the local path is already missing", async () => {
     vi.mocked(hasStagedChanges).mockResolvedValueOnce(true);
 
@@ -288,6 +376,35 @@ describe("processFullResponseActions add dependency errors", () => {
     expect(result).toMatchObject({
       updatedFiles: true,
     });
+    expect(queueCloudSandboxSnapshotSyncMock).toHaveBeenCalledWith({
+      appId: 1,
+      changedPaths: ["src/file1.js"],
+      deletedPaths: ["src/missing.js"],
+    });
+  });
+
+  it("queues the canonical physical delete path through an in-project alias", async () => {
+    vi.mocked(hasStagedChanges).mockResolvedValueOnce(true);
+    vi.mocked(fs.realpathSync).mockImplementation((filePath) =>
+      resolveSelfAlias("/mock/apps/test-app", filePath),
+    );
+    vi.mocked(fs.promises.realpath).mockImplementation(async (filePath) =>
+      resolveSelfAlias("/mock/apps/test-app", filePath),
+    );
+
+    const result = await processFullResponseActions(
+      `
+      <dyad-write path="src/file1.js">console.log("Hello");</dyad-write>
+      <dyad-delete path="self/src/missing.js"></dyad-delete>
+      `,
+      1,
+      {
+        chatSummary: undefined,
+        messageId: 1,
+      },
+    );
+
+    expect(result).toMatchObject({ updatedFiles: true });
     expect(queueCloudSandboxSnapshotSyncMock).toHaveBeenCalledWith({
       appId: 1,
       changedPaths: ["src/file1.js"],

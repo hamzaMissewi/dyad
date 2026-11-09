@@ -6,7 +6,6 @@
 import { Page, expect } from "@playwright/test";
 import fs from "fs";
 import path from "path";
-import { Timeout } from "../../constants";
 
 export class Settings {
   constructor(
@@ -15,26 +14,8 @@ export class Settings {
     private fakeLlmPort: number,
   ) {}
 
-  async toggleAutoApprove() {
-    await this.page.getByRole("switch", { name: "Auto-approve" }).click();
-  }
-
   async toggleLocalAgentMode() {
     await this.page.getByRole("switch", { name: "Enable Agent v2" }).click();
-  }
-
-  async toggleNativeGit() {
-    await this.page.getByRole("switch", { name: "Enable Native Git" }).click();
-  }
-
-  async toggleAutoFixProblems() {
-    await this.page.getByRole("switch", { name: "Auto-fix problems" }).click();
-  }
-
-  async toggleEnableMcpServersForBuildMode() {
-    await this.page
-      .getByRole("switch", { name: "Enable MCP servers for Build mode" })
-      .click();
   }
 
   async toggleSandboxScriptExecution() {
@@ -49,16 +30,16 @@ export class Settings {
       .click();
   }
 
-  async toggleEnableSelectAppFromHomeChatInput() {
-    await this.page
-      .getByRole("switch", {
-        name: "Enable Select App from Home Chat Input",
-      })
-      .click();
-  }
-
   async toggleAutoUpdate() {
     await this.page.getByRole("switch", { name: "Auto-update" }).click();
+  }
+
+  async disableAppBlueprint() {
+    await this.page.evaluate(async () => {
+      await (window as any).electron.ipcRenderer.invoke("set-user-settings", {
+        enableAppBlueprint: false,
+      });
+    });
   }
 
   async enableChatEventNotifications() {
@@ -187,15 +168,6 @@ export class Settings {
     const section = this.page.locator(`#${sectionId}`);
     await expect(section).toBeVisible();
     await section.scrollIntoViewIfNeeded();
-  }
-
-  async waitForMcpTool(serverName: string, toolName: string) {
-    await expect(this.page.getByText(serverName, { exact: true })).toBeVisible({
-      timeout: Timeout.MEDIUM,
-    });
-    await expect(this.page.getByText(toolName, { exact: true })).toBeVisible({
-      timeout: Timeout.MEDIUM,
-    });
   }
 
   async setUpTestProvider() {
